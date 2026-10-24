@@ -171,8 +171,38 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 	curr[2*sn+i] = c;
 }
 
-// ---- fused step: update_fused, launch_fused, gather_region, field_dft and update_currents_nodes
-// are ported in tasks T18 and T20
+// ---- fused step: update_fused, launch_fused and update_currents_nodes are ported in task T20
+
+// the raw values of a dump region (see SYCL_GatherRegion) for a snapshot: only these go over
+// PCIe, not the whole fields; the host interpolates them
+inline void gather_region(const sycl::nd_item<3>& it, const float* __restrict__ f, const SYCL_GatherRegion& R, const SYCL_GridDim& N,
+                          float* __restrict__ out)
+{
+	const size_t e = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (e<R.total)
+		out[e] = f[region_field_index(R, N, e)];
+}
+
+// frequency domain dumps: sums[k*total + e] += raw value(e) * w[k] for the weights of one timestep,
+// a float times a complex float, then a complex sum; the host interpolates the sums
+#define DFT_WEIGHTS 32   // weights per launch, captured by value in the kernel lambda (256 bytes)
+struct SYCL_DFTWeights { float2 w[DFT_WEIGHTS]; };
+
+inline void field_dft(const sycl::nd_item<3>& it, const float* __restrict__ f, const SYCL_GatherRegion& R, const SYCL_GridDim& N,
+                      const SYCL_DFTWeights& W, unsigned int nw, float2* __restrict__ sums)
+{
+	const size_t e = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (e>=R.total)
+		return;
+	const float v = f[region_field_index(R, N, e)];
+	for (unsigned int k=0; k<nw; ++k)
+	{
+		float2 s = sums[k*R.total + e];
+		s.x += v*W.w[k].x;
+		s.y += v*W.w[k].y;
+		sums[k*R.total + e] = s;
+	}
+}
 
 // Field energy: the squared voltages and currents of the nodes below L, summed along x
 // in float, one work-item per (y,z) line. The host sums the lines in double.
@@ -820,6 +850,162 @@ bool GPU_Backend_SYCL::DownloadRange(bool currents, size_t offset, size_t count,
 void GPU_Backend_SYCL::Synchronize()
 {
 	d->Flush();
+}
+
+bool GPU_Backend_SYCL::SetSnapshotGather(const std::vector<Engine_GatherRegion>& volt_regions, const std::vector<Engine_GatherRegion>& curr_regions)
+{
+	SYCL_Check("queue synchronization", [&] {d->ctx->copy_q.wait_and_throw();});
+	d->FreeSnapshots();
+	size_t nv = 0, n = 0;
+	for (size_t r=0; r<volt_regions.size(); ++r)
+		nv += volt_regions[r].Size();
+	n = nv;
+	for (size_t r=0; r<curr_regions.size(); ++r)
+		n += curr_regions[r].Size();
+	if ((n==0) || (n>UINT_MAX))
+		return false;
+	// not fatal: without snapshots the dumps read the fields from the host mirror
+	bool ok = true;
+	try
+	{
+		d->snap_dev = sycl::malloc_device<float>(n, d->ctx->device, *d->ctx->context);
+		d->snap_host = sycl::malloc_host<float>(n, *d->ctx->context);
+	}
+	catch (const sycl::exception&)
+	{
+		ok = false;
+	}
+	ok = ok && d->snap_dev && d->snap_host;
+	const std::vector<Engine_GatherRegion>* regions[2] = {&volt_regions, &curr_regions};
+	for (int f=0; f<2 && ok; ++f)
+		for (size_t r=0; r<regions[f]->size() && ok; ++r)
+		{
+			SYCL_GatherRegion dev;
+			void* buf = d->UploadRegion(regions[f]->at(r), dev);
+			ok = (buf!=NULL);
+			if (ok)
+			{
+				d->snap_lines.push_back(buf);
+				d->snap_regions[f].push_back(dev);
+			}
+		}
+	if (!ok)
+	{
+		d->FreeSnapshots();
+		std::cerr << "GPU_Backend_SYCL: not enough memory for field snapshots, the field dumps wait for the device" << std::endl;
+		return false;
+	}
+	d->snap_nv = nv;
+	d->snap_n = n;
+	return true;
+}
+
+bool GPU_Backend_SYCL::SnapshotFields(const FDTD_FLOAT* &volt, const FDTD_FLOAT* &curr)
+{
+	if (!d->snap_n)
+		return false;
+	// the raw values on the compute queue, once the last snapshot was downloaded from snap_dev
+	if (d->snap_taken)
+		SYCL_Check("barrier", [&] {d->Queue().ext_oneapi_submit_barrier({d->snap_done});});
+	size_t offset = 0;
+	const SYCL_GridDim N = d->dim;
+	for (int f=0; f<2; ++f)
+		for (size_t r=0; r<d->snap_regions[f].size(); ++r)
+		{
+			const SYCL_GatherRegion R = d->snap_regions[f][r];
+			const float* field = f ? d->curr : d->volt;
+			float* out = d->snap_dev + offset;
+			SYCL_Launch(d, "gather_region", R.total, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				gather_region(it, field, R, N, out);
+			});
+			offset += R.total;
+		}
+	SYCL_Check("barrier", [&] {d->snap_evaluated = d->Queue().ext_oneapi_submit_barrier();});
+	// the download on the copy queue, while the compute queue continues with the next timesteps
+	sycl::queue& copy = d->ctx->copy_q;
+	SYCL_Check("snapshot download", [&]
+	{
+		copy.ext_oneapi_submit_barrier({d->snap_evaluated});
+		d->snap_done = copy.memcpy(d->snap_host, d->snap_dev, d->snap_n*sizeof(float));
+	});
+	d->snap_taken = true;
+	volt = d->snap_host;
+	curr = d->snap_host + d->snap_nv;
+	return true;
+}
+
+int GPU_Backend_SYCL::AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count)
+{
+	const size_t n = region.Size();
+	if ((n==0) || (count==0))
+		return -1;
+	Impl::FieldDFT dft;
+	dft.count = count;
+	dft.currents = h_field;
+	void* lines = d->UploadRegion(region, dft.region);
+	dft.sums = lines ? d->TryAlloc<float2>(n*count) : NULL;
+	if (!dft.sums)
+	{
+		// not fatal: without device sums the dump sums the fields on the host
+		d->Free(lines);
+		std::cerr << "GPU_Backend_SYCL: not enough memory for a frequency domain dump on the device" << std::endl;
+		return -1;
+	}
+	SYCL_Check("memset", [&] {d->Queue().memset(dft.sums, 0, n*count*sizeof(float2));});
+	d->field_dfts.push_back(dft);
+	return d->field_dfts.size()-1;
+}
+
+void GPU_Backend_SYCL::AccumulateFieldDFT(int id, const std::vector<std::complex<float>>& weights)
+{
+	if ((id<0) || ((size_t)id>=d->field_dfts.size()))
+		return;
+	const Impl::FieldDFT& dft = d->field_dfts[id];
+	const unsigned int count = std::min((size_t)dft.count, weights.size());
+	const SYCL_GatherRegion R = dft.region;
+	const SYCL_GridDim N = d->dim;
+	const float* field = dft.currents ? d->curr : d->volt;
+	for (unsigned int k0=0; k0<count; k0+=DFT_WEIGHTS)
+	{
+		SYCL_DFTWeights W;
+		const unsigned int nw = std::min(count-k0, (unsigned int)DFT_WEIGHTS);
+		for (unsigned int k=0; k<nw; ++k)
+		{
+			W.w[k].x = weights[k0+k].real();
+			W.w[k].y = weights[k0+k].imag();
+		}
+		float2* sums = dft.sums + (size_t)k0*R.total;
+		SYCL_Launch(d, "field_dft", R.total, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			field_dft(it, field, R, N, W, nw, sums);
+		});
+	}
+}
+
+bool GPU_Backend_SYCL::ReadFieldDFT(int id, unsigned int k, std::vector<std::complex<float>>& sums)
+{
+	if ((id<0) || ((size_t)id>=d->field_dfts.size()) || (k>=d->field_dfts[id].count))
+		return false;
+	const Impl::FieldDFT& dft = d->field_dfts[id];
+	sums.resize(dft.region.total);
+	// std::complex<float> has the layout of float2
+	SYCL_Check("download", [&] {d->Queue().memcpy(sums.data(), dft.sums + (size_t)k*dft.region.total, sums.size()*sizeof(float2));});
+	d->Flush();
+	return true;
+}
+
+void GPU_Backend_SYCL::WaitSnapshot()
+{
+	// called on the dump thread: report errors instead of throwing (a default event, no snapshot taken, is complete)
+	try
+	{
+		d->snap_done.wait();
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "GPU_Backend_SYCL: field snapshot failed: " << e.what() << std::endl;
+	}
 }
 
 bool GPU_Backend_SYCL::CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy)
