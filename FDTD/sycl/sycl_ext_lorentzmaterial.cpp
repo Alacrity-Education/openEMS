@@ -15,13 +15,165 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Lorentz/Drude dispersive materials and conducting sheets, see Engine_Ext_LorentzMaterial.
-// Stub: the device implementation is ported in task T12 (from FDTD/hip/hip_ext_lorentzmaterial.hip).
-
 #include "sycl_internal.h"
+#include "FDTD/engine.h"
+#include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/engine_ext_lorentzmaterial.h"
+
+// Drude/Lorentz materials and conducting sheets, see Engine_Ext_LorentzMaterial
+// and Engine_Ext_Dispersive. One launch per dispersion order, one thread per mesh
+// position of that order (unique within an order). The ADE state and coefficients
+// are stored per order as [direction][position].
+struct ADEParam { size_t count; unsigned int lorentz; size_t sn; };
+
+// ADE update before the main update, reads the field
+static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, float* ade, float* lor, const float* c_int,
+                               const float* c_ext, const float* c_lor, const size_t* pos, ADEParam P)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (i>=P.count)
+		return;
+	for (unsigned int n=0; n<3; ++n)
+	{
+		const size_t k = n*P.count + i;
+		const float f = field[n*P.sn + pos[i]];
+		if (P.lorentz)
+		{
+			lor[k] = lor[k] + c_lor[k]*ade[k];
+			ade[k] = ade[k] * c_int[k];
+			ade[k] = ade[k] + c_ext[k]*(f - lor[k]);
+		}
+		else
+		{
+			ade[k] = ade[k] * c_int[k];
+			ade[k] = ade[k] + c_ext[k]*f;
+		}
+	}
+}
+
+// subtract the ADE current from the field
+static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, const float* ade, const size_t* pos, ADEParam P)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (i>=P.count)
+		return;
+	for (unsigned int n=0; n<3; ++n)
+	{
+		const size_t g = n*P.sn + pos[i];
+		field[g] = field[g] - ade[n*P.count + i];
+	}
+}
+
+class SYCL_Ext_LorentzMaterial : public GPU_Extension
+{
+public:
+	SYCL_Ext_LorentzMaterial(GPU_Backend_SYCL::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
+
+	virtual void DoPreVoltageUpdates() {for (size_t o=0; o<m_Volt.size(); ++o) Pre(m_Volt[o], d->volt);}
+	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) Apply(m_Volt[o], d->volt);}
+	virtual void DoPreCurrentUpdates() {for (size_t o=0; o<m_Curr.size(); ++o) Pre(m_Curr[o], d->curr);}
+	virtual void Apply2Current()       {for (size_t o=0; o<m_Curr.size(); ++o) Apply(m_Curr[o], d->curr);}
+
+protected:
+	//! one dispersion order of the voltages or currents
+	struct Order
+	{
+		ADEParam param;
+		size_t* pos;                //!< flat NIJK index of direction 0
+		float *ade, *lor;           //!< state
+		float *c_int, *c_ext, *c_lor;
+	};
+
+	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
+	float* Coefficients(size_t count, FDTD_FLOAT** c);
+	void Pre(Order& o, float* field)
+	{
+		const float* f = field;
+		float* ade = o.ade;
+		float* lor = o.lor;
+		const float* c_int = o.c_int;
+		const float* c_ext = o.c_ext;
+		const float* c_lor = o.c_lor;
+		const size_t* pos = o.pos;
+		const ADEParam param = o.param;
+		SYCL_Launch(d, "lorentz_pre", param.count, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			lorentz_pre(it, f, ade, lor, c_int, c_ext, c_lor, pos, param);
+		});
+	}
+	void Apply(Order& o, float* field)
+	{
+		float* f = field;
+		const float* ade = o.ade;
+		const size_t* pos = o.pos;
+		const ADEParam param = o.param;
+		SYCL_Launch(d, "dispersive_apply", param.count, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			dispersive_apply(it, f, ade, pos, param);
+		});
+	}
+
+	GPU_Backend_SYCL::Impl* d;
+	std::vector<Order> m_Volt;
+	std::vector<Order> m_Curr;
+};
+
+SYCL_Ext_LorentzMaterial::SYCL_Ext_LorentzMaterial(GPU_Backend_SYCL::Impl* impl, Operator_Ext_LorentzMaterial* op_ext)
+{
+	d = impl;
+	for (int o=0; o<op_ext->m_Order; ++o)
+	{
+		const size_t count = op_ext->m_LM_Count.at(o);
+		if (op_ext->m_volt_ADE_On[o])
+			Setup(m_Volt, count, op_ext->m_LM_pos[o], op_ext->m_volt_Lor_ADE_On[o],
+			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
+		if (op_ext->m_curr_ADE_On[o])
+			Setup(m_Curr, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
+			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
+	}
+}
+
+float* SYCL_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
+{
+	std::vector<float> data(3*(size_t)count, 0);
+	if (c)
+		for (int n=0; n<3; ++n)
+			for (size_t i=0; i<count; ++i)
+				data[n*count + i] = c[n][i];
+	return d->Alloc<float>(data.size(), data.data());
+}
+
+void SYCL_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+                                     bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
+{
+	if (count==0)
+		return;
+	Order ord;
+	ord.param.count = count;
+	ord.param.lorentz = lorentz;
+	ord.param.sn = d->numCells;
+
+	std::vector<size_t> flat(count);
+	for (size_t i=0; i<count; ++i)
+		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
+	ord.pos = d->Alloc<size_t>(count, flat.data());
+
+	ord.ade = d->Alloc<float>(3*(size_t)count);
+	ord.lor = d->Alloc<float>(3*(size_t)count);
+	ord.c_int = Coefficients(count, c_int);
+	ord.c_ext = Coefficients(count, c_ext);
+	ord.c_lor = Coefficients(count, c_lor);
+	orders.push_back(ord);
+}
 
 GPU_Extension* SYCL_CreateExt_LorentzMaterial(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)
 {
-	(void)d; (void)eng_ext; (void)eng;
-	return NULL;   // ported in task T12: until then the engine runs this extension on the host
+	(void)eng;
+	if (!dynamic_cast<Engine_Ext_LorentzMaterial*>(eng_ext))
+		return NULL;
+	Operator_Ext_LorentzMaterial* op_ext = dynamic_cast<Operator_Ext_LorentzMaterial*>(eng_ext->GetOperatorExtension());
+	if (!op_ext)
+		return NULL;
+	return new SYCL_Ext_LorentzMaterial(d, op_ext);
 }
