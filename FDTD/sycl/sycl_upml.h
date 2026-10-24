@@ -64,6 +64,8 @@ inline UPMLCoeffT<I> upml_coeff(const UPMLFusedArgs& A, typename SYCL_NoDeduce<I
 // Fused: upml_pre, the main update (update_voltages) and upml_post of the region node
 // (x, y, z), operation by operation the same (see GPU_UPMLFusionBox() for the conditions).
 // Reads volt_in, writes volt_out: the same field, or the two buffers of the fused step.
+// FACTOR: the main coefficients of modes 3/4 (see main_coeff()).
+template<bool FACTOR>
 inline void upml_fused_volt_node(float* volt_out, const float* volt_in, const float* curr, const UPMLFusedArgs& A,
                                  const SYCL_GridDim& N, const UPMLRegion& R,
                                  unsigned int x, unsigned int y, unsigned int z)
@@ -74,7 +76,7 @@ inline void upml_fused_volt_node(float* volt_out, const float* volt_in, const fl
 	const size_t xm = (gx>0) ? (size_t)N.ny*N.nz : 0;
 	const size_t ym = (gy>0) ? N.nz : 0;
 	const size_t zm = (gz>0) ? 1 : 0;
-	const SYCL_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
+	const SYCL_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 0);
 	float curl[3];
@@ -95,6 +97,7 @@ inline void upml_fused_volt_node(float* volt_out, const float* volt_in, const fl
 }
 
 // same for the currents (update_currents), which are not updated on the last mesh lines
+template<bool FACTOR>
 inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const float* volt, const UPMLFusedArgs& A,
                                  const SYCL_GridDim& N, const UPMLRegion& R,
                                  unsigned int x, unsigned int y, unsigned int z)
@@ -106,12 +109,12 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 9);
 	float curl[3] = {0, 0, 0};
-	SYCL_MainCoeff C = {};
+	SYCL_MainCoeffT<size_t, FACTOR> C = {};
 	if (update)
 	{
 		const size_t xp = (size_t)N.ny*N.nz;
 		const size_t yp = N.nz;
-		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
+		C = main_coeff<size_t, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
 		curl[0] = (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
 		curl[1] = (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
 		curl[2] = (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp]);
@@ -137,7 +140,7 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
 // if write (the node's own work-group; others compute the node again as a border voltage), the
 // same operations as upml_fused_volt_node. All loads come before the stores, which could alias
 // them for the compiler.
-template<typename I>
+template<typename I, bool FACTOR>
 inline void upml_volt_value(const float* __restrict__ volt, const float* __restrict__ curr, const UPMLFusedArgs& A,
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool write, float out[3])
@@ -147,7 +150,7 @@ inline void upml_volt_value(const float* __restrict__ volt, const float* __restr
 	const I xm = (gx>0) ? (I)N.ny*N.nz : 0;
 	const I ym = (gy>0) ? N.nz : 0;
 	const I zm = (gz>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
+	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
 	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 0);
@@ -174,7 +177,7 @@ inline void upml_volt_value(const float* __restrict__ volt, const float* __restr
 
 // ... and the currents of a slab node (the node's own work-group only, the flux in place), with the
 // curl of the new voltages (the operations of upml_fused_curr_node); update: not on the last mesh lines
-template<typename I>
+template<typename I, bool FACTOR>
 inline void upml_curr_value(const float* __restrict__ curr_in, float* __restrict__ curr_out, const UPMLFusedArgs& A,
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
@@ -184,9 +187,9 @@ inline void upml_curr_value(const float* __restrict__ curr_in, float* __restrict
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
 	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 9);
-	SYCL_MainCoeffT<I> C = {};
+	SYCL_MainCoeffT<I, FACTOR> C = {};
 	if (update)
-		C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
+		C = main_coeff<I, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
 	float c[3], f_help[3];
 	for (unsigned int n=0; n<3; ++n)
 	{

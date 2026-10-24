@@ -65,16 +65,19 @@ static inline void upml_post(const sycl::nd_item<3>& it, float* field, UPMLFused
 }
 
 // the fused kernels of a whole region, in place or from one buffer of the fused step into the other
+// (FACTOR: coefficient modes 3/4, see main_coeff())
+template<bool FACTOR>
 static inline void upml_fused_volt(const sycl::nd_item<3>& it, float* volt_out, const float* volt_in, const float* curr, UPMLFusedArgs A, SYCL_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_volt_node(volt_out, volt_in, curr, A, N, R, x, y, z);
+	upml_fused_volt_node<FACTOR>(volt_out, volt_in, curr, A, N, R, x, y, z);
 }
 
+template<bool FACTOR>
 static inline void upml_fused_curr(const sycl::nd_item<3>& it, float* curr_out, const float* curr_in, const float* volt, UPMLFusedArgs A, SYCL_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
+	upml_fused_curr_node<FACTOR>(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
 // The UPML regions the region kernels update in the fused step (those along x and y), all in one
@@ -106,20 +109,22 @@ struct SYCL_UPMLGroup
 	const unsigned int z = t % R.lz; \
 	const unsigned int y = t / R.lz;
 
+template<bool FACTOR>
 static inline void upml_group_volt(const sycl::nd_item<3>& it, float* volt_out, const float* volt_in, const float* curr,
                                    const SYCL_UPMLGroup* G, unsigned int count, SYCL_GridDim N)
 {
 	UPML_GROUP_THREAD
 	const UPMLFusedArgs A = G[r].volt;
-	upml_fused_volt_node(volt_out, volt_in, curr, A, N, R, x, y, z);
+	upml_fused_volt_node<FACTOR>(volt_out, volt_in, curr, A, N, R, x, y, z);
 }
 
+template<bool FACTOR>
 static inline void upml_group_curr(const sycl::nd_item<3>& it, float* curr_out, const float* curr_in, const float* volt,
                                    const SYCL_UPMLGroup* G, unsigned int count, SYCL_GridDim N)
 {
 	UPML_GROUP_THREAD
 	const UPMLFusedArgs A = G[r].curr;
-	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
+	upml_fused_curr_node<FACTOR>(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
 class SYCL_Ext_UPML : public GPU_Extension
@@ -204,10 +209,16 @@ protected:
 		const UPMLFusedArgs A = VoltArgs();
 		const SYCL_GridDim N = d->dim;
 		const UPMLRegion R = m_Region;
-		SYCL_Launch(d, "upml_fused_volt", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
-		{
-			upml_fused_volt(it, volt_out, volt_in, curr, A, N, R);
-		});
+		if (d->coeff_mode>=3)
+			SYCL_Launch(d, "upml_fused_volt", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
+			{
+				upml_fused_volt<true>(it, volt_out, volt_in, curr, A, N, R);
+			});
+		else
+			SYCL_Launch(d, "upml_fused_volt", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
+			{
+				upml_fused_volt<false>(it, volt_out, volt_in, curr, A, N, R);
+			});
 	}
 	void FuseCurr(float* curr_out)
 	{
@@ -216,10 +227,16 @@ protected:
 		const UPMLFusedArgs A = CurrArgs();
 		const SYCL_GridDim N = d->dim;
 		const UPMLRegion R = m_Region;
-		SYCL_Launch(d, "upml_fused_curr", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
-		{
-			upml_fused_curr(it, curr_out, curr_in, volt, A, N, R);
-		});
+		if (d->coeff_mode>=3)
+			SYCL_Launch(d, "upml_fused_curr", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
+			{
+				upml_fused_curr<true>(it, curr_out, curr_in, volt, A, N, R);
+			});
+		else
+			SYCL_Launch(d, "upml_fused_curr", R.lz*R.ly, 1, R.lx, [=](sycl::nd_item<3> it)
+			{
+				upml_fused_curr<false>(it, curr_out, curr_in, volt, A, N, R);
+			});
 	}
 	// the fused step: the regions of the group (see SYCL_UPMLGroup), into the next buffers
 	void FuseGroup(bool currents)
@@ -230,15 +247,26 @@ protected:
 		const SYCL_UPMLGroup* G = m_Group;
 		const unsigned int count = m_GroupCount;
 		const SYCL_GridDim N = d->dim;
-		if (currents)
+		const bool factor = d->coeff_mode>=3;
+		if (currents && factor)
 			SYCL_Launch(d, "upml_group_curr", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
 			{
-				upml_group_curr(it, out, curr, volt, G, count, N);
+				upml_group_curr<true>(it, out, curr, volt, G, count, N);
+			});
+		else if (currents)
+			SYCL_Launch(d, "upml_group_curr", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				upml_group_curr<false>(it, out, curr, volt, G, count, N);
+			});
+		else if (factor)
+			SYCL_Launch(d, "upml_group_volt", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				upml_group_volt<true>(it, out, volt, curr, G, count, N);
 			});
 		else
 			SYCL_Launch(d, "upml_group_volt", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
 			{
-				upml_group_volt(it, out, volt, curr, G, count, N);
+				upml_group_volt<false>(it, out, volt, curr, G, count, N);
 			});
 	}
 	UPMLFusedArgs Args(float* flux, const float* c_old, const float* c_fo, const float* c_fn, const float* full_a, const float* full_b)
