@@ -714,9 +714,22 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
 
+	const char* index_bits = d->index32 ? ", 32 bit indices" : ", 64 bit indices";
+
 	// upload the final operator coefficients, including all changes by operator extensions.
-	// The coefficient sets (GPU_FindSets(), coeff_mode 1/2) are added in task T6; the kernels
-	// read either form through main_coeff().
+	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
+	// every distinct set of the 12 coefficients of a node once and a set index per node
+	GPU_CoeffSets sets;
+	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
+	{
+		d->coeff_mode = sets.mode;
+		d->index = d->AllocIndex(sets);
+		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		if (g_settings.GetVerboseLevel()>1)
+			std::cout << "GPU_Backend_SYCL: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
+			          << (sets.mode==1 ? 16 : 32) << " bit index)" << index_bits << std::endl;
+		return true;
+	}
 
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
@@ -727,7 +740,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->ii = upload(2);
 	d->iv = upload(3);
 	if (g_settings.GetVerboseLevel()>1)
-		std::cout << "GPU_Backend_SYCL: full coefficient arrays" << (d->index32 ? ", 32 bit indices" : ", 64 bit indices") << std::endl;
+		std::cout << "GPU_Backend_SYCL: full coefficient arrays" << index_bits << std::endl;
 	return true;
 }
 
