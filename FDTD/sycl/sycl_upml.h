@@ -74,7 +74,7 @@ inline void upml_fused_volt_node(float* volt_out, const float* volt_in, const fl
 	const size_t xm = (gx>0) ? (size_t)N.ny*N.nz : 0;
 	const size_t ym = (gy>0) ? N.nz : 0;
 	const size_t zm = (gz>0) ? 1 : 0;
-	const SYCL_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0);
+	const SYCL_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 0);
 	float curl[3];
@@ -106,12 +106,12 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 9);
 	float curl[3] = {0, 0, 0};
-	SYCL_MainCoeff C = {A.ca, A.cb, 0};
+	SYCL_MainCoeff C = {};
 	if (update)
 	{
 		const size_t xp = (size_t)N.ny*N.nz;
 		const size_t yp = N.nz;
-		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6);
+		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
 		curl[0] = (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
 		curl[1] = (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
 		curl[2] = (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp]);
@@ -147,7 +147,7 @@ inline void upml_volt_value(const float* __restrict__ volt, const float* __restr
 	const I xm = (gx>0) ? (I)N.ny*N.nz : 0;
 	const I ym = (gy>0) ? N.nz : 0;
 	const I zm = (gz>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 0);
+	const SYCL_MainCoeffT<I> C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
 	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 0);
@@ -184,9 +184,9 @@ inline void upml_curr_value(const float* __restrict__ curr_in, float* __restrict
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
 	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 9);
-	SYCL_MainCoeffT<I> C = {A.ca, A.cb, 0};
+	SYCL_MainCoeffT<I> C = {};
 	if (update)
-		C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 6);
+		C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
 	float c[3], f_help[3];
 	for (unsigned int n=0; n<3; ++n)
 	{
