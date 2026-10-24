@@ -24,29 +24,7 @@ if(ENABLE_HIP)
   endif()
 endif()
 
-# SYCL GPU backend (Intel GPUs), only built as a plugin (see the top level)
-if(ENABLE_SYCL)
-  set(SYCL_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/gpu_backend_sycl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_excitation.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_upml.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_mur_abc.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_lorentzmaterial.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_debyematerial.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_lumpedRLC.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_tfsf.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_absorbing_bc.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_steadystate.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_ext_cylinder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_multigrid.cpp
-  )
-  set(SYCL_SOURCES ${SYCL_SOURCES} PARENT_SCOPE)
-  if(OPENEMS_GPU_PLUGINS)
-    set(SYCL_PLUGIN_SOURCES ${SYCL_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/sycl/sycl_plugin.cpp PARENT_SCOPE)
-    # in a plugin, not in libopenEMS
-    set(SYCL_SOURCES "")
-  endif()
-endif()
+# the SYCL GPU backend is a plugin only, built from FDTD/sycl (see the top level)
 
 # Metal GPU backend (Objective-C++)
 if(APPLE AND ENABLE_METAL)
@@ -69,7 +47,6 @@ endif()
 set(SOURCES
   ${SOURCES}
   ${HIP_SOURCES}
-  ${SYCL_SOURCES}
   ${METAL_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator.cpp
