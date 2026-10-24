@@ -132,103 +132,116 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
 	}
 }
 
-// The fused step (update_fused) with the UPML regions in the kernel: the voltages of a region
-// node from the current fields and flux (A.flux), the new flux into A.flux_out if write (the
-// node's own block; other blocks compute it again), the same operations as upml_fused_volt_node
+// The fused step (update_fused) with the UPML z slabs in the kernel: the voltages of a slab node
+// (gx, gy, gz) of region R from the current fields and flux (A.flux), the new flux into A.flux_out
+// if write (the node's own work-group; others compute the node again as a border voltage), the
+// same operations as upml_fused_volt_node. All loads come before the stores, which could alias
+// them for the compiler.
 template<typename I>
-inline void upml_volt_value(const float* volt, const float* curr, const UPMLFusedArgs& A,
+inline void upml_volt_value(const float* __restrict__ volt, const float* __restrict__ curr, const UPMLFusedArgs& A,
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool write, float out[3])
 {
-	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
 	const I sn = (I)N.nx*N.ny*N.nz;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
 	const I xm = (gx>0) ? (I)N.ny*N.nz : 0;
 	const I ym = (gy>0) ? N.nz : 0;
 	const I zm = (gz>0) ? 1 : 0;
 	const SYCL_MainCoeffT<I> C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 0);
+	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
-	const UPMLCoeffT<I> U = upml_coeff<I>(A, (x*R.ly + y)*R.lz + z, cells, 0);
+	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 0);
 	float curl[3];
 	curl[0] = (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
 	curl[1] = (curr[i] - curr[i-zm] - curr[2*sn+i] + curr[2*sn+i-xm]);
 	curl[2] = (curr[sn+i] - curr[sn+i-xm] - curr[i] + curr[i-ym]);
+	float flux[3], f_help[3];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const I l = upml_local<I>(R, n, x, y, z);
-		const I g = n*sn + i;
-		const float f_help = U.old[n*U.s]*volt[g] - U.fo[n*U.s]*A.flux[l];
+		flux[n] = A.flux[n*cells + l0];   // upml_local()
+		f_help[n] = U.old[n*U.s]*volt[n*sn + i] - U.fo[n*U.s]*flux[n];
+	}
+	for (unsigned int n=0; n<3; ++n)
+	{
 		float v;
-		v  = A.flux[l] * C.a[n*C.s];
+		v  = flux[n] * C.a[n*C.s];
 		v += C.b[n*C.s] * curl[n];
 		if (write)
-			A.flux_out[l] = v;
-		out[n] = f_help + U.fn[n*U.s]*v;
+			A.flux_out[n*cells + l0] = v;
+		out[n] = f_help[n] + U.fn[n*U.s]*v;
 	}
 }
 
-// ... and the currents of a region node (the node's own block only, the flux in place), with the
-// curl of the new voltages (the expressions of upml_fused_curr_node); update: not on the last mesh lines
+// ... and the currents of a slab node (the node's own work-group only, the flux in place), with the
+// curl of the new voltages (the operations of upml_fused_curr_node); update: not on the last mesh lines
 template<typename I>
-inline void upml_curr_value(const float* curr_in, float* curr_out, const UPMLFusedArgs& A,
+inline void upml_curr_value(const float* __restrict__ curr_in, float* __restrict__ curr_out, const UPMLFusedArgs& A,
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
 {
-	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
 	const I sn = (I)N.nx*N.ny*N.nz;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
+	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
-	const UPMLCoeffT<I> U = upml_coeff<I>(A, (x*R.ly + y)*R.lz + z, cells, 9);
+	const UPMLCoeffT<I> U = upml_coeff<I>(A, l0, cells, 9);
 	SYCL_MainCoeffT<I> C = {A.ca, A.cb, 0};
 	if (update)
 		C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 6);
+	float c[3], f_help[3];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const I l = upml_local<I>(R, n, x, y, z);
-		const I g = n*sn + i;
-		const float f_help = U.old[n*U.s]*curr_in[g] - U.fo[n*U.s]*A.flux[l];
-		float c = A.flux[l];
+		c[n] = A.flux[n*cells + l0];
+		f_help[n] = U.old[n*U.s]*curr_in[n*sn + i] - U.fo[n*U.s]*c[n];
+	}
+	for (unsigned int n=0; n<3; ++n)
+	{
 		if (update)
 		{
-			c  = c * C.a[n*C.s];
-			c += C.b[n*C.s] * curl[n];
+			c[n] = c[n] * C.a[n*C.s];
+			c[n] += C.b[n*C.s] * curl[n];
 		}
-		A.flux[l] = c;
-		curr_out[g] = f_help + U.fn[n*U.s]*c;
+		A.flux[n*cells + l0] = c[n];
+		curr_out[n*sn + i] = f_help[n] + U.fn[n*U.s]*c[n];
 	}
 }
 
-//! The UPML regions updated by the fused step kernel (update_fused): a node outside the main
-//! nodes [lo, hi) belongs to the region of the side it is on, in the order x, y, z (see
-//! Operator_Ext_UPML::Create_UPML(), checked in SYCL_Ext_UPML::CanFuse())
-struct SYCL_FusedRegions
-{
-	unsigned int count;       //!< 0: none, the region kernels update the UPML regions
-	SYCL_GridDim lo, hi;
-	int side[6];              //!< region of the side x<lo, x>=hi, y<lo, y>=hi, z<lo, z>=hi (-1: none)
-	UPMLRegion R[6];
-	UPMLFusedArgs volt[6], curr[6];
-};
-
-inline int fused_region_of(const SYCL_FusedRegions& F, unsigned int x, unsigned int y, unsigned int z)
-{
-	if (x<F.lo.nx) return F.side[0];
-	if (x>=F.hi.nx) return F.side[1];
-	if (y<F.lo.ny) return F.side[2];
-	if (y>=F.hi.ny) return F.side[3];
-	if (z<F.lo.nz) return F.side[4];
-	if (z>=F.hi.nz) return F.side[5];
-	return -1;
-}
-
 //! UPML regions at the lower/upper z end covering the x/y range of the main updates: the
-//! main kernels update them too (full z lines instead of short rows, see sycl_ext_upml.cpp)
+//! main kernels update them too (full z lines instead of short rows, see sycl_ext_upml.cpp),
+//! the separate ones (update_voltages/update_currents) as the fused step (update_fused)
 struct SYCL_ZSlabs
 {
 	unsigned int z_lo, z_hi;       //!< main update nodes: z_lo <= z < z_hi, below: slab lo, above: slab hi
-	unsigned int t_lo, t_int;      //!< threads along z of slab lo and of the main update nodes, whole sub-groups (0: no padding)
+	unsigned int t_lo, t_int;      //!< separate updates: threads along z of slab lo and of the main update nodes, whole sub-groups (0: no padding)
 	UPMLRegion R_lo, R_hi;
+	//! the fused step reads the voltage flux from flux and writes the new one into flux_out (two
+	//! buffers, the UPML hooks swap them every step), the separate updates in place
 	UPMLFusedArgs volt_lo, volt_hi, curr_lo, curr_hi;
 };
+
+//! \a lo ? \a a : \a b, field by field: a pick of kernel arguments that stays in registers (a
+//! reference to one of two by-value structs makes the work-items copy them to private memory);
+//! \a lo should be the same for a work-group, else every work-item holds its own pointers
+inline UPMLFusedArgs upml_pick(bool lo, const UPMLFusedArgs& a, const UPMLFusedArgs& b)
+{
+	UPMLFusedArgs r;
+	r.flux = lo ? a.flux : b.flux;
+	r.flux_out = lo ? a.flux_out : b.flux_out;
+	r.c_old = lo ? a.c_old : b.c_old;
+	r.c_fo = lo ? a.c_fo : b.c_fo;
+	r.c_fn = lo ? a.c_fn : b.c_fn;
+	r.u_index = lo ? a.u_index : b.u_index;
+	r.u_sets = lo ? a.u_sets : b.u_sets;
+	r.u_mode = lo ? a.u_mode : b.u_mode;
+	r.index = a.index; r.ca = a.ca; r.cb = a.cb; r.mode = a.mode;   // the main coefficients, the same in both
+	return r;
+}
+
+inline UPMLRegion upml_pick(bool lo, const UPMLRegion& a, const UPMLRegion& b)
+{
+	UPMLRegion r;
+	r.sx = lo ? a.sx : b.sx; r.sy = lo ? a.sy : b.sy; r.sz = lo ? a.sz : b.sz;
+	r.lx = lo ? a.lx : b.lx; r.ly = lo ? a.ly : b.ly; r.lz = lo ? a.lz : b.lz;
+	return r;
+}
 
 #endif // SYCL_UPML_H

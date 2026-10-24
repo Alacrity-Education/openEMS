@@ -207,7 +207,7 @@ inline void fused_volt(const float* __restrict__ volt, const float* __restrict__
 #define FUSED_TY 8    // work-items along y, the last row computes the border voltages only
 #define FUSED_XC 4    // x lines per work-group (default): short work-groups are faster, despite the voltages of one more x line
 
-// The arguments of update_fused but the UPML regions (passed separately, see launch_fused),
+// The arguments of update_fused but the UPML z slabs (passed separately, see launch_fused),
 // so that a launch is written once for every tile shape
 struct SYCL_FusedArgs
 {
@@ -223,6 +223,13 @@ struct SYCL_FusedArgs
 	unsigned int mode;
 	SYCL_GridDim N, B, E;
 	unsigned int xc;
+	//! main nodes z_lo <= z < z_hi, the UPML z slabs below and above (see SYCL_ZSlabs)
+	unsigned int z_lo, z_hi;
+	//! the z tiles: t_slab slab tiles, then the main tiles from zm_start up to zm_end (see update_fused)
+	unsigned int t_slab, zm_start, zm_end;
+	//! the slab tiles of slab lo and hi: lines of sw work-items, sr lines (the last one the border),
+	//! sy tiles along y, sn tiles (see launch_fused)
+	unsigned int sw_lo, sw_hi, sr_lo, sr_hi, sy_lo, sy_hi, sn_lo, sn_hi;
 };
 
 // Fused step: the voltages and currents of the main nodes [B, E) in one pass, from the current
@@ -233,17 +240,26 @@ struct SYCL_FusedArgs
 // A work-group marches along xc x lines of a (TZ-1)x(TY-1) tile in (z,y). At each x it computes
 // the new voltages of the tile and its border (+z, +y) into local memory and of the next x line
 // (registers), then the new currents of the tile. The border voltages of other tiles are
-// computed again (they only read the current fields), those outside the main nodes (UPML
-// regions) come from volt_out, where the UPML regions stored them before.
-// With the UPML regions in the kernel (REG, F->count>0, [B, E) is the whole grid), the region
-// nodes are computed like the main nodes, from the current flux (the new voltage flux goes to a
-// second buffer, written by the node's own work-group; the current flux in place). F is the
-// device copy of the regions (see Impl::FusedRegionsOnDevice()); without them (REG false) it is
-// NULL and never read.
-// sV is the local memory tile sV[3][TY][TZ], flattened: sV[c][ty][tz] is sV[(c*TY + ty)*TZ + tz].
-template<typename I, unsigned int TZ, unsigned int TY, bool REG>
+// computed again (they only read the current fields), those outside [B, E) (the UPML regions
+// along x and y) come from volt_out, where the region kernels stored them before.
+// With the UPML z slabs in the kernel (SLABS, see SYCL_ZSlabs), [B, E) covers them along z:
+// a slab node is computed with the UPML update (upml_volt_value, upml_curr_value), from the
+// current voltage flux into the second flux buffer (written by the node's own work-group only,
+// as other work-groups compute it again as a border voltage) and the current flux in place.
+// The first t_slab tiles along z hold the slab tiles: a slab is a few nodes deep (e.g. 8), so a
+// slab tile packs its y lines one after the other, lines of sw = depth+1 work-items (the last one
+// the border along z), sr lines (the last one the border along y): e.g. 28 lines of 9 in 256
+// work-items, nearly all busy, and only one line in 27 computed again as a border. The main tiles
+// cover [z_lo, zm_end), the lines of slab hi start at zm_end = z_hi-1, its last main node: so the
+// main tiles (and their border nodes) take the main code path only, the slab tiles the UPML path
+// but for their first (slab hi) or border (slab lo) node, which takes the cheaper main path.
+// With zm_start = B.nz, zm_end = E.nz and no slab tiles, one tiling covers all, and rows crossing
+// z_lo or z_hi run both code paths.
+// sV is the local memory tile sV[3][TY*TZ]: the place of a work-item is its local linear id
+// ty*TZ + tz, a row (line along z) is rowlen (TZ, or sw in slab tiles) places long.
+template<typename I, unsigned int TZ, unsigned int TY, bool SLABS>
 inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<float, 1>& sV,
-                         const SYCL_FusedArgs& a, const SYCL_FusedRegions* F)
+                         const SYCL_FusedArgs& a, const SYCL_ZSlabs& Z)
 {
 	const float* __restrict__ volt_in = a.volt_in;
 	const float* __restrict__ curr_in = a.curr_in;
@@ -253,57 +269,83 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 	const SYCL_GridDim& B = a.B;
 	const SYCL_GridDim& E = a.E;
 	const unsigned int tz = it.get_local_id(2), ty = it.get_local_id(1);
-	const unsigned int z = B.nz + (unsigned int)it.get_group(2)*(TZ-1) + tz;
-	const unsigned int y = B.ny + (unsigned int)it.get_group(1)*(TY-1) + ty;
+	const unsigned int place = ty*TZ + tz;
+	// the tile: its first node (y0, z0), the end of its class along z (slab lo, main nodes, slab hi),
+	// its lines (rows of rowlen work-items, the last row the border) and the place of the work-item in it
+	const unsigned int gz = it.get_group(2);
+	unsigned int y0, z0, z_end, rows, row, col, rowlen;
+	bool lo;   // slab nodes of the tile are in slab lo, else in slab hi; the same for the work-group
+	if (SLABS && (gz<a.t_slab))
+	{
+		const unsigned int k = gz*(unsigned int)it.get_group_range(1) + (unsigned int)it.get_group(1);
+		if (k>=a.sn_lo+a.sn_hi)
+			return;   // the whole work-group: no barrier waits for it
+		lo = k<a.sn_lo;
+		const unsigned int kk = lo ? k : k-a.sn_lo;
+		const unsigned int sy = lo ? a.sy_lo : a.sy_hi;
+		rowlen = lo ? a.sw_lo : a.sw_hi;
+		rows = lo ? a.sr_lo : a.sr_hi;
+		row = place/rowlen;
+		col = place%rowlen;
+		y0 = B.ny + (kk%sy)*(rows-1);
+		z0 = (lo ? B.nz : a.zm_end) + (kk/sy)*(rowlen-1);
+		z_end = lo ? a.z_lo : E.nz;
+	}
+	else
+	{
+		rowlen = TZ;
+		rows = TY;
+		row = ty;
+		col = tz;
+		y0 = B.ny + (unsigned int)it.get_group(1)*(TY-1);
+		z0 = a.zm_start + (gz-a.t_slab)*(TZ-1);
+		z_end = a.zm_end;
+		lo = z0<a.z_lo;   // one tiling only: the main nodes are at least TZ long (see DecideFusedStep())
+	}
+	const unsigned int z = z0 + col;
+	const unsigned int y = y0 + row;
 	const unsigned int xs = B.nx + (unsigned int)it.get_group(0)*a.xc;
 	const unsigned int xe = sycl::min(xs+a.xc, E.nx);
-	const bool main_yz = (z<E.nz) && (y<E.ny);                          // a main node line
-	const bool owner = main_yz && (tz<TZ-1) && (ty<TY-1);  // written by this work-group
-	const bool in_grid = (z<N.nz) && (y<N.ny);
+	const bool live = (z0<z_end) && (z<=z_end) && (row<rows);   // a node of the tile or its border
+	const bool main_yz = live && (z<E.nz) && (y<E.ny);   // a node line computed here
+	const bool owner = (z<z_end) && (y<E.ny) && (col<rowlen-1) && (row<rows-1);   // written by this work-group
+	const bool read_yz = live && (y<=E.ny) && (z<N.nz) && (y<N.ny);   // a border line outside [B, E): from volt_out
+	const bool slab = SLABS && ((z<a.z_lo) || (z>=a.z_hi));   // a node of a UPML z slab
 	const I sn = (I)N.nx*N.ny*N.nz;
-	auto sv = [&](unsigned int c, unsigned int j, unsigned int k) -> float& {return sV[(c*TY + j)*TZ + k];};
+	auto sv = [&](unsigned int c, unsigned int p) -> float& {return sV[c*TY*TZ + p];};
 
-	// the UPML region of node (x, y, z) in the kernel, -1: none; fused_region_of on a private
-	// copy of the layout (F is global memory, which the compiler reads again after every store)
-	SYCL_FusedRegions L;
-	L.count = 0;
-	if constexpr (REG)
+	// the UPML z slab of the slab nodes of the work-item (by value: see upml_pick())
+	UPMLFusedArgs Av, Ac;
+	UPMLRegion R;
+	if constexpr (SLABS)
 	{
-		L.count = F->count;
-		L.lo = F->lo;
-		L.hi = F->hi;
-		for (int s=0; s<6; ++s)
-			L.side[s] = F->side[s];
+		Av = upml_pick(lo, Z.volt_lo, Z.volt_hi);
+		Ac = upml_pick(lo, Z.curr_lo, Z.curr_hi);
+		R = upml_pick(lo, Z.R_lo, Z.R_hi);
 	}
-	auto region_of = [&](unsigned int x) -> int
+	else
 	{
-		if constexpr (REG)
-			return L.count ? fused_region_of(L, x, y, z) : -1;
-		else
-			return -1;
-	};
+		(void)lo;
+		Av = Ac = UPMLFusedArgs();
+		R = UPMLRegion();
+	}
 
-	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
+	// the new voltages at x: computed on the nodes of [B, E), else from volt_out (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
 	{
 		if (main_yz && (x<E.nx))
 		{
-			const int r = region_of(x);
-			if (r<0)
+			if (!slab)
 				fused_volt<I>(volt_in, curr_in, a.index, a.va, a.vb, a.mode, N, x, y, z, v);
-			else if constexpr (REG)
-			{
-				const UPMLFusedArgs A = F->volt[r];
-				const UPMLRegion R = F->R[r];
-				upml_volt_value<I>(volt_in, curr_in, A, N, R, x, y, z, owner && (x<xe), v);
-			}
+			else if constexpr (SLABS)
+				upml_volt_value<I>(volt_in, curr_in, Av, N, R, x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
 				volt_out[i] = v[0]; volt_out[sn+i] = v[1]; volt_out[2*sn+i] = v[2];
 			}
 		}
-		else if (in_grid && (x<N.nx))
+		else if (read_yz && (x<N.nx))
 		{
 			const I i = nijk<I>(N, 0, x, y, z);
 			v[0] = volt_out[i]; v[1] = volt_out[sn+i]; v[2] = volt_out[2*sn+i];
@@ -314,7 +356,7 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 
 	float v[3];
 	volt_at(xs, v);
-	sv(0, ty, tz) = v[0]; sv(1, ty, tz) = v[1]; sv(2, ty, tz) = v[2];
+	sv(0, place) = v[0]; sv(1, place) = v[1]; sv(2, place) = v[2];
 	sycl::group_barrier(it.get_group());
 	for (unsigned int x=xs; x<xe; ++x)
 	{
@@ -327,19 +369,15 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 			float curl[3] = {0, 0, 0};
 			if (update)
 			{
-				curl[0] = (sv(2, ty, tz) - sv(2, ty+1, tz) - sv(1, ty, tz) + sv(1, ty, tz+1));
-				curl[1] = (sv(0, ty, tz) - sv(0, ty, tz+1) - sv(2, ty, tz) + v1[2]);
-				curl[2] = (sv(1, ty, tz) - v1[1] - sv(0, ty, tz) + sv(0, ty+1, tz));
+				const unsigned int zp = place+1, yp = place+rowlen;
+				curl[0] = (sv(2, place) - sv(2, yp) - sv(1, place) + sv(1, zp));
+				curl[1] = (sv(0, place) - sv(0, zp) - sv(2, place) + v1[2]);
+				curl[2] = (sv(1, place) - v1[1] - sv(0, place) + sv(0, yp));
 			}
-			const int r = region_of(x);
-			if (r>=0)
+			if (slab)
 			{
-				if constexpr (REG)
-				{
-					const UPMLFusedArgs A = F->curr[r];
-					const UPMLRegion R = F->R[r];
-					upml_curr_value<I>(curr_in, curr_out, A, N, R, x, y, z, update, curl);
-				}
+				if constexpr (SLABS)
+					upml_curr_value<I>(curr_in, curr_out, Ac, N, R, x, y, z, update, curl);
 			}
 			else if (update)
 			{
@@ -361,18 +399,48 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 			}
 		}
 		sycl::group_barrier(it.get_group());
-		sv(0, ty, tz) = v1[0]; sv(1, ty, tz) = v1[1]; sv(2, ty, tz) = v1[2];
+		sv(0, place) = v1[0]; sv(1, place) = v1[1]; sv(2, place) = v1[2];
 		sycl::group_barrier(it.get_group());
 	}
 }
 
 // One launch of update_fused: work-groups of (1, TY, TZ) work-items (TZ along z, dimension 2),
-// one sub-group of TZ per tile row. F: the device copy of the UPML regions in the kernel, or NULL.
+// one sub-group of TZ per tile row. Z: the UPML z slabs in the kernel, or NULL. aligned: slab
+// tiles and main tiles from z_lo (see update_fused), else one tiling from B.nz.
 template<typename I, unsigned int TZ, unsigned int TY>
-static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_FusedRegions* F)
+static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& args, const SYCL_ZSlabs* Z, bool aligned)
 {
-	const size_t grid_z = (a.E.nz-a.B.nz+TZ-2)/(TZ-1);
+	SYCL_FusedArgs a = args;
+	auto tiles = [](unsigned int n, unsigned int w) {return (n+w-2)/(w-1);};
 	const size_t grid_y = (a.E.ny-a.B.ny+TY-2)/(TY-1);
+	a.sn_lo = a.sn_hi = 0;
+	a.sw_lo = a.sw_hi = a.sr_lo = a.sr_hi = a.sy_lo = a.sy_hi = 2;
+	if (Z && aligned)
+	{
+		// slab hi from its last main node on (see update_fused)
+		a.zm_start = a.z_lo;
+		a.zm_end = (a.E.nz>a.z_hi) ? a.z_hi-1 : a.E.nz;
+		// a slab tile: lines of up to TZ work-items, as many as fit the work-group
+		auto slab = [&](unsigned int depth, unsigned int& w, unsigned int& r, unsigned int& ny, unsigned int& n)
+		{
+			if (depth==0)
+				return;
+			w = std::min(depth+1, TZ);
+			r = (TY*TZ)/w;
+			ny = tiles(a.E.ny-a.B.ny, r);
+			n = ny*tiles(depth, w);
+		};
+		slab(a.z_lo-a.B.nz, a.sw_lo, a.sr_lo, a.sy_lo, a.sn_lo);
+		slab(a.E.nz-a.zm_end, a.sw_hi, a.sr_hi, a.sy_hi, a.sn_hi);
+		a.t_slab = (a.sn_lo+a.sn_hi+grid_y-1)/grid_y;
+	}
+	else
+	{
+		a.t_slab = 0;
+		a.zm_start = a.B.nz;
+		a.zm_end = a.E.nz;
+	}
+	const size_t grid_z = a.t_slab + tiles(a.zm_end-a.zm_start, TZ);
 	const size_t grid_x = (a.E.nx-a.B.nx+a.xc-1)/a.xc;
 	if (grid_x==0 || grid_y==0 || grid_z==0)
 		return;
@@ -390,17 +458,21 @@ static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, con
 		d->Queue().submit([&](sycl::handler& h)
 		{
 			sycl::local_accessor<float, 1> sV(sycl::range<1>(3*TY*TZ), h);
-			if (F)
+			if (Z)
+			{
+				const SYCL_ZSlabs slabs = *Z;
 				h.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> it)
 					[[sycl::reqd_work_group_size(1, TY, TZ)]] [[sycl::reqd_sub_group_size(TZ)]]
 				{
-					update_fused<I, TZ, TY, true>(it, sV, a, F);
+					update_fused<I, TZ, TY, true>(it, sV, a, slabs);
 				});
+			}
 			else
 				h.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> it)
 					[[sycl::reqd_work_group_size(1, TY, TZ)]] [[sycl::reqd_sub_group_size(TZ)]]
 				{
-					update_fused<I, TZ, TY, false>(it, sV, a, NULL);
+					const SYCL_ZSlabs none = {};   // never read
+					update_fused<I, TZ, TY, false>(it, sV, a, none);
 				});
 		});
 	}
@@ -416,24 +488,24 @@ static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, con
 }
 
 template<typename I, unsigned int TZ>
-static void launch_fused_ty(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_FusedRegions* F, unsigned int ty)
+static void launch_fused_ty(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_ZSlabs* Z, bool aligned, unsigned int ty)
 {
 	switch (ty)
 	{
-		case 4:  launch_fused<I, TZ, 4>(d, a, F); break;
-		case 16: launch_fused<I, TZ, 16>(d, a, F); break;
-		default: launch_fused<I, TZ, 8>(d, a, F); break;
+		case 4:  launch_fused<I, TZ, 4>(d, a, Z, aligned); break;
+		case 16: launch_fused<I, TZ, 16>(d, a, Z, aligned); break;
+		default: launch_fused<I, TZ, 8>(d, a, Z, aligned); break;
 	}
 }
 
 // the index type of the fused step, see GPU_Backend_SYCL::Impl::index32
 template<unsigned int TZ>
-static void launch_fused_tz(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_FusedRegions* F, unsigned int ty, bool index32)
+static void launch_fused_tz(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_ZSlabs* Z, bool aligned, unsigned int ty, bool index32)
 {
 	if (index32)
-		launch_fused_ty<unsigned int, TZ>(d, a, F, ty);
+		launch_fused_ty<unsigned int, TZ>(d, a, Z, aligned, ty);
 	else
-		launch_fused_ty<size_t, TZ>(d, a, F, ty);
+		launch_fused_ty<size_t, TZ>(d, a, Z, aligned, ty);
 }
 
 // the currents of the given main nodes again (update_currents), after the voltage extensions
@@ -681,12 +753,6 @@ GPU_Backend_SYCL::Impl::Impl()
 	memset(&zslabs, 0, sizeof(zslabs));
 	fused_step = -1;
 	fused_blockers = 0;
-	memset(&fregions, 0, sizeof(fregions));
-	fregions.count = 0;
-	fregions_dev = NULL;
-	memset(fregions_up, 0, sizeof(fregions_up));
-	fregions_up_valid[0] = fregions_up_valid[1] = false;
-	fregions_up_next = 0;
 	volt_next = curr_next = NULL;
 	fixup = NULL;
 	index32 = false;
@@ -742,14 +808,13 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 			          << " blocking extension(s) or grid(s))" << std::endl;
 		return false;
 	}
-	// Default policy: no fused step on a grid with UPML regions. On the B580 the separate updates,
-	// with the UPML regions along z in the main kernels, are faster than both fused variants
-	// (benchmark/bench.py, MC/s, separate / fused with the regions in the kernel / fused with the
-	// region kernels, OPENEMS_SYCL_FUSED_REGIONS=0):
-	//   pml S 6006 / 4493 / 6154, pml M 8051 / 7133 / 8589, inhomogeneous S 3152 / 2953 / 1819
-	// In the kernel the region nodes share sub-groups with the main nodes (both code paths run);
-	// as region kernels the z slabs have short rows (about 70 us each on inhomogeneous S).
-	// Without UPML the fused step is faster (ideal S 11114 vs 10793, M 13701 vs 11759).
+	// Default policy: no fused step on a grid with UPML regions. On the B580 the fused step (the
+	// UPML z slabs in its kernel, the regions along x and y in one region kernel per half-step) is
+	// faster on a uniform grid, but not on a graded one with many coefficient sets, where its border
+	// voltages computed again cost about as much as the second pass of the separate updates saves
+	// (benchmark/bench.py, MC/s, 2 repeats, separate / fused):
+	//   pml S 5969 / 6317, pml M 8069 / 8944, inhomogeneous S 3097 / 2892, inhomogeneous M 4322 / 4346
+	// Without UPML the fused step is faster (ideal S 11004 vs 10885, M 13553 vs 11758).
 	if (!upml.empty() && !(env && (atoi(env)==1)))
 	{
 		if (g_settings.GetVerboseLevel()>1)
@@ -758,39 +823,37 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	}
 
 	// The kernel arguments (captured by value) must fit the device's max_parameter_size: the
-	// arguments of SYCL_FusedArgs, the region pointer and a margin for the local memory accessor
-	// and the ranges, about 400 bytes. The B580 reports 2048 bytes.
-	// The UPML regions (SYCL_FusedRegions, about 1.35 KB) are not among them, although with them
-	// the arguments (about 1.5 KB) would fit the B580 too: the kernel picks a region by its
-	// number, and a by-value struct indexed at run time is copied to private memory by every
-	// work-item, which made the fused step 30 times slower than the separate updates. They are
-	// in a device buffer instead (see FusedRegionsOnDevice()); without it, no regions in the kernel.
+	// arguments of SYCL_FusedArgs, the UPML z slabs and a margin for the local memory accessor
+	// and the ranges, about 850 bytes. The B580 reports 2048 bytes.
+	// The kernel reads the slabs at fixed places (upml_pick() selects by value): a by-value struct
+	// indexed at run time would be copied to private memory by every work-item, which made an
+	// earlier variant with all six regions indexed by number 30 times slower than the separate updates.
 	const size_t margin = 256;
-	const size_t arg_bytes = sizeof(SYCL_FusedArgs) + sizeof(const SYCL_FusedRegions*) + margin;
-	if (arg_bytes > ctx->max_parameter_size)
+	if (sizeof(SYCL_FusedArgs) + margin > ctx->max_parameter_size)
 	{
 		std::cout << "GPU_Backend_SYCL: the kernel arguments of the fused step do not fit the device ("
-		          << arg_bytes << " > " << ctx->max_parameter_size << " bytes), using separate updates" << std::endl;
+		          << sizeof(SYCL_FusedArgs) + margin << " > " << ctx->max_parameter_size << " bytes), using separate updates" << std::endl;
 		return false;
 	}
-	// OPENEMS_SYCL_FUSED_REGIONS=0: the UPML regions stay with the region kernels (into the next
-	// buffers, see SYCL_Ext_UPML) and the kernel updates the main nodes only. On the B580 this is
-	// faster on pml (no divergence between region and main nodes in a sub-group), slower on
-	// inhomogeneous (the z slabs as region kernels), see the default policy above.
-	if (const char* regions = getenv("OPENEMS_SYCL_FUSED_REGIONS"))
-		if (atoi(regions)==0)
-			fregions.count = 0;
-	if (fregions.count && !fregions_dev)
-	{
-		fregions_dev = TryAlloc<SYCL_FusedRegions>(2);
-		if (!fregions_dev)
-			fregions.count = 0;   // the region kernels update the regions
-	}
+	// OPENEMS_SYCL_FUSED_REGIONS=0: the UPML z slabs stay with the region kernels (into the next
+	// buffers, see SYCL_Ext_UPML) as the regions along x and y always do, the kernel updates the
+	// main nodes only (slower on the B580: the z slabs as region kernels have short rows).
+	// 2: the z slabs in the kernel with one z tiling (rows crossing the slab ends run both code
+	// paths, to measure the alignment, see update_fused). Unset or 1: in the kernel, aligned tiles.
+	const int regions = getenv("OPENEMS_SYCL_FUSED_REGIONS") ? atoi(getenv("OPENEMS_SYCL_FUSED_REGIONS")) : 1;
+	if (regions==0)
+		zslab_lo = zslab_hi = false;
+	// The kernel picks the slab of a tile by its first node: with one tiling the main nodes must be
+	// at least a tile row (32) long along z, so that no tile has nodes of both slabs; the slab tiles
+	// need one main node (the border of slab lo).
+	if ((zslab_lo || zslab_hi) && ((sizeof(SYCL_FusedArgs) + sizeof(SYCL_ZSlabs) + margin > ctx->max_parameter_size)
+	                               || (main_stop.nz < main_start.nz + ((regions==2) ? 32 : 1))))
+		zslab_lo = zslab_hi = false;
 
 	// The currents of the nodes that read a voltage changed between the half-steps are computed
-	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
-	// updated in place): then the region kernels update the regions.
-	const bool folded = fregions.count>0;
+	// again, on main nodes. The regions along x and y are updated by the region kernels after the
+	// voltage extensions; a UPML z slab in the kernel cannot be (its current flux is updated in
+	// place): then its region kernels update it too.
 	std::set<size_t> nodes;
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
@@ -810,23 +873,20 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 			}
 			bool ok = true;
 			for (int n=0; n<3; ++n)
-				ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
+				ok &= (c[n]+1<n_lines[n]);
+			for (int n=0; n<2; ++n)
+				ok &= (c[n]>=start[n]) && (c[n]<stop[n]);
 			if (!ok)
 				continue;
-			if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
-				fregions.count = 0;   // a region node: no regions in the kernel
-			nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
+			if (c[2]<start[2])
+				zslab_lo = false;   // a node of slab lo: its region kernels update it
+			else if (c[2]>=stop[2])
+				zslab_hi = false;
+			else
+				nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
 		}
 	}
-	std::vector<size_t> list;
-	for (std::set<size_t>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
-	{
-		const unsigned int c[3] = {(unsigned int)(*it/((size_t)dim.ny*dim.nz)), (unsigned int)((*it/dim.nz)%dim.ny), (unsigned int)(*it%dim.nz)};
-		if ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
-			list.push_back(*it);   // main nodes only, the region kernels update the others after the extensions
-		else if (fregions.count)
-			list.push_back(*it);
-	}
+	std::vector<size_t> list(nodes.begin(), nodes.end());
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
@@ -849,27 +909,11 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	if (g_settings.GetVerboseLevel()>1)
 	{
 		std::cout << "GPU_Backend_SYCL: fused voltage and current updates" << (index32 ? ", 32 bit indices" : "");
-		if (fregions.count)
-			std::cout << " (" << fregions.count << " UPML regions in the kernel)";
+		if (zslab_lo || zslab_hi)
+			std::cout << " (" << zslab_lo+zslab_hi << " UPML regions along z in the kernel)";
 		std::cout << std::endl;
 	}
 	return true;
-}
-
-const SYCL_FusedRegions* GPU_Backend_SYCL::Impl::FusedRegionsOnDevice()
-{
-	// The UPML hooks set the voltage flux buffers of the step in fregions, alternating two: after
-	// the first two steps both versions are on the device and the launch only picks one.
-	for (unsigned int k=0; k<2; ++k)
-		if (fregions_up_valid[k] && (memcmp(&fregions_up[k], &fregions, sizeof(fregions))==0))
-			return fregions_dev + k;
-	// in order with the kernels: a launch still reading the replaced copy runs before the copy
-	const unsigned int k = fregions_up_next;
-	fregions_up_next ^= 1;
-	memcpy(&fregions_up[k], &fregions, sizeof(fregions));
-	fregions_up_valid[k] = true;
-	SYCL_Check("fused step regions", [&] {Queue().memcpy(fregions_dev + k, &fregions_up[k], sizeof(SYCL_FusedRegions)).wait();});
-	return fregions_dev + k;
 }
 
 void GPU_Backend_SYCL::Impl::ResetZSlabs()
@@ -1232,27 +1276,29 @@ void GPU_Backend_SYCL::UpdateVoltages()
 	const bool c = d->coeff_mode>0;
 	if (d->DecideFusedStep())
 	{
-		// the main nodes, or the whole grid with the UPML regions in the kernel (see update_fused)
+		// the main nodes and the UPML z slabs in the kernel (see update_fused)
 		SYCL_GridDim B = d->main_start;
 		SYCL_GridDim E = d->main_stop;
-		if (d->fregions.count)
-		{
-			B.nx = B.ny = B.nz = 0;
-			E = d->dim;
-		}
+		if (d->zslab_lo)
+			B.nz = d->zslabs.R_lo.sz;
+		if (d->zslab_hi)
+			E.nz = d->zslabs.R_hi.sz + d->zslabs.R_hi.lz;
 		static const unsigned int xc = getenv("OPENEMS_SYCL_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_SYCL_FUSED_XC"))) : FUSED_XC;
 		// the tile is a sub-group wide (see FUSED_TZ); OPENEMS_SYCL_FUSED_TY sets the other side
 		static const unsigned int ty = getenv("OPENEMS_SYCL_FUSED_TY") ? std::max(2, atoi(getenv("OPENEMS_SYCL_FUSED_TY"))) : FUSED_TY;
 		static const unsigned int tz = (getenv("OPENEMS_SYCL_FUSED_TZ") && (atoi(getenv("OPENEMS_SYCL_FUSED_TZ"))==16)) ? 16 : FUSED_TZ;
+		// OPENEMS_SYCL_FUSED_REGIONS=2: one z tiling, see DecideFusedStep()
+		static const bool aligned = !(getenv("OPENEMS_SYCL_FUSED_REGIONS") && (atoi(getenv("OPENEMS_SYCL_FUSED_REGIONS"))==2));
 		const SYCL_FusedArgs a = { (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, (const void*)d->index,
 		                           (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi),
 		                           (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv),
-		                           d->coeff_mode, d->dim, B, E, xc };
-		const SYCL_FusedRegions* F = d->fregions.count ? d->FusedRegionsOnDevice() : NULL;
+		                           d->coeff_mode, d->dim, B, E, xc, d->zslabs.z_lo, d->zslabs.z_hi, 0, 0, 0,
+		                           0, 0, 0, 0, 0, 0, 0, 0 };
+		const SYCL_ZSlabs* Z = (d->zslab_lo || d->zslab_hi) ? &d->zslabs : NULL;
 		if (tz==16)
-			launch_fused_tz<16>(d, a, F, ty, d->index32);
+			launch_fused_tz<16>(d, a, Z, aligned, ty, d->index32);
 		else
-			launch_fused_tz<32>(d, a, F, ty, d->index32);
+			launch_fused_tz<32>(d, a, Z, aligned, ty, d->index32);
 		// only the voltages: UpdateCurrents swaps the currents, once the fix-up has read the old ones
 		std::swap(d->volt, d->volt_next);
 		return;

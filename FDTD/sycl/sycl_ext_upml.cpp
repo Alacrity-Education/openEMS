@@ -77,6 +77,51 @@ static inline void upml_fused_curr(const sycl::nd_item<3>& it, float* curr_out, 
 	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
+// The UPML regions the region kernels update in the fused step (those along x and y), all in one
+// launch per half-step: the regions are small (e.g. 8 nodes thick), as separate kernels the launch
+// and the ramp of each one cost more than their nodes on small grids. A table in device memory
+// (constant, as these regions update their flux in place), one region per work-group.
+#define UPML_GROUP_SIZE 256   // work-items per work-group: cells of an x plane of the region
+struct SYCL_UPMLGroup
+{
+	UPMLRegion R;
+	UPMLFusedArgs volt, curr;
+	unsigned int first;    //!< the first work-group of the region
+	unsigned int blocks;   //!< work-groups per x plane of the region
+};
+
+// the region (the same for the work-group) and the cell of the work-item; returns past the region's cells
+#define UPML_GROUP_THREAD \
+	const unsigned int g = it.get_group(2); \
+	unsigned int r = 0; \
+	for (unsigned int k=1; k<count; ++k) \
+		if (g>=G[k].first) \
+			r = k; \
+	const UPMLRegion R = G[r].R; \
+	const unsigned int l = g - G[r].first; \
+	const unsigned int x = l / G[r].blocks; \
+	const unsigned int t = (l % G[r].blocks)*UPML_GROUP_SIZE + it.get_local_id(2); \
+	if (t>=R.lz*R.ly) \
+		return; \
+	const unsigned int z = t % R.lz; \
+	const unsigned int y = t / R.lz;
+
+static inline void upml_group_volt(const sycl::nd_item<3>& it, float* volt_out, const float* volt_in, const float* curr,
+                                   const SYCL_UPMLGroup* G, unsigned int count, SYCL_GridDim N)
+{
+	UPML_GROUP_THREAD
+	const UPMLFusedArgs A = G[r].volt;
+	upml_fused_volt_node(volt_out, volt_in, curr, A, N, R, x, y, z);
+}
+
+static inline void upml_group_curr(const sycl::nd_item<3>& it, float* curr_out, const float* curr_in, const float* volt,
+                                   const SYCL_UPMLGroup* G, unsigned int count, SYCL_GridDim N)
+{
+	UPML_GROUP_THREAD
+	const UPMLFusedArgs A = G[r].curr;
+	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
+}
+
 class SYCL_Ext_UPML : public GPU_Extension
 {
 public:
@@ -85,20 +130,24 @@ public:
 
 	// fused: nothing before the main update, the region update after it (unless done by the main kernels);
 	// fused step (see update_fused): the voltages of the region before it (the main nodes next to the
-	// region need them), the currents after the voltage extensions, into the next buffers
+	// region need them), the currents after the voltage extensions, into the next buffers; a z slab
+	// in the kernel only alternates its voltage flux buffers
 	virtual void DoPreVoltageUpdates()
 	{
 		if (!Fused())
 			Pre(d->volt, VoltArgs(), 0);
-		else if ((d->fused_step>0) && d->fregions.count)
+		else if ((d->fused_step>0) && m_InMain)
 		{
 			// in the kernel: the current voltage flux in, the new one into the second buffer,
-			// as blocks that only need a border voltage compute the node again on the old flux
-			d->fregions.volt[m_Side].flux = m_VoltFlux;
-			d->fregions.volt[m_Side].flux_out = m_VoltFlux2;
+			// as work-groups that only need a border voltage compute the node again on the old flux
+			UPMLFusedArgs& A = (m_ZSlab<0) ? d->zslabs.volt_lo : d->zslabs.volt_hi;
+			A.flux = m_VoltFlux;
+			A.flux_out = m_VoltFlux2;
 			std::swap(m_VoltFlux, m_VoltFlux2);
 		}
-		else if (d->fused_step>0)
+		else if ((d->fused_step>0) && m_GroupCount)
+			FuseGroup(false);
+		else if ((d->fused_step>0) && !m_Grouped)
 			FuseVolt(d->volt_next);
 	}
 	virtual void DoPostVoltageUpdates()
@@ -112,7 +161,9 @@ public:
 	{
 		if (!Fused())
 			Pre(d->curr, CurrArgs(), 9);
-		else if ((d->fused_step>0) && !d->fregions.count)
+		else if ((d->fused_step>0) && m_GroupCount)
+			FuseGroup(true);
+		else if ((d->fused_step>0) && !m_InMain && !m_Grouped)
 			FuseCurr(d->curr_next);
 	}
 	virtual void DoPostCurrentUpdates()
@@ -170,6 +221,26 @@ protected:
 			upml_fused_curr(it, curr_out, curr_in, volt, A, N, R);
 		});
 	}
+	// the fused step: the regions of the group (see SYCL_UPMLGroup), into the next buffers
+	void FuseGroup(bool currents)
+	{
+		const float* volt = d->volt;
+		const float* curr = d->curr;
+		float* out = currents ? d->curr_next : d->volt_next;
+		const SYCL_UPMLGroup* G = m_Group;
+		const unsigned int count = m_GroupCount;
+		const SYCL_GridDim N = d->dim;
+		if (currents)
+			SYCL_Launch(d, "upml_group_curr", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				upml_group_curr(it, out, curr, volt, G, count, N);
+			});
+		else
+			SYCL_Launch(d, "upml_group_volt", (size_t)m_GroupBlocks*UPML_GROUP_SIZE, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				upml_group_volt(it, out, volt, curr, G, count, N);
+			});
+	}
 	UPMLFusedArgs Args(float* flux, const float* c_old, const float* c_fo, const float* c_fn, const float* full_a, const float* full_b)
 	{
 		UPMLFusedArgs A;
@@ -192,8 +263,12 @@ protected:
 	Engine* m_Eng;
 	UPMLRegion m_Region;
 	bool m_InMain;   //!< fused: updated by the main kernels (see SYCL_ZSlabs)
-	int m_Side;      //!< fused step with the regions in the kernel: the side of the region (see SYCL_FusedRegions)
-	float* m_VoltFlux2;   //!< ... and the second buffer of the voltage flux, written by the block that owns the node
+	int m_ZSlab;     //!< -1: slab lo, 1: slab hi, 0: not a z slab
+	float* m_VoltFlux2;   //!< fused step: the second buffer of the voltage flux of a z slab, written by the work-group that owns the node
+	bool m_Grouped;              //!< fused step: updated by the group launch (see SYCL_UPMLGroup) ...
+	SYCL_UPMLGroup* m_Group;     //!< ... of this extension, the first of the group: the device table,
+	unsigned int m_GroupCount;   //!< its number of regions (0: not the first)
+	unsigned int m_GroupBlocks;  //!< and of work-groups
 
 	float *m_VoltFlux, *m_CurrFlux;
 	float *m_VV, *m_VVFO, *m_VVFN;   //!< mode 0 only, else NULL
@@ -209,8 +284,11 @@ SYCL_Ext_UPML::SYCL_Ext_UPML(GPU_Backend_SYCL::Impl* impl, Operator_Ext_UPML* op
 	d = impl;
 	m_Eng = eng;
 	m_InMain = false;
-	m_Side = -1;
+	m_ZSlab = 0;
 	m_VoltFlux2 = NULL;
+	m_Grouped = false;
+	m_Group = NULL;
+	m_GroupCount = m_GroupBlocks = 0;
 	m_Region.sx = op_ext->m_StartPos[0];
 	m_Region.sy = op_ext->m_StartPos[1];
 	m_Region.sz = op_ext->m_StartPos[2];
@@ -269,7 +347,13 @@ SYCL_Ext_UPML::~SYCL_Ext_UPML()
 	d->main_stop = d->dim;
 	d->ResetZSlabs();
 	for (size_t r=0; r<d->upml.size(); ++r)
-		static_cast<SYCL_Ext_UPML*>(d->upml[r])->m_InMain = false;
+	{
+		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
+		u->m_InMain = false;
+		u->m_ZSlab = 0;
+		u->m_Grouped = false;
+		u->m_GroupCount = 0;
+	}
 }
 
 bool SYCL_Ext_UPML::Fused()
@@ -281,7 +365,7 @@ bool SYCL_Ext_UPML::Fused()
 		d->upml_fused = (env && (atoi(env)==0)) ? 0 : CanFuse();
 		if (d->upml_fused && (g_settings.GetVerboseLevel()>1))
 			std::cout << "GPU_Backend_SYCL: " << d->upml.size() << " UPML regions fused with the main updates ("
-			          << d->zslab_lo+d->zslab_hi << " along z in the main kernels)" << std::endl;
+			          << d->zslab_lo+d->zslab_hi << " along z in the main " << ((d->fused_step>0) ? "kernel" : "kernels") << ")" << std::endl;
 		if (!d->upml_fused)
 			d->fused_blockers++;   // the fused step needs the fused UPML
 	}
@@ -307,80 +391,10 @@ bool SYCL_Ext_UPML::CanFuse()
 	d->main_stop.nx = stop[0]; d->main_stop.ny = stop[1]; d->main_stop.nz = stop[2];
 	d->ResetZSlabs();
 
-	// The fused step (see update_fused) can update the regions in its kernel, if they are on the
-	// sides of the main nodes in the order x, y, z (as Operator_Ext_UPML::Create_UPML() makes them),
-	// else the region kernels update them.
-	SYCL_FusedRegions& F = d->fregions;
-	F.count = 0;
-	F.lo = d->main_start;
-	F.hi = d->main_stop;
-	bool sides_ok = true;
-	for (int s=0; s<6; ++s)
-		F.side[s] = -1;
-	for (size_t r=0; r<d->upml.size(); ++r)
-	{
-		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
-		const UPMLRegion& R = u->m_Region;
-		const unsigned int sR[3] = {R.sx, R.sy, R.sz};
-		const unsigned int lR[3] = {R.lx, R.ly, R.lz};
-		const unsigned int lo[3] = {F.lo.nx, F.lo.ny, F.lo.nz};
-		const unsigned int hi[3] = {F.hi.nx, F.hi.ny, F.hi.nz};
-		const unsigned int N[3] = {d->dim.nx, d->dim.ny, d->dim.nz};
-		int side = -1;
-		for (int n=0; n<3 && side<0; ++n)
-			for (int h=0; h<2 && side<0; ++h)
-			{
-				// along n below lo or from hi on; along the directions before n the main nodes, after it all
-				bool match = h ? ((sR[n]==hi[n]) && (sR[n]+lR[n]==N[n])) : ((sR[n]==0) && (lR[n]==lo[n]));
-				for (int m=0; m<3; ++m)
-					if (m<n)
-						match &= (sR[m]==lo[m]) && (lR[m]==hi[m]-lo[m]);
-					else if (m>n)
-						match &= (sR[m]==0) && (lR[m]==N[m]);
-				if (match && (F.side[2*n+h]<0))
-					side = 2*n+h;
-			}
-		if (side<0)
-		{
-			sides_ok = false;
-			break;
-		}
-		F.side[side] = F.count;
-		F.R[F.count] = R;
-		F.volt[F.count] = u->VoltArgs();
-		F.curr[F.count] = u->CurrArgs();
-		u->m_Side = F.count;
-		++F.count;
-	}
-	if (!sides_ok)
-		F.count = 0;
-	// the second flux buffers only for the regions in the kernel, which are optional (as the fused step)
-	for (size_t r=0; (r<d->upml.size()) && F.count; ++r)
-	{
-		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
-		const size_t n = 3*(size_t)u->m_Region.lx*u->m_Region.ly*u->m_Region.lz;
-		u->m_VoltFlux2 = d->TryAlloc<float>(n);
-		if (u->m_VoltFlux2)
-			SYCL_Check("UPML flux", [&] {d->Queue().memcpy(u->m_VoltFlux2, u->m_VoltFlux, n*sizeof(float));});
-		else
-			F.count = 0;
-	}
-	const bool fused_step = d->DecideFusedStep();
-	if (!fused_step)
-		F.count = 0;
-	if (!F.count)
-		for (size_t r=0; r<d->upml.size(); ++r)
-		{
-			SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
-			d->Free(u->m_VoltFlux2);
-			u->m_VoltFlux2 = NULL;
-		}
-	if (fused_step)
-		return true;
-
 	// The regions along z (which cover the x/y range of the main updates) are updated by the
 	// main kernels, along full z lines: a region of their own would only have short rows
-	// (e.g. 9 nodes), which use the memory transactions poorly.
+	// (e.g. 9 nodes), which use the memory transactions poorly. The fused step can leave them
+	// to the region kernels (see DecideFusedStep()).
 	for (size_t r=0; r<d->upml.size(); ++r)
 	{
 		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
@@ -394,6 +408,7 @@ bool SYCL_Ext_UPML::CanFuse()
 			d->zslabs.volt_lo = u->VoltArgs();
 			d->zslabs.curr_lo = u->CurrArgs();
 			u->m_InMain = true;
+			u->m_ZSlab = -1;
 		}
 		else if (!d->zslab_hi && (R.sz==stop[2]))
 		{
@@ -402,6 +417,79 @@ bool SYCL_Ext_UPML::CanFuse()
 			d->zslabs.volt_hi = u->VoltArgs();
 			d->zslabs.curr_hi = u->CurrArgs();
 			u->m_InMain = true;
+			u->m_ZSlab = 1;
+		}
+	}
+
+	// In the fused step a z slab node is computed by several work-groups: the voltage flux goes
+	// into a second buffer (optional, as the fused step: without it, its region kernels update it)
+	for (size_t r=0; r<d->upml.size(); ++r)
+	{
+		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
+		if (!u->m_ZSlab)
+			continue;
+		const size_t n = 3*(size_t)u->m_Region.lx*u->m_Region.ly*u->m_Region.lz;
+		u->m_VoltFlux2 = d->TryAlloc<float>(n);
+		if (u->m_VoltFlux2)
+			SYCL_Check("UPML flux", [&] {d->Queue().memcpy(u->m_VoltFlux2, u->m_VoltFlux, n*sizeof(float));});
+		else if (u->m_ZSlab<0)
+			d->zslab_lo = false;
+		else
+			d->zslab_hi = false;
+	}
+	const bool fused_step = d->DecideFusedStep();
+	for (size_t r=0; r<d->upml.size(); ++r)
+	{
+		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
+		// the decision may leave a slab to its region kernels
+		if (u->m_ZSlab && !((u->m_ZSlab<0) ? d->zslab_lo : d->zslab_hi))
+		{
+			u->m_InMain = false;
+			u->m_ZSlab = 0;
+		}
+		if (!fused_step || !u->m_ZSlab)
+		{
+			d->Free(u->m_VoltFlux2);
+			u->m_VoltFlux2 = NULL;
+		}
+	}
+
+	// the fused step: the other regions in one launch per half-step (optional: else one each)
+	std::vector<SYCL_UPMLGroup> group;
+	unsigned int blocks = 0;
+	for (size_t r=0; fused_step && (r<d->upml.size()); ++r)
+	{
+		SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
+		if (u->m_InMain)
+			continue;
+		SYCL_UPMLGroup e;
+		e.R = u->m_Region;
+		e.volt = u->VoltArgs();
+		e.curr = u->CurrArgs();
+		e.first = blocks;
+		e.blocks = (e.R.lz*e.R.ly + UPML_GROUP_SIZE-1)/UPML_GROUP_SIZE;
+		blocks += e.blocks*e.R.lx;
+		group.push_back(e);
+	}
+	if (group.size()>1)
+	{
+		SYCL_UPMLGroup* table = d->TryAlloc<SYCL_UPMLGroup>(group.size());
+		if (table)
+		{
+			SYCL_Check("UPML group", [&] {d->Queue().memcpy(table, group.data(), group.size()*sizeof(SYCL_UPMLGroup)).wait();});
+			bool first = true;   // the first one launches the group
+			for (size_t r=0; r<d->upml.size(); ++r)
+			{
+				SYCL_Ext_UPML* u = static_cast<SYCL_Ext_UPML*>(d->upml[r]);
+				u->m_Grouped = !u->m_InMain;
+				if (u->m_Grouped && first)
+				{
+					u->m_Group = table;
+					u->m_GroupCount = group.size();
+					u->m_GroupBlocks = blocks;
+					first = false;
+				}
+			}
 		}
 	}
 	return true;
