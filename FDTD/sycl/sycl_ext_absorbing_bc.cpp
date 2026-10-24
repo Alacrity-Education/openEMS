@@ -24,7 +24,7 @@
 // currents), see Engine_Ext_Absorbing_BC. One thread per (i,j) of the sheet,
 // i along m_nyP, j along m_nyPP. The state and coefficient arrays have the full
 // sheet size ni x nj, the currents use ni-1 x nj-1 of it.
-struct ABCParam { int ny, nyP, nyPP; unsigned int line, line_shift; unsigned int startP, startPP; unsigned int ni, nj, stride; };
+struct ABCParam { int ny, nyP, nyPP; unsigned int line, line_shift; unsigned int startP, startPP; unsigned int ni, nj, stride; unsigned int swap; };
 
 //! state and coefficients of one field
 struct ABCData
@@ -43,10 +43,14 @@ inline size_t abc_index(const SYCL_GridDim& N, const ABCParam& P, unsigned int n
 	return nijk(N, n, pos[0], pos[1], pos[2]);
 }
 
-// thread index: j along x-threads, i along y-threads; the arrays have a row length of stride
+// thread index: j along dimension 2, i along dimension 1, or the other way round (swap: the
+// contiguous dimension along the axis with the smaller memory stride); the arrays have a row
+// length of stride
 #define ABC_THREAD \
-	const unsigned int j = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
-	const unsigned int i = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1); \
+	const unsigned int t2 = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
+	const unsigned int t1 = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1); \
+	const unsigned int j = P.swap ? t1 : t2; \
+	const unsigned int i = P.swap ? t2 : t1; \
 	if (i>=P.ni || j>=P.nj) \
 		return; \
 	const unsigned int ij = i*P.stride + j;
@@ -108,9 +112,9 @@ protected:
 		const SYCL_GridDim N = d->dim;
 		const ABCParam P = param;
 		if (post)
-			SYCL_Launch(d, name, P.nj, P.ni, 1, [=](sycl::nd_item<3> it) {abc_post(it, field, D, N, P);});
+			SYCL_Launch(d, name, P.swap ? P.ni : P.nj, P.swap ? P.nj : P.ni, 1, [=](sycl::nd_item<3> it) {abc_post(it, field, D, N, P);});
 		else
-			SYCL_Launch(d, name, P.nj, P.ni, 1, [=](sycl::nd_item<3> it) {abc_pre(it, field, D, N, P);});
+			SYCL_Launch(d, name, P.swap ? P.ni : P.nj, P.swap ? P.nj : P.ni, 1, [=](sycl::nd_item<3> it) {abc_pre(it, field, D, N, P);});
 	}
 
 	//! abc_apply_volt or abc_apply_curr (curr==true)
@@ -121,9 +125,9 @@ protected:
 		const SYCL_GridDim N = d->dim;
 		const ABCParam P = param;
 		if (curr)
-			SYCL_Launch(d, name, P.nj, P.ni, 1, [=](sycl::nd_item<3> it) {abc_apply_curr(it, field, D, N, P);});
+			SYCL_Launch(d, name, P.swap ? P.ni : P.nj, P.swap ? P.nj : P.ni, 1, [=](sycl::nd_item<3> it) {abc_apply_curr(it, field, D, N, P);});
 		else
-			SYCL_Launch(d, name, P.nj, P.ni, 1, [=](sycl::nd_item<3> it) {abc_apply_volt(it, field, D, N, P);});
+			SYCL_Launch(d, name, P.swap ? P.ni : P.nj, P.swap ? P.nj : P.ni, 1, [=](sycl::nd_item<3> it) {abc_apply_volt(it, field, D, N, P);});
 	}
 
 	GPU_Backend_SYCL::Impl* d;
@@ -150,6 +154,7 @@ SYCL_Ext_Absorbing_BC::SYCL_Ext_Absorbing_BC(GPU_Backend_SYCL::Impl* impl, Opera
 	base.startP = op_ext->m_sheetX0[op_ext->m_nyP];
 	base.startPP = op_ext->m_sheetX0[op_ext->m_nyPP];
 	base.stride = nj;
+	base.swap = base.nyP > base.nyPP;   // the higher axis has the smaller stride
 
 	m_VoltParam = base;
 	m_VoltParam.line = start;

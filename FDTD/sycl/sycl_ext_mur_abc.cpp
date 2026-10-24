@@ -21,8 +21,10 @@
 #include "FDTD/extensions/engine_ext_mur_abc.h"
 
 // First order Mur ABC on one boundary plane, see Engine_Ext_Mur_ABC.
-// One thread per (i,j) of the plane, i along m_nyP, j along m_nyPP.
-struct MurParam { int ny, nyP, nyPP; unsigned int line, line_shift; unsigned int ni, nj; };
+// One thread per (i,j) of the plane, i along m_nyP, j along m_nyPP. The contiguous work-item
+// dimension (2) runs along the one of them with the smaller memory stride (swap: along i), so
+// that neighbouring work-items access neighbouring field values where the plane allows it.
+struct MurParam { int ny, nyP, nyPP; unsigned int line, line_shift; unsigned int ni, nj; unsigned int swap; };
 
 inline size_t mur_index(const SYCL_GridDim& N, const MurParam& P, unsigned int n, unsigned int line, unsigned int i, unsigned int j)
 {
@@ -33,10 +35,12 @@ inline size_t mur_index(const SYCL_GridDim& N, const MurParam& P, unsigned int n
 	return nijk(N, n, pos[0], pos[1], pos[2]);
 }
 
-// thread index: j along x-threads, i along y-threads
+// thread index: j along dimension 2, i along dimension 1, or the other way round (swap)
 #define MUR_THREAD \
-	const unsigned int j = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
-	const unsigned int i = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1); \
+	const unsigned int t2 = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
+	const unsigned int t1 = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1); \
+	const unsigned int j = P.swap ? t1 : t2; \
+	const unsigned int i = P.swap ? t2 : t1; \
 	if (i>=P.ni || j>=P.nj) \
 		return; \
 	const unsigned int ij = i*P.nj + j;
@@ -78,7 +82,7 @@ public:
 		const float* c_nyPP = m_Coeff_nyPP;
 		const SYCL_GridDim dim = d->dim;
 		const MurParam param = m_Param;
-		SYCL_Launch(d, "mur_pre", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		SYCL_Launch(d, "mur_pre", m_Param.swap ? m_Param.ni : m_Param.nj, m_Param.swap ? m_Param.nj : m_Param.ni, 1, [=](sycl::nd_item<3> it)
 		{
 			mur_pre(it, volt, v_nyP, v_nyPP, c_nyP, c_nyPP, dim, param);
 		});
@@ -94,7 +98,7 @@ public:
 		const float* c_nyPP = m_Coeff_nyPP;
 		const SYCL_GridDim dim = d->dim;
 		const MurParam param = m_Param;
-		SYCL_Launch(d, "mur_post", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		SYCL_Launch(d, "mur_post", m_Param.swap ? m_Param.ni : m_Param.nj, m_Param.swap ? m_Param.nj : m_Param.ni, 1, [=](sycl::nd_item<3> it)
 		{
 			mur_post(it, volt, v_nyP, v_nyPP, c_nyP, c_nyPP, dim, param);
 		});
@@ -108,7 +112,7 @@ public:
 		const float* v_nyPP = m_Volt_nyPP;
 		const SYCL_GridDim dim = d->dim;
 		const MurParam param = m_Param;
-		SYCL_Launch(d, "mur_apply", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		SYCL_Launch(d, "mur_apply", m_Param.swap ? m_Param.ni : m_Param.nj, m_Param.swap ? m_Param.nj : m_Param.ni, 1, [=](sycl::nd_item<3> it)
 		{
 			mur_apply(it, volt, v_nyP, v_nyPP, dim, param);
 		});
@@ -139,6 +143,7 @@ SYCL_Ext_Mur_ABC::SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mu
 	m_Param.line_shift = op_ext->m_LineNr_Shift;
 	m_Param.ni = op_ext->m_numLines[0];
 	m_Param.nj = op_ext->m_numLines[1];
+	m_Param.swap = m_Param.nyP > m_Param.nyPP;   // the higher axis has the smaller stride
 
 	const size_t count = (size_t)m_Param.ni*m_Param.nj;
 	m_Volt_nyP  = d->Alloc<float>(count);

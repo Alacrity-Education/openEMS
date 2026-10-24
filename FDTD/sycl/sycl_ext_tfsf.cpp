@@ -30,6 +30,7 @@ struct TFSFParam
 	unsigned int n, nP, nPP;                               // plane normal and the two field components
 	unsigned int line, startP, startPP;                    // plane position
 	unsigned int ni, nj;                                   // plane size (along nP, nPP)
+	unsigned int swap;                                     // i along the contiguous work-item dimension (2)
 };
 
 // signal index for a delay of k timesteps, same as Engine_Ext_TFSF::m_DelayLookup
@@ -50,8 +51,11 @@ inline unsigned int tfsf_lookup(unsigned int k, const TFSFParam& P)
 static inline void tfsf_apply(const sycl::nd_item<3>& it, float* field, const unsigned int* delay, const float* delta,
                               const float* amp, const float* signal, SYCL_GridDim N, TFSFParam P)
 {
-	const unsigned int j = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
-	const unsigned int i = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+	// the contiguous dimension along the axis with the smaller memory stride
+	const unsigned int t2 = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	const unsigned int t1 = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+	const unsigned int j = P.swap ? t1 : t2;
+	const unsigned int i = P.swap ? t2 : t1;
 	if (i>=P.ni || j>=P.nj)
 		return;
 	unsigned int pos[3];
@@ -132,6 +136,7 @@ void SYCL_Ext_TFSF::SetupPlanes(std::vector<Plane>& planes, bool currents, Opera
 			pl.param.startPP = op_ext->m_Start[nPP];
 			pl.param.ni = op_ext->m_numLines[nP];
 			pl.param.nj = op_ext->m_numLines[nPP];
+			pl.param.swap = nP > nPP;   // the higher axis has the smaller stride
 
 			const size_t count = (size_t)pl.param.ni*pl.param.nj;
 			std::vector<unsigned int> delay(2*count);
@@ -171,7 +176,7 @@ void SYCL_Ext_TFSF::Apply(std::vector<Plane>& planes, float* field, const float*
 		const float* amp = pl.amp;
 		const SYCL_GridDim N = d->dim;
 		const TFSFParam P = pl.param;
-		SYCL_Launch(d, "tfsf_apply", P.nj, P.ni, 1, [=](sycl::nd_item<3> it)
+		SYCL_Launch(d, "tfsf_apply", P.swap ? P.ni : P.nj, P.swap ? P.nj : P.ni, 1, [=](sycl::nd_item<3> it)
 		{
 			tfsf_apply(it, field, delay, delta, amp, signal, N, P);
 		});
