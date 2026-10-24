@@ -325,6 +325,46 @@ IF(ENABLE_HIP AND NOT OPENEMS_GPU_PLUGINS)
   ADD_DEFINITIONS( -DOPENEMS_WITH_HIP )
 ENDIF()
 
+# SYCL GPU backend for the GPU engine (--engine=gpu), for Intel GPUs through Level Zero.
+# It needs the Intel oneAPI DPC++ compiler (icpx) as the C++ compiler of the whole build
+# and is only built as a plugin: libopenEMS then needs no SYCL runtime. Whatever is
+# missing switches it off, with a warning if it was asked for.
+include(CheckCXXSourceCompiles)
+set(SYCL_MISSING "")
+IF(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  set(SYCL_MISSING "the Intel oneAPI DPC++ compiler (icpx) as the C++ compiler")
+ELSE()
+  set(CMAKE_REQUIRED_FLAGS "-fsycl")
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fsycl")
+  check_cxx_source_compiles("#include <sycl/sycl.hpp>
+int main() { sycl::range<1> r(1); return (int)r.size() - 1; }" OPENEMS_SYCL_COMPILES)
+  unset(CMAKE_REQUIRED_FLAGS)
+  unset(CMAKE_REQUIRED_LINK_OPTIONS)
+  IF(NOT OPENEMS_SYCL_COMPILES)
+    set(SYCL_MISSING "a working -fsycl compiler")
+  ENDIF()
+ENDIF()
+IF(SYCL_MISSING)
+  OPTION(ENABLE_SYCL "Build the SYCL GPU backend (Intel GPUs)" OFF)
+ELSE()
+  OPTION(ENABLE_SYCL "Build the SYCL GPU backend (Intel GPUs)" ON)
+ENDIF()
+IF(ENABLE_SYCL AND SYCL_MISSING)
+  message(WARNING "The SYCL GPU backend needs ${SYCL_MISSING}, building without it")
+  set(ENABLE_SYCL OFF)
+ENDIF()
+IF(ENABLE_SYCL AND NOT OPENEMS_GPU_PLUGINS)
+  message(WARNING "The SYCL GPU backend is only built as a plugin (OPENEMS_GPU_PLUGINS), building without it")
+  set(ENABLE_SYCL OFF)
+ENDIF()
+# The Intel GPUs compiled ahead of time; any other Intel GPU compiles the SPIR-V image
+# when the GPU engine starts.
+set(OPENEMS_SYCL_AOT_DEVICES "bmg-g21" CACHE STRING
+  "Intel GPU targets compiled ahead of time by the SYCL backend (ocloc -device syntax); empty: SPIR-V only, compiled on the device at run time")
+IF(ENABLE_SYCL)
+  message(STATUS "SYCL GPU backend enabled, AOT devices: ${OPENEMS_SYCL_AOT_DEVICES}")
+ENDIF()
+
 # libopenEMS refuses a plugin of another build (see FDTD/gpu_plugin.h). In a git
 # checkout the version does not tell uncommitted changes apart: a random id per build
 # directory, kept across reconfigures. A release (no .git) is told by its version
@@ -431,6 +471,42 @@ IF(ENABLE_HIP AND OPENEMS_HIP_AS_CUDA)
   target_include_directories( ${HIP_TARGET} PRIVATE ${HIP_INCLUDE_DIR} )
   target_compile_definitions( ${HIP_TARGET} PRIVATE __HIP_PLATFORM_NVIDIA__=1 )
 ENDIF()
+IF(ENABLE_SYCL)
+  # the SYCL backend, always a plugin (see the SYCL block above)
+  add_library( openEMS_gpu_sycl MODULE ${SYCL_PLUGIN_SOURCES} )
+  set_target_properties( openEMS_gpu_sycl PROPERTIES PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/plugins
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/plugins )
+  TARGET_LINK_LIBRARIES( openEMS_gpu_sycl openEMS )
+  target_compile_definitions( openEMS_gpu_sycl PRIVATE OPENEMS_GPU_PLUGIN_NAME="sycl" )
+  # The kernels round like the CPU engines: no fused multiply-add, correctly rounded
+  # division and square root, flush-to-zero as ENABLE_FLUSH_TO_ZERO. On the compile and
+  # the link line: the device code is generated at link time, where the
+  # -foffload-fp32-prec-* flags act; -fno-fast-math because the icpx host default is fast math.
+  IF(OPENEMS_SYCL_AOT_DEVICES)
+    set(_sycl_targets spir64,spir64_gen)
+  ELSE()
+    set(_sycl_targets spir64)
+  ENDIF()
+  set(_sycl_flags -fsycl -fsycl-targets=${_sycl_targets} -fno-fast-math -ffp-contract=off
+    -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+  target_compile_options( openEMS_gpu_sycl PRIVATE ${_sycl_flags} )
+  target_link_options( openEMS_gpu_sycl PRIVATE ${_sycl_flags} )
+  # options of the device back ends, link line only (SHELL: keeps a quoted string one
+  # argument and the repeated -Xsycl-target-backend from being de-duplicated)
+  IF(OPENEMS_SYCL_AOT_DEVICES)
+    IF(ENABLE_FLUSH_TO_ZERO)
+      target_link_options( openEMS_gpu_sycl PRIVATE
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${OPENEMS_SYCL_AOT_DEVICES} -options -cl-denorms-are-zero\"" )
+    ELSE()
+      target_link_options( openEMS_gpu_sycl PRIVATE
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${OPENEMS_SYCL_AOT_DEVICES}\"" )
+    ENDIF()
+  ENDIF()
+  IF(ENABLE_FLUSH_TO_ZERO)
+    target_link_options( openEMS_gpu_sycl PRIVATE "SHELL:-Xsycl-target-backend=spir64 -cl-denorms-are-zero" )
+  ENDIF()
+ENDIF()
 #ADD_EXECUTABLE( openEMS main.cpp ${SOURCES})
 IF(ENABLE_HIP AND NOT OPENEMS_HIP_AS_CUDA AND CMAKE_HIP_PLATFORM STREQUAL "amd")
   TARGET_LINK_LIBRARIES( ${HIP_TARGET} ${HIP_RUNTIME_LIBRARY} )
@@ -480,6 +556,10 @@ IF(ENABLE_HIP AND OPENEMS_GPU_PLUGINS)
   ELSE()
     INSTALL(TARGETS ${HIP_TARGET} LIBRARY DESTINATION lib${LIB_SUFFIX}/openEMS/plugins)
   ENDIF()
+ENDIF()
+
+IF(ENABLE_SYCL)
+  INSTALL(TARGETS openEMS_gpu_sycl LIBRARY DESTINATION lib${LIB_SUFFIX}/openEMS/plugins)
 ENDIF()
 
 if (UNIX)
