@@ -182,6 +182,20 @@ SYCL_Ext_Absorbing_BC::SYCL_Ext_Absorbing_BC(GPU_Backend_SYCL::Impl* impl, Opera
 	m_VoltData.k1_nyPP = m_CurrData.k1_nyPP = k1_nyPP;
 	m_VoltData.k2_nyP = m_CurrData.k2_nyP = k2_nyP;
 	m_VoltData.k2_nyPP = m_CurrData.k2_nyPP = k2_nyPP;
+
+	// fused step (see update_fused): Apply2Voltages() replaces the voltages of the sheet after the
+	// voltage update, the currents next to them are recomputed; Apply2Current() changes the
+	// currents of its plane after the current update
+	for (unsigned int i=0; i<m_VoltParam.ni; ++i)
+		for (unsigned int j=0; j<m_VoltParam.nj; ++j)
+		{
+			d->volt_modified.push_back(abc_index(d->dim, m_VoltParam, m_VoltParam.nyP, m_VoltParam.line, i, j));
+			d->volt_modified.push_back(abc_index(d->dim, m_VoltParam, m_VoltParam.nyPP, m_VoltParam.line, i, j));
+		}
+	if (m_SuperAbsorption)
+		for (unsigned int i=0; i<m_CurrParam.ni; ++i)
+			for (unsigned int j=0; j<m_CurrParam.nj; ++j)
+				d->curr_modified.push_back(abc_index(d->dim, m_CurrParam, 0, m_CurrParam.line, i, j));
 }
 
 GPU_Extension* SYCL_CreateExt_Absorbing_BC(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)

@@ -150,6 +150,15 @@ SYCL_Ext_Mur_ABC::SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mu
 	m_Volt_nyPP = d->Alloc<float>(count);
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
 	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data());
+
+	// fused step (see update_fused): Apply2Voltages() replaces the voltages of the boundary plane
+	// after the voltage update, the currents next to them are recomputed
+	for (unsigned int i=0; i<m_Param.ni; ++i)
+		for (unsigned int j=0; j<m_Param.nj; ++j)
+		{
+			d->volt_modified.push_back(mur_index(d->dim, m_Param, m_Param.nyP, m_Param.line, i, j));
+			d->volt_modified.push_back(mur_index(d->dim, m_Param, m_Param.nyPP, m_Param.line, i, j));
+		}
 }
 
 GPU_Extension* SYCL_CreateExt_Mur_ABC(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)

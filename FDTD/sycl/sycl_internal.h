@@ -246,9 +246,18 @@ struct GPU_Backend_SYCL::Impl
 	int fused_step;                          //!< -1: not decided yet, 0: off, 1: on
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
-	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
+	//! flat indices of the voltages the extensions register as changed between the half-steps
+	//! (excitation, lumped RLC, Mur ABC, absorbing sheets, TF/SF, Lorentz and Debye materials)
+	std::vector<size_t> volt_modified;
+	//! flat indices of the currents the extensions change after the current update (TF/SF,
+	//! absorbing sheets, Lorentz materials): none may be on the last mesh lines, which the fused step
+	//! does not write (see DecideFusedStep())
+	std::vector<size_t> curr_modified;
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
+	//! extensions the fused step handles with a large fix-up (Mur ABC, absorbing sheets, TF/SF,
+	//! Lorentz and Debye materials): fused only with OPENEMS_SYCL_FUSED_STEP=1 (see DecideFusedStep())
+	int fused_optin;
 	bool index32;                            //!< the kernels index with 32 bit (see Init())
 	//! Decide once whether the fused step is used, and prepare it; it keeps the UPML z slabs
 	//! (zslab_lo, zslab_hi) in its kernel or leaves them to the region kernels (clears the flags)
