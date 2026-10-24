@@ -26,6 +26,19 @@ there are unreleased changes. It becomes the next release entry.
   several GPUs it takes a discrete one before an integrated one, then the one
   with more memory; `--gpu-device=N` (`gpu_device=N`) picks device N of the
   list printed at `--verbose=1`.
+- The SYCL backend fuses the voltage and current updates into one pass
+  over the fields when that is faster: on grids without UPML, Mur ABC,
+  absorbing sheets, TF/SF or dispersive materials. `OPENEMS_SYCL_FUSED_STEP=1`
+  fuses them on every Cartesian grid (the extensions' corrections are
+  followed by a fix-up of the neighbouring currents, bit-identical to the
+  separate kernels but slower on those grids), `=0` never does.
+- `OPENEMS_SYCL_COEFF=sets|full|factor` selects how the SYCL backend stores
+  the update coefficients: deduplicated sets (the default, exact, falling
+  back to full arrays when there are too many), or `factor`, which keeps a
+  material factor per edge and rebuilds the geometry part in the kernel
+  from 1-D tables, which shrinks the 59 MB table of a gerber2ems board
+  mesh to 1.3 MB at a relative difference below 1e-5 of the peak field.
+  `--verbose=2` prints the mode, the set count and the fused-step decision.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
