@@ -21,46 +21,86 @@
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
 
 // Drude/Lorentz materials and conducting sheets, see Engine_Ext_LorentzMaterial
-// and Engine_Ext_Dispersive. One launch per dispersion order, one thread per mesh
-// position of that order (unique within an order). The ADE state and coefficients
-// are stored per order as [direction][position].
-struct ADEParam { size_t count; unsigned int lorentz; size_t sn; };
+// and Engine_Ext_Dispersive. The ADE state and coefficients are stored per order as
+// [direction][position]. The orders of one side (voltages or currents) on the same
+// positions (e.g. the two orders of a conducting sheet) run in one launch, one thread
+// per position: the field is read once for all of them, and the corrections are
+// subtracted one after the other in the order of the orders, as separate launches
+// would do. A direction no order of a launch has a coefficient for is skipped: its
+// state stays zero, so its correction would be a subtraction of zero (e.g. the
+// normal direction of a conducting sheet).
+#define ADE_MAX_ORDERS 4
+
+struct ADEOrder
+{
+	float *ade, *lor;
+	const float *c_int, *c_ext, *c_lor;
+	unsigned int lorentz;
+	unsigned int dirs;     //!< bit n: direction n has a nonzero coefficient
+};
+
+struct ADEGroup
+{
+	size_t count;
+	size_t sn;
+	const size_t* pos;     //!< flat NIJK index of direction 0, in memory order
+	unsigned int orders;
+	unsigned int dirs;     //!< union of the directions of the orders
+	ADEOrder o[ADE_MAX_ORDERS];
+};
 
 // ADE update before the main update, reads the field
-static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, float* ade, float* lor, const float* c_int,
-                               const float* c_ext, const float* c_lor, const size_t* pos, ADEParam P)
+static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, const ADEGroup& G)
 {
 	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const size_t p = G.pos[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const size_t k = n*P.count + i;
-		const float f = field[n*P.sn + pos[i]];
-		if (P.lorentz)
+		if (!((G.dirs>>n) & 1))
+			continue;
+		const size_t k = n*G.count + i;
+		const float f = field[n*G.sn + p];
+		#pragma unroll
+		for (unsigned int q=0; q<ADE_MAX_ORDERS; ++q)   // fixed indices: the arguments stay in registers
 		{
-			lor[k] = lor[k] + c_lor[k]*ade[k];
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*(f - lor[k]);
-		}
-		else
-		{
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*f;
+			const ADEOrder& O = G.o[q];
+			if ((q>=G.orders) || !((O.dirs>>n) & 1))
+				continue;
+			if (O.lorentz)
+			{
+				O.lor[k] = O.lor[k] + O.c_lor[k]*O.ade[k];
+				O.ade[k] = O.ade[k] * O.c_int[k];
+				O.ade[k] = O.ade[k] + O.c_ext[k]*(f - O.lor[k]);
+			}
+			else
+			{
+				O.ade[k] = O.ade[k] * O.c_int[k];
+				O.ade[k] = O.ade[k] + O.c_ext[k]*f;
+			}
 		}
 	}
 }
 
-// subtract the ADE current from the field
-static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, const float* ade, const size_t* pos, ADEParam P)
+// subtract the ADE currents of the orders from the field
+static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, const ADEGroup& G)
 {
 	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const size_t p = G.pos[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const size_t g = n*P.sn + pos[i];
-		field[g] = field[g] - ade[n*P.count + i];
+		if (!((G.dirs>>n) & 1))
+			continue;
+		const size_t g = n*G.sn + p;
+		float f = field[g];
+		#pragma unroll
+		for (unsigned int q=0; q<ADE_MAX_ORDERS; ++q)
+			if ((q<G.orders) && ((G.o[q].dirs>>n) & 1))
+				f = f - G.o[q].ade[n*G.count + i];
+		field[g] = f;
 	}
 }
 
@@ -69,67 +109,55 @@ class SYCL_Ext_LorentzMaterial : public GPU_Extension
 public:
 	SYCL_Ext_LorentzMaterial(GPU_Backend_SYCL::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
 
-	virtual void DoPreVoltageUpdates() {for (size_t o=0; o<m_Volt.size(); ++o) Pre(m_Volt[o], d->volt);}
-	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) Apply(m_Volt[o], d->volt);}
-	virtual void DoPreCurrentUpdates() {for (size_t o=0; o<m_Curr.size(); ++o) Pre(m_Curr[o], d->curr);}
-	virtual void Apply2Current()       {for (size_t o=0; o<m_Curr.size(); ++o) Apply(m_Curr[o], d->curr);}
+	virtual void DoPreVoltageUpdates() {for (size_t g=0; g<m_Volt.size(); ++g) Pre(m_Volt[g], d->volt);}
+	virtual void Apply2Voltages()      {for (size_t g=0; g<m_Volt.size(); ++g) Apply(m_Volt[g], d->volt);}
+	virtual void DoPreCurrentUpdates() {for (size_t g=0; g<m_Curr.size(); ++g) Pre(m_Curr[g], d->curr);}
+	virtual void Apply2Current()       {for (size_t g=0; g<m_Curr.size(); ++g) Apply(m_Curr[g], d->curr);}
 
 protected:
-	//! one dispersion order of the voltages or currents
-	struct Order
-	{
-		ADEParam param;
-		size_t* pos;                //!< flat NIJK index of direction 0
-		float *ade, *lor;           //!< state
-		float *c_int, *c_ext, *c_lor;
-	};
-
-	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+	void Setup(std::vector<ADEGroup>& groups, std::vector<std::vector<size_t>>& group_pos, size_t count, unsigned int** pos,
 	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
 	float* Coefficients(size_t count, FDTD_FLOAT** c);
-	void Pre(Order& o, float* field)
+	void Pre(const ADEGroup& group, float* field)
 	{
+		if (group.dirs==0)
+			return;
 		const float* f = field;
-		float* ade = o.ade;
-		float* lor = o.lor;
-		const float* c_int = o.c_int;
-		const float* c_ext = o.c_ext;
-		const float* c_lor = o.c_lor;
-		const size_t* pos = o.pos;
-		const ADEParam param = o.param;
-		SYCL_Launch(d, "lorentz_pre", param.count, 1, 1, [=](sycl::nd_item<3> it)
+		const ADEGroup G = group;
+		SYCL_Launch(d, "lorentz_pre", G.count, 1, 1, [=](sycl::nd_item<3> it)
 		{
-			lorentz_pre(it, f, ade, lor, c_int, c_ext, c_lor, pos, param);
+			lorentz_pre(it, f, G);
 		});
 	}
-	void Apply(Order& o, float* field)
+	void Apply(const ADEGroup& group, float* field)
 	{
+		if (group.dirs==0)
+			return;
 		float* f = field;
-		const float* ade = o.ade;
-		const size_t* pos = o.pos;
-		const ADEParam param = o.param;
-		SYCL_Launch(d, "dispersive_apply", param.count, 1, 1, [=](sycl::nd_item<3> it)
+		const ADEGroup G = group;
+		SYCL_Launch(d, "dispersive_apply", G.count, 1, 1, [=](sycl::nd_item<3> it)
 		{
-			dispersive_apply(it, f, ade, pos, param);
+			dispersive_apply(it, f, G);
 		});
 	}
 
 	GPU_Backend_SYCL::Impl* d;
-	std::vector<Order> m_Volt;
-	std::vector<Order> m_Curr;
+	std::vector<ADEGroup> m_Volt;
+	std::vector<ADEGroup> m_Curr;
 };
 
 SYCL_Ext_LorentzMaterial::SYCL_Ext_LorentzMaterial(GPU_Backend_SYCL::Impl* impl, Operator_Ext_LorentzMaterial* op_ext)
 {
 	d = impl;
+	std::vector<std::vector<size_t>> volt_pos, curr_pos;
 	for (int o=0; o<op_ext->m_Order; ++o)
 	{
 		const size_t count = op_ext->m_LM_Count.at(o);
 		if (op_ext->m_volt_ADE_On[o])
-			Setup(m_Volt, count, op_ext->m_LM_pos[o], op_ext->m_volt_Lor_ADE_On[o],
+			Setup(m_Volt, volt_pos, count, op_ext->m_LM_pos[o], op_ext->m_volt_Lor_ADE_On[o],
 			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
 		if (op_ext->m_curr_ADE_On[o])
-			Setup(m_Curr, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
+			Setup(m_Curr, curr_pos, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
 			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
 	}
 }
@@ -144,27 +172,49 @@ float* SYCL_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
 	return d->Alloc<float>(data.size(), data.data());
 }
 
-void SYCL_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+void SYCL_Ext_LorentzMaterial::Setup(std::vector<ADEGroup>& groups, std::vector<std::vector<size_t>>& group_pos, size_t count, unsigned int** pos,
                                      bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
 {
 	if (count==0)
 		return;
-	Order ord;
-	ord.param.count = count;
-	ord.param.lorentz = lorentz;
-	ord.param.sn = d->numCells;
-
 	std::vector<size_t> flat(count);
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	ord.pos = d->Alloc<size_t>(count, flat.data());
 
+	ADEOrder ord;
+	ord.lorentz = lorentz;
+	// a direction without a coefficient keeps a zero state (ade = ade*c_int + 0, lor = lor + c_lor*0)
+	ord.dirs = 0;
+	for (int n=0; n<3; ++n)
+		for (size_t i=0; c_ext && (i<count); ++i)
+			if (c_ext[n][i]!=0)
+			{
+				ord.dirs |= 1u<<n;
+				break;
+			}
 	ord.ade = d->Alloc<float>(3*(size_t)count);
 	ord.lor = d->Alloc<float>(3*(size_t)count);
 	ord.c_int = Coefficients(count, c_int);
 	ord.c_ext = Coefficients(count, c_ext);
 	ord.c_lor = Coefficients(count, c_lor);
-	orders.push_back(ord);
+
+	// the same positions as the previous order of this side: one launch for both
+	if (!groups.empty() && (group_pos.back()==flat) && (groups.back().orders<ADE_MAX_ORDERS))
+	{
+		ADEGroup& G = groups.back();
+		G.o[G.orders++] = ord;
+		G.dirs |= ord.dirs;
+		return;
+	}
+	ADEGroup G;
+	G.count = count;
+	G.sn = d->numCells;
+	G.pos = d->Alloc<size_t>(count, flat.data());
+	G.orders = 1;
+	G.dirs = ord.dirs;
+	G.o[0] = ord;
+	groups.push_back(G);
+	group_pos.push_back(flat);
 }
 
 GPU_Extension* SYCL_CreateExt_LorentzMaterial(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)
