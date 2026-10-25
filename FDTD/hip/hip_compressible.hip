@@ -21,6 +21,21 @@
 // hipMalloc memory is never compressed. Lossless and transparent to the kernels and copies.
 // The AMD runtime does not honour the flag: the property read back says so, and the caller
 // falls back to hipMalloc.
+//
+// OPENEMS_HIP_COMPRESSIBLE: unset or 0 plain memory (the default); 1 or all every buffer of
+// Alloc()/TryAlloc() of at least 2 MiB; fields, coeff (comma separated, they add) only the field
+// buffers (volt, curr, volt_next, curr_next) or the coefficient buffers (set index and table, or
+// the full arrays). Only lines of equal values compress (all zero or one constant, up to 128
+// bytes), so it helps while the fields are mostly zero and costs a little on random data. On an
+// RTX 5090 (2026-10): a 28.7 Mcell board ran 8000 steps in 26.0 s instead of 29.5 s, all of it in
+// the first intervals, the settled speed unchanged (8018 against 7963 MC/s); a 3 Mcell model
+// +0.5 % over 40000 steps (noise); the 1 Mcell bench cases, which fit the 96 MB L2, 6 to 8 %
+// slower. Hence off by default; worth trying on models with large zero (PEC, empty) regions.
+//
+// OPENEMS_HIP_COMPRESSIBLE_STATS=1: the share of uniform 128-byte lines (what could compress) of
+// every named buffer at upload and of the fields at every download, to judge a model before
+// trying the knob. On that board the set index has 0.2 % (graded mesh along z, the fastest
+// index) and the fields 8.6 % after 5400 steps.
 
 #include "hip/hip_runtime.h"
 #include <cstdint>

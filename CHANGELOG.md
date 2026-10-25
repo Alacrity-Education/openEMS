@@ -39,6 +39,18 @@ there are unreleased changes. It becomes the next release entry.
   from 1-D tables, which shrinks the 59 MB table of a gerber2ems board
   mesh to 1.3 MB at a relative difference below 1e-5 of the peak field.
   `--verbose=2` prints the mode, the set count and the fused-step decision.
+- `OPENEMS_HIP_COMPRESSIBLE=1` places the device buffers of the HIP backend
+  of 2 MiB and more in compressible memory on NVIDIA GPUs (Ampere and later;
+  `=fields` or `=coeff` for the field or the coefficient buffers only). The
+  GPU then stores lines of equal values, such as zero fields, in compressed
+  form; the results are bit-identical. It is off by default: on an RTX 5090
+  it makes runs faster only while most of the fields are still zero (a
+  board of 28.7 Mcells: 8000 steps in 26.0 s instead of 29.5 s, the settled
+  speed unchanged at about 8000 MC/s), and small grids that fit the L2 cache get
+  6 to 8 % slower. Where the driver grants plain memory (AMD), the buffers
+  stay plain. `OPENEMS_HIP_COMPRESSIBLE_STATS=1` prints the share of
+  uniform 128-byte lines of every large buffer at upload and of the fields
+  at every download, which tells how much a model could compress.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
