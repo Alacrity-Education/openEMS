@@ -13,6 +13,7 @@ if(ENABLE_HIP)
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_steadystate.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_cylinder.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_multigrid.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_compressible.hip
   )
   # the top level needs the list by itself: source file properties belong to the
   # directory of the target, and the openEMS and plugin targets are defined there

@@ -111,10 +111,10 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 	m_Param.nj = op_ext->m_numLines[1];
 
 	const size_t count = (size_t)m_Param.ni*m_Param.nj;
-	m_Volt_nyP  = d->Alloc<float>(count);
-	m_Volt_nyPP = d->Alloc<float>(count);
-	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
-	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data());
+	m_Volt_nyP  = d->Alloc<float>(count, NULL, HIP_AllocOther, "mur_volt_nyP");
+	m_Volt_nyPP = d->Alloc<float>(count, NULL, HIP_AllocOther, "mur_volt_nyPP");
+	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data(), HIP_AllocOther, "mur_coeff_nyP");
+	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data(), HIP_AllocOther, "mur_coeff_nyPP");
 }
 
 GPU_Extension* HIP_CreateExt_Mur_ABC(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)

@@ -111,6 +111,13 @@ struct HIP_Context
 	~HIP_Context();
 };
 
+//! Class of a device buffer for the compressible memory (see hip_compressible.hip)
+enum HIP_AllocClass {HIP_AllocOther, HIP_AllocFields, HIP_AllocCoeff};
+//! share (0..1) of the complete 128-byte lines of \a data whose bytes all equal the line's first 4 bytes (host memory)
+double HIP_UniformLineShare(const void* data, size_t bytes);
+//! true if OPENEMS_HIP_COMPRESSIBLE_STATS is set to a non-zero value (read once)
+bool HIP_CompressibleStats();
+
 //! State of one grid
 struct GPU_Backend_HIP::Impl
 {
@@ -183,8 +190,11 @@ struct GPU_Backend_HIP::Impl
 
 	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl
 	template <typename T>
-	T* Alloc(size_t count, const T* host=NULL)
+	T* Alloc(size_t count, const T* host=NULL, HIP_AllocClass cls=HIP_AllocOther, const char* name=NULL)
 	{
+		(void)cls;
+		if (name && HIP_CompressibleStats())
+			ReportUniformLines(name, host, count*sizeof(T));
 		T* ptr = NULL;
 		HIP_Check(hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "hipMalloc");
 		m_Allocations.push_back(ptr);
@@ -200,8 +210,10 @@ struct GPU_Backend_HIP::Impl
 	//! Uninitialized device buffer of \a count elements for an optional optimization, freed with
 	//! this Impl or by Free(); NULL if the device memory is not sufficient
 	template <typename T>
-	T* TryAlloc(size_t count)
+	T* TryAlloc(size_t count, HIP_AllocClass cls=HIP_AllocOther, const char* name=NULL)
 	{
+		(void)cls;
+		(void)name;
 		T* ptr = NULL;
 		if (hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess)
 		{
@@ -227,15 +239,19 @@ struct GPU_Backend_HIP::Impl
 		if (sets.mode==1)
 		{
 			std::vector<unsigned short> index16(sets.index.begin(), sets.index.end());
-			return Alloc<unsigned short>(index16.size(), index16.data());
+			return Alloc<unsigned short>(index16.size(), index16.data(), HIP_AllocCoeff, "index");
 		}
-		return Alloc<unsigned int>(sets.index.size(), sets.index.data());
+		return Alloc<unsigned int>(sets.index.size(), sets.index.data(), HIP_AllocCoeff, "index");
 	}
 
 	//! No UPML regions updated by the main kernels (call after changing main_start/main_stop)
 	void ResetZSlabs();
 	//! Nodes [B, E) of the main kernels: main_start/main_stop and the UPML regions along z they update
 	void MainRange(HIP_GridDim& B, HIP_GridDim& E, unsigned int& threads_z);
+
+	//! Statistics (OPENEMS_HIP_COMPRESSIBLE_STATS): print the uniform line share of a buffer about to be
+	//! uploaded from \a host (NULL: zero fill, 100 % by construction)
+	void ReportUniformLines(const char* name, const void* host, size_t bytes);
 
 	//! Wait until all work on the stream is done
 	void Flush();

@@ -23,6 +23,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -612,8 +613,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 			list.push_back(*it);
 	}
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
-	volt_next = TryAlloc<float>(3*numCells);
-	curr_next = TryAlloc<float>(3*numCells);
+	volt_next = TryAlloc<float>(3*numCells, HIP_AllocFields, "volt_next");
+	curr_next = TryAlloc<float>(3*numCells, HIP_AllocFields, "curr_next");
 	if ((volt_next==NULL) || (curr_next==NULL))
 	{
 		Free(volt_next);
@@ -915,8 +916,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	}
 
 	const size_t count = 3*d->numCells;
-	d->volt = d->Alloc<float>(count);
-	d->curr = d->Alloc<float>(count);
+	d->volt = d->Alloc<float>(count, NULL, HIP_AllocFields, "volt");
+	d->curr = d->Alloc<float>(count, NULL, HIP_AllocFields, "curr");
 
 	// upload the final operator coefficients, including all changes by operator extensions.
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
@@ -926,7 +927,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	{
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
-		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data(), HIP_AllocCoeff, "coeff");
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
@@ -936,11 +937,11 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
 	std::vector<float> values;
-	auto upload = [&](int c) {GPU_CoefficientArray(op, numLines, c, values); return d->Alloc<float>(count, values.data());};
-	d->vv = upload(0);
-	d->vi = upload(1);
-	d->ii = upload(2);
-	d->iv = upload(3);
+	auto upload = [&](int c, const char* name) {GPU_CoefficientArray(op, numLines, c, values); return d->Alloc<float>(count, values.data(), HIP_AllocCoeff, name);};
+	d->vv = upload(0, "vv");
+	d->vi = upload(1, "vi");
+	d->ii = upload(2, "ii");
+	d->iv = upload(3, "iv");
 	return true;
 }
 
@@ -1021,6 +1022,9 @@ void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
+	if (HIP_CompressibleStats())
+		std::cout << "GPU_Backend_HIP: uniform lines at download: volt " << std::fixed << std::setprecision(1)
+		          << 100.0*HIP_UniformLineShare(volt.data(), volt.size()*sizeof(float)) << " %" << std::defaultfloat << std::endl;
 }
 
 void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
@@ -1029,6 +1033,9 @@ void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
+	if (HIP_CompressibleStats())
+		std::cout << "GPU_Backend_HIP: uniform lines at download: curr " << std::fixed << std::setprecision(1)
+		          << 100.0*HIP_UniformLineShare(curr.data(), curr.size()*sizeof(float)) << " %" << std::defaultfloat << std::endl;
 }
 
 void GPU_Backend_HIP::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
