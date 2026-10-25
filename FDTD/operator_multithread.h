@@ -48,6 +48,10 @@ protected:
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
 
+	//! Operator cache hit: the workers leave without building
+	virtual void SkipBuildThreads();
+	bool m_SkipBuild;
+
 	//Calc_EC barrier
 	boost::barrier* m_CalcEC_Start;
 	boost::barrier* m_CalcEC_Stop;

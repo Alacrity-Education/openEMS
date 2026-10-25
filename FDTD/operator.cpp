@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <stdexcept>
 #include <chrono>
+#include <sstream>
 #include "operator.h"
+#include "operator_cache.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
@@ -1059,9 +1061,63 @@ static std::string HashOperatorArray(const Operator* op, const ArrayLib::ArrayNI
 	return hash.Hex();
 }
 
+//! The fingerprint lines of the built operator and its extensions, OPENEMS_OPERATOR_FINGERPRINT=1
+static std::vector<std::string> OperatorFingerprint(const Operator* op, double dT, const unsigned int nrPEC[3], const unsigned int numLines[3],
+	const std::vector<Operator_Extension*>& exts)
+{
+	std::vector<std::string> lines;
+	FNVHash hash_dT;
+	hash_dT.AddValue(dT);
+	std::ostringstream line;
+	line << "Operator fingerprint: cells " << ((unsigned long long)numLines[0]*numLines[1]*numLines[2])
+		<< " dT " << hash_dT.Hex() << " vv " << HashOperatorArray(op, op->vv_ptr, &Operator::GetVV, numLines) << " vi " << HashOperatorArray(op, op->vi_ptr, &Operator::GetVI, numLines)
+		<< " ii " << HashOperatorArray(op, op->ii_ptr, &Operator::GetII, numLines) << " iv " << HashOperatorArray(op, op->iv_ptr, &Operator::GetIV, numLines)
+		<< " PEC " << nrPEC[0] << "/" << nrPEC[1] << "/" << nrPEC[2];
+	lines.push_back(line.str());
+	for (size_t n=0; n<exts.size(); ++n)
+	{
+		std::string fp = exts.at(n)->Fingerprint();
+		std::string note = exts.at(n)->FingerprintNote();
+		line.str("");
+		line << "Operator fingerprint: ext '" << exts.at(n)->GetExtensionName() << "' " << fp;
+		if (note.empty()==false)
+			line << " (" << note << ")";
+		lines.push_back(line.str());
+	}
+	return lines;
+}
+
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
 	SetupTimer timer;
+	Operator_Cache cache(this, debugFlags); // OPENEMS_OPERATOR_CACHE=<dir>; without it nothing is done
+
+	if (cache.Hit())
+	{
+		// the state an earlier build with the same key wrote: the operator arrays, the timestep, the PEC counts
+		cache.Load();
+		timer.Lap("operator cache load");
+		for (size_t n=0; n<m_Op_exts.size(); ++n)
+		{
+			// a cacheable extension is restored, the others (the excitation) are built as usual
+			if ((cache.LoadExtension(n)==false) && (m_Op_exts.at(n)->BuildExtension()==false))
+				m_Op_exts.at(n)->SetActive(false);
+			timer.Lap("ext '" + m_Op_exts.at(n)->GetExtensionName() + "'");
+		}
+		for (size_t n=m_Op_exts.size(); n>0; --n)
+			if (m_Op_exts.at(n-1)->IsActive()==false)
+				DeleteExtension(m_Op_exts.at(n-1));
+		std::vector<std::string> fingerprint;
+		if (FNVHash::Enabled())
+		{
+			fingerprint = OperatorFingerprint(this, dT, m_Nr_PEC, numLines, m_Op_exts);
+			for (size_t n=0; n<fingerprint.size(); ++n)
+				cout << fingerprint.at(n) << endl;
+		}
+		cache.Finish(fingerprint);
+		timer.Total();
+		return 0;
+	}
 
 	Init_EC();
 	timer.Lap("Init_EC");
@@ -1152,6 +1208,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
 		timer.Lap("ext '" + m_Op_exts.at(n)->GetExtensionName() + "'");
 	}
+	cache.ExtensionsBuilt();
 
 	//remove inactive extensions
 	std::vector<Operator_Extension*>::iterator it = m_Op_exts.begin();
@@ -1166,24 +1223,14 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 			++it;
 	}
 
+	std::vector<std::string> fingerprint;
 	if (FNVHash::Enabled())
 	{
-		FNVHash hash_dT;
-		hash_dT.AddValue(dT);
-		cout << "Operator fingerprint: cells " << ((unsigned long long)numLines[0]*numLines[1]*numLines[2])
-			<< " dT " << hash_dT.Hex() << " vv " << HashOperatorArray(this, vv_ptr, &Operator::GetVV, numLines) << " vi " << HashOperatorArray(this, vi_ptr, &Operator::GetVI, numLines)
-			<< " ii " << HashOperatorArray(this, ii_ptr, &Operator::GetII, numLines) << " iv " << HashOperatorArray(this, iv_ptr, &Operator::GetIV, numLines)
-			<< " PEC " << m_Nr_PEC[0] << "/" << m_Nr_PEC[1] << "/" << m_Nr_PEC[2] << endl;
-		for (size_t n=0; n<m_Op_exts.size(); ++n)
-		{
-			std::string fp = m_Op_exts.at(n)->Fingerprint();
-			std::string note = m_Op_exts.at(n)->FingerprintNote();
-			cout << "Operator fingerprint: ext '" << m_Op_exts.at(n)->GetExtensionName() << "' " << fp;
-			if (note.empty()==false)
-				cout << " (" << note << ")";
-			cout << endl;
-		}
+		fingerprint = OperatorFingerprint(this, dT, m_Nr_PEC, numLines, m_Op_exts);
+		for (size_t n=0; n<fingerprint.size(); ++n)
+			cout << fingerprint.at(n) << endl;
 	}
+	cache.Finish(fingerprint);
 
 	if (debugFlags & debugMaterial)
 		DumpMaterial2File( "material_dump" );

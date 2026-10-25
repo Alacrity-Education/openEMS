@@ -68,6 +68,13 @@ public:
 	//! Short factual note printed behind the fingerprint, e.g. the number of positions
 	virtual std::string FingerprintNote() const {return "";}
 
+	//! Operator cache (OPENEMS_OPERATOR_CACHE=<dir>): write the built state the engine extension reads. Returns false (default) if the extension is not cacheable: it is built in every run.
+	virtual bool Serialize(std::ostream& out) const {UNUSED(out); return false;}
+	//! Operator cache: restore the state Serialize wrote, in place of BuildExtension. Returns false (default) if not cacheable.
+	virtual bool Deserialize(std::istream& in) {UNUSED(in); return false;}
+	//! Operator cache: the settings of a cacheable extension that the geometry, the mesh and the timestep do not tell (part of the cache key)
+	virtual std::string CacheKey() const {return "";}
+
 	virtual bool IsActive() const {return m_Active;}
 	virtual void SetActive(bool active=true) {m_Active=active;}
 

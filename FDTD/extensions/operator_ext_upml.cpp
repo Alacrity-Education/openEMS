@@ -20,6 +20,9 @@
 #include "engine_ext_upml.h"
 #include "fparser.hh"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
+
+#include <sstream>
 
 using namespace std;
 
@@ -481,4 +484,50 @@ void Operator_Ext_UPML::ShowStat(ostream &ostr)  const
 	ostr << " PML range\t\t: " << "[" << m_StartPos[0]<< "," << m_StartPos[1]<< "," << m_StartPos[2]<< "] to ["
 	<<  m_StartPos[0]+m_numLines[0]-1 << "," << m_StartPos[1]+m_numLines[1]-1 << "," << m_StartPos[2]+m_numLines[2]-1 << "]" << endl;
 	ostr << " Grading function\t: \"" << m_GradFunc << "\"" << endl;
+}
+
+bool Operator_Ext_UPML::Serialize(std::ostream& out) const
+{
+	Operator_Cache::Write(out, m_StartPos, 3);
+	Operator_Cache::Write(out, m_numLines, 3);
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {&vv, &vvfo, &vvfn, &ii, &iifo, &iifn};
+	for (int a=0; a<6; ++a)
+		Operator_Cache::Write(out, arrays[a]->data(), arrays[a]->size());
+	return true;
+}
+
+bool Operator_Ext_UPML::Deserialize(std::istream& in)
+{
+	// the range is set before the build (SetRange): it must be the one of the entry
+	unsigned int start[3], numLines[3];
+	Operator_Cache::Read(in, start, 3);
+	Operator_Cache::Read(in, numLines, 3);
+	for (int n=0; n<3; ++n)
+		if ((start[n]!=m_StartPos[n]) || (numLines[n]!=m_numLines[n]))
+			return false;
+	vv.Init("vv", m_numLines);
+	vvfo.Init("vvfo", m_numLines);
+	vvfn.Init("vvfn", m_numLines);
+	ii.Init("ii", m_numLines);
+	iifo.Init("iifo", m_numLines);
+	iifn.Init("iifn", m_numLines);
+	ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {&vv, &vvfo, &vvfn, &ii, &iifo, &iifn};
+	for (int a=0; a<6; ++a)
+		Operator_Cache::Read(in, arrays[a]->data(), arrays[a]->size());
+	return true;
+}
+
+std::string Operator_Ext_UPML::CacheKey() const
+{
+	std::ostringstream key;
+	key << "bc";
+	for (int n=0; n<6; ++n)
+		key << " " << m_BC[n];
+	key << " size";
+	for (int n=0; n<6; ++n)
+		key << " " << m_Size[n];
+	key << " start " << m_StartPos[0] << " " << m_StartPos[1] << " " << m_StartPos[2];
+	key << " lines " << m_numLines[0] << " " << m_numLines[1] << " " << m_numLines[2];
+	key << " grading " << m_GradFunc;
+	return key.str();
 }

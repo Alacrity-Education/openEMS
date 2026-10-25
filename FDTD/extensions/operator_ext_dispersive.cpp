@@ -17,6 +17,7 @@
 
 #include "operator_ext_dispersive.h"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
 
 using namespace std;
 
@@ -76,6 +77,60 @@ void Operator_Ext_Dispersive::FingerprintBase(FNVHash& hash) const
 		hash.AddValue((uint8_t)(m_curr_ADE_On ? m_curr_ADE_On[o] : false));
 		for (int n=0; n<3; ++n)
 			hash.AddArray((m_LM_pos && (size_t)o<m_LM_Count.size()) ? m_LM_pos[o][n] : NULL, ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0);
+	}
+}
+
+void Operator_Ext_Dispersive::SerializeBase(std::ostream& out) const
+{
+	Operator_Cache::WriteValue(out, (int32_t)m_Order);
+	Operator_Cache::WriteValue(out, (uint64_t)m_LM_Count.size());
+	for (size_t o=0; o<m_LM_Count.size(); ++o)
+		Operator_Cache::WriteValue(out, (uint64_t)m_LM_Count[o]);
+	uint8_t has[3] = {m_volt_ADE_On!=NULL, m_curr_ADE_On!=NULL, m_LM_pos!=NULL};
+	Operator_Cache::Write(out, has, 3);
+	for (int o=0; o<m_Order; ++o)
+	{
+		if (has[0])
+			Operator_Cache::WriteValue(out, (uint8_t)m_volt_ADE_On[o]);
+		if (has[1])
+			Operator_Cache::WriteValue(out, (uint8_t)m_curr_ADE_On[o]);
+		size_t count = ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0;
+		for (int n=0; has[2] && (n<3); ++n)
+			Operator_Cache::Write(out, m_LM_pos[o][n], count);
+	}
+}
+
+void Operator_Ext_Dispersive::DeserializeBase(std::istream& in)
+{
+	m_Order = Operator_Cache::ReadValue<int32_t>(in);
+	uint64_t orders = Operator_Cache::ReadValue<uint64_t>(in);
+	if ((m_Order<0) || (m_Order>1024) || (orders>1024))
+		throw std::runtime_error("operator cache: implausible dispersion order in an extension file");
+	m_LM_Count.clear();
+	for (uint64_t o=0; o<orders; ++o)
+		m_LM_Count.push_back((size_t)Operator_Cache::ReadValue<uint64_t>(in));
+	uint8_t has[3];
+	Operator_Cache::Read(in, has, 3);
+	if (has[0])
+		m_volt_ADE_On = new bool[m_Order];
+	if (has[1])
+		m_curr_ADE_On = new bool[m_Order];
+	if (has[2])
+		m_LM_pos = new unsigned int**[m_Order];
+	for (int o=0; o<m_Order; ++o)
+	{
+		if (has[0])
+			m_volt_ADE_On[o] = Operator_Cache::ReadValue<uint8_t>(in)!=0;
+		if (has[1])
+			m_curr_ADE_On[o] = Operator_Cache::ReadValue<uint8_t>(in)!=0;
+		size_t count = ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0;
+		if (has[2])
+			m_LM_pos[o] = new unsigned int*[3];
+		for (int n=0; has[2] && (n<3); ++n)
+		{
+			m_LM_pos[o][n] = new unsigned int[count];
+			Operator_Cache::Read(in, m_LM_pos[o][n], count);
+		}
 	}
 }
 

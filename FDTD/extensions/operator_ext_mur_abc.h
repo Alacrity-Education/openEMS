@@ -68,6 +68,10 @@ public:
 	virtual std::string Fingerprint() const;
 	virtual std::string FingerprintNote() const;
 
+	virtual bool Serialize(std::ostream& out) const;
+	virtual bool Deserialize(std::istream& in);
+	virtual std::string CacheKey() const;
+
 protected:
 	Operator_Ext_Mur_ABC(Operator* op, Operator_Ext_Mur_ABC* op_ext);
 	void Initialize();
