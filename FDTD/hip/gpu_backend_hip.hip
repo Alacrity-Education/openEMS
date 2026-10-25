@@ -36,6 +36,8 @@
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
+#include "FDTD/extensions/engine_ext_mur_abc.h"
+#include "FDTD/extensions/engine_ext_dispersive.h"
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
@@ -103,6 +105,221 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 	v  = volt[2*sn+i] * vv[2*s];
 	v += vi[2*s] * (curr[sn+i] - curr[sn+i-xm] - curr[i] + curr[i-ym]);
 	volt[2*sn+i] = v;
+}
+
+// OPENEMS_HIP_MUR_FUSED=1: the voltage update with the first order Mur ABC of the active planes F, which
+// mode 0 runs as mur_pre, mur_post and mur_apply (hip_ext_mur_abc.hip, Engine_Ext_Mur_ABC), as two launches over
+// disjoint nodes: update_voltages_inner off the planes, mur_shell on the line and shift line of each. The Mur value of
+// component c of a cell L on the line of a plane is
+//     v = V_old(S) - k*V_old(L);  v += k*V_new(S)
+// with S the cell next to L on the shift line and V_new(S) its main update. The thread of S writes it: it holds
+// V_old(S) and computes V_new(S); the thread of L leaves component c alone. Every voltage has one writer, and
+// the only thread that reads its old value is that writer, so no thread waits for another.
+// Component c is tangential to the planes normal to the two other axes a = c+1 and b = c+2 (mod 3). An edge
+// cell E on the lines of an a-plane and of a b-plane takes the value of the plane applied last, the apply hooks
+// running in the extension order: the plane of the highest rank (HIP_MurFace::rank; with Mur on all faces the
+// one of the lowest face: x-low wins over y-low and z-low, see Engine::SortExtensionByPriority()). Its shift
+// cell is on the line of the other plane, whose Mur value replaces the main update there, while E needs that
+// main update (the Mur post hooks all read before the first apply): the thread of the diagonal cell D (on the
+// shift lines of both planes) writes E and both line cells next to it, and computes the main update of the
+// shift cell of E again from its old value, with the statements of the main update (volt_update_at()).
+// So for each component c a thread on no line of an active a- or b-plane writes its own main update, on the
+// shift line of an a-plane the Mur value of the a-line cell next to it, the same for b, and on both shift lines
+// the edge E. The normal component of a line cell is the main update of its own thread.
+template<unsigned int c>
+__device__ __forceinline__ void mur_volt_component(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
+                                                   unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
+                                                   unsigned int x, unsigned int y, unsigned int z, const HIP_MainCoeff& C,
+                                                   size_t sn, size_t i, size_t xm, size_t ym, size_t zm)
+{
+	const unsigned int a = (c+1)%3;
+	const unsigned int b = (c+2)%3;
+	const unsigned int p[3] = {x, y, z};
+	const unsigned int n[3] = {N.nx, N.ny, N.nz};
+	const bool a0 = (active>>(2*a)) & 1u;
+	const bool a1 = (active>>(2*a+1)) & 1u;
+	const bool b0 = (active>>(2*b)) & 1u;
+	const bool b1 = (active>>(2*b+1)) & 1u;
+	if ((a0 && (p[a]==F[2*a].line)) || (a1 && (p[a]==F[2*a+1].line)) || (b0 && (p[b]==F[2*b].line)) || (b1 && (p[b]==F[2*b+1].line)))
+		return;   // a line cell: written by the thread of its shift cell
+	const bool sa0 = a0 && (p[a]==F[2*a].shift);
+	const bool sa = sa0 || (a1 && (p[a]==F[2*a+1].shift));
+	const bool sb0 = b0 && (p[b]==F[2*b].shift);
+	const bool sb = sb0 || (b1 && (p[b]==F[2*b+1].shift));
+	const float old = volt[c*sn+i];
+	const float nv = volt_update_node(c, old, curr, C, sn, i, xm, ym, zm);
+	if (!sa && !sb)
+	{
+		volt[c*sn+i] = nv;
+		return;
+	}
+	// the a-plane: c is its component nyPP, coefficient (i,j) = (p[b], p[c]); the b-plane: c is its nyP, (i,j) = (p[c], p[a])
+	const HIP_MurFace& A = F[sa0 ? 2*a : 2*a+1];
+	const HIP_MurFace& B = F[sb0 ? 2*b : 2*b+1];
+	const unsigned int la = A.line;
+	const unsigned int lb = B.line;
+	// the line cells La (a-line), Lb (b-line) and the edge E, all read before any is written
+	unsigned int q[3] = {x, y, z};
+	q[a] = la;
+	const size_t ia = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	q[b] = lb;
+	const size_t ie = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	q[a] = p[a];
+	const size_t ib = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	const float old_a = sa ? volt[ia] : 0.0f;
+	const float old_b = sb ? volt[ib] : 0.0f;
+	float v_e = 0.0f;
+	if (sa && sb)
+	{
+		const float old_e = volt[ie];
+		if (A.rank>B.rank)
+		{
+			// the a-plane is applied last: its shift cell of E is Lb (q = Lb)
+			const float k = A.c_nyPP[(size_t)lb*n[c] + p[c]];
+			const float new_b = volt_update_at(c, old_b, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			v_e = old_b - k * old_e;
+			v_e = v_e + k * new_b;
+		}
+		else
+		{
+			// the b-plane is applied last: its shift cell of E is La
+			q[a] = la;
+			q[b] = p[b];
+			const float k = B.c_nyP[(size_t)p[c]*n[a] + la];
+			const float new_a = volt_update_at(c, old_a, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			v_e = old_a - k * old_e;
+			v_e = v_e + k * new_a;
+		}
+	}
+	volt[c*sn+i] = nv;
+	if (sa)
+	{
+		const float k = A.c_nyPP[(size_t)p[b]*n[c] + p[c]];
+		float v = old - k * old_a;
+		v = v + k * nv;
+		volt[ia] = v;
+	}
+	if (sb)
+	{
+		const float k = B.c_nyP[(size_t)p[c]*n[a] + p[a]];
+		float v = old - k * old_b;
+		v = v + k * nv;
+		volt[ib] = v;
+	}
+	if (sa && sb)
+		volt[ie] = v_e;
+}
+
+// all components of node (x, y, z) on the line or the shift line of a Mur plane
+__device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
+                                              unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
+                                              unsigned int x, unsigned int y, unsigned int z)
+{
+	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t i  = nijk(N, 0, x, y, z);
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;
+	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t zm = (z>0) ? 1 : 0;
+	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	mur_volt_component<0>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<1>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<2>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+}
+
+// The main update of the nodes inside the box [S.L, S.H), the statements of update_voltages: in one kernel with
+// the Mur nodes (all the same, see mur_shell) the registers of the Mur path halve the occupancy of every block,
+// and the warps on the outer z lines of every line run both paths.
+__global__ void update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
+                                      const void* index, const float* ca, const float* cb, unsigned int mode,
+                                      HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S)
+{
+	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	unsigned int z = B.nz + tz;
+	if (Z.t_int)
+	{
+		if (tz<Z.t_lo)
+		{
+			if (B.nz+tz>=Z.z_lo)
+				return;
+		}
+		else if (tz<Z.t_lo+Z.t_int)
+		{
+			z = Z.z_lo + (tz-Z.t_lo);
+			if (z>=Z.z_hi)
+				return;
+		}
+		else
+			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
+	}
+	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int x = B.nx + blockIdx.z;
+	if (z>=E.nz || y>=E.ny || x>=E.nx)
+		return;
+	if (z<Z.z_lo)
+	{
+		upml_fused_volt_node(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		return;
+	}
+	if (z>=Z.z_hi)
+	{
+		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		return;
+	}
+	if ((x<S.L.nx) || (x>=S.H.nx) || (y<S.L.ny) || (y>=S.H.ny) || (z<S.L.nz) || (z>=S.H.nz))
+		return;   // a node of mur_shell
+	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t i  = nijk(N, 0, x, y, z);
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;   // shift to the previous line, none on the first
+	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t zm = (z>0) ? 1 : 0;
+	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	volt[i]      = volt_update_node(0, volt[i], curr, C, sn, i, xm, ym, zm);
+	volt[sn+i]   = volt_update_node(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
+	volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+}
+
+// the j-th of the n0 + (E-H) lines of an axis outside [L, H) (n0 = L-B)
+__device__ __forceinline__ unsigned int mur_shell_line(unsigned int j, unsigned int B, unsigned int L, unsigned int H)
+{
+	return (j<L-B) ? B+j : H+(j-(L-B));
+}
+
+// The main nodes outside the box [S.L, S.H): the lines and shift lines of the Mur planes (inactive ones too),
+// one thread per node, as the slabs of the x faces (all y, z), of the y faces (x inside) and of the z faces
+// (x and y inside). Launched right after update_voltages_inner, on nodes disjoint from its own.
+__global__ void mur_shell(float* volt, const float* curr, const void* index, const float* ca, const float* cb, unsigned int mode,
+                          HIP_GridDim N, HIP_MurShell S, const HIP_MurFace* F, unsigned int active)
+{
+	size_t k = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int fx = S.E.nx-S.B.nx, fy = S.E.ny-S.B.ny, fz = S.E.nz-S.B.nz;   // full extents
+	const unsigned int ix = S.H.nx-S.L.nx, iy = S.H.ny-S.L.ny;                         // inner extents
+	const unsigned int cx = fx-ix, cy = fy-iy, cz = fz-(S.H.nz-S.L.nz);                // outer lines
+	const size_t sx = (size_t)cx*fy*fz, sy = (size_t)ix*cy*fz, sz = (size_t)ix*iy*cz;
+	unsigned int x, y, z;
+	if (k<sx)
+	{
+		x = mur_shell_line((unsigned int)(k/((size_t)fy*fz)), S.B.nx, S.L.nx, S.H.nx);
+		k %= (size_t)fy*fz;
+		y = S.B.ny + (unsigned int)(k/fz);
+		z = S.B.nz + (unsigned int)(k%fz);
+	}
+	else if ((k -= sx)<sy)
+	{
+		x = S.L.nx + (unsigned int)(k/((size_t)cy*fz));
+		k %= (size_t)cy*fz;
+		y = mur_shell_line((unsigned int)(k/fz), S.B.ny, S.L.ny, S.H.ny);
+		z = S.B.nz + (unsigned int)(k%fz);
+	}
+	else if ((k -= sy)<sz)
+	{
+		x = S.L.nx + (unsigned int)(k/((size_t)iy*cz));
+		k %= (size_t)iy*cz;
+		y = S.L.ny + (unsigned int)(k/cz);
+		z = mur_shell_line((unsigned int)(k%cz), S.B.nz, S.L.nz, S.H.nz);
+	}
+	else
+		return;
+	mur_volt_node(volt, curr, index, ca, cb, mode, N, F, active, x, y, z);
 }
 
 // the currents on the last mesh line of each direction are not updated
@@ -546,6 +763,13 @@ GPU_Backend_HIP::Impl::Impl()
 	snap_taken = false;
 	m_CompressibleRefused = 0;
 	m_CompressibleLogged = false;
+	mur_knob = 0;
+	mur_mode = -1;
+	memset(&mur, 0, sizeof(mur));
+	mur_dev = NULL;
+	memset(&mur_shell, 0, sizeof(mur_shell));
+	mur_shell_count = 0;
+	mur_released = false;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -643,6 +867,164 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		std::cout << std::endl;
 	}
 	return true;
+}
+
+std::string GPU_Backend_HIP::Impl::MurRefusal() const
+{
+	if (mur_released)
+		return "host fallback";
+	if (fused_step>0)
+		return "fused step";
+	const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
+	const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
+	const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+	// the line cells and the shift cells, updated in the main kernel, must be main nodes, outside the UPML regions
+	unsigned int faces = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+	{
+		const HIP_MurPlane& P = mur_planes[k];
+		for (int n=0; n<3; ++n)
+		{
+			const bool in = (n==P.ny) ? ((P.line>=start[n]) && (P.line<stop[n]) && (P.shift>=start[n]) && (P.shift<stop[n]))
+			                          : ((start[n]==0) && (stop[n]==n_lines[n]));
+			if (!in)
+				return "a Mur plane crosses a UPML region";
+		}
+		const unsigned int f = 2*P.ny + (P.line>0 ? 1 : 0);
+		if (faces & (1u<<f))
+			return "two Mur planes on one face";
+		faces |= 1u<<f;
+	}
+	for (int n=0; n<3; ++n)
+		if (((faces>>(2*n)) & 3u)==3u && (n_lines[n]<4))
+			return "fewer than 4 lines between two Mur planes";
+	size_t last_mur = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		last_mur = std::max(last_mur, mur_planes[k].seq);
+	// a voltage (flat index g) on the line of a Mur plane, of a component the plane writes
+	auto on_line = [&](size_t g, bool any_component) {
+		const unsigned int c = (unsigned int)(g/numCells);
+		const size_t node = g % numCells;
+		const unsigned int q[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((q[mur_planes[k].ny]==mur_planes[k].line) && (any_component || ((int)c!=mur_planes[k].ny)))
+				return true;
+		return false;
+	};
+	// The other extensions: the Mur values are written in the main update, before the post and apply hooks
+	// of all extensions, so none of them may read or write the voltages of the line cells, unless its hook
+	// runs only after the Mur apply hooks (the excitation). The UPML region updates are outside the main nodes.
+	for (size_t e=0; e<ext_log.size(); ++e)
+	{
+		Engine_Extension* eng_ext = ext_log[e].eng_ext;
+		if (dynamic_cast<Engine_Ext_Mur_ABC*>(eng_ext))
+			continue;
+		if (dynamic_cast<Engine_Ext_UPML*>(eng_ext))
+		{
+			if (upml_fused<=0)
+				return "UPML not fused";
+			continue;
+		}
+		const bool disp = dynamic_cast<Engine_Ext_Dispersive*>(eng_ext)!=NULL;   // Lorentz/Drude materials, sheets, Debye materials
+		const bool exc = dynamic_cast<Engine_Ext_Excitation*>(eng_ext)!=NULL;
+		const bool rlc = dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)!=NULL;
+		const bool ssd = dynamic_cast<Engine_Ext_SteadyState*>(eng_ext)!=NULL;
+		if (!disp && !exc && !rlc && !ssd)
+			return eng_ext->GetExtensionName();
+		if (ssd)
+			return "steady-state detection reads the fields before the Mur apply";
+		if (exc && (e>last_mur))
+			continue;   // only an apply hook, after those of the Mur planes
+		if (exc || rlc)
+		{
+			for (size_t k=ext_log[e].vm_begin; k<ext_log[e].vm_end; ++k)
+				if (on_line(volt_modified[k], false))
+					return eng_ext->GetExtensionName() + " on a Mur plane";
+			continue;
+		}
+		for (size_t k=ext_log[e].nodes_begin; k<ext_log[e].nodes_end; ++k)
+			if (on_line(ext_nodes[k], true))
+				return eng_ext->GetExtensionName() + " on a Mur plane";
+	}
+	return std::string();
+}
+
+void GPU_Backend_HIP::Impl::DecideMurFused()
+{
+	if (mur_mode>=0)
+		return;
+	mur_mode = 0;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if ((mur_knob>0) && !mur_planes.empty())
+	{
+		const std::string reason = MurRefusal();
+		if (reason.empty())
+			mur_mode = 1;
+		else if (verbose)
+			std::cout << "GPU_Backend_HIP: Mur fused: 1 unavailable: " << reason << std::endl;
+	}
+	if (mur_mode==1)
+	{
+		// the plane applied last has the highest rank (see mur_volt_component)
+		const unsigned int active = mur.active;
+		memset(&mur, 0, sizeof(mur));
+		mur.active = active;
+		for (size_t k=0; k<mur_planes.size(); ++k)
+		{
+			const HIP_MurPlane& P = mur_planes[k];
+			HIP_MurFace& F = mur.f[2*P.ny + (P.line>0 ? 1 : 0)];
+			F.c_nyP = P.c_nyP;
+			F.c_nyPP = P.c_nyPP;
+			F.line = P.line;
+			F.shift = P.shift;
+			F.rank = (unsigned int)P.seq;
+		}
+		mur_dev = Alloc<HIP_MurFace>(6, mur.f);
+		// the box of update_voltages_inner: the main nodes but the lines and shift lines of the planes
+		const unsigned int b[3] = {main_start.nx, main_start.ny, main_start.nz};
+		const unsigned int e[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+		unsigned int l[3], h[3];
+		for (int n=0; n<3; ++n)
+		{
+			l[n] = b[n];
+			h[n] = e[n];
+		}
+		for (size_t k=0; k<mur_planes.size(); ++k)
+		{
+			const HIP_MurPlane& P = mur_planes[k];
+			if (P.line<P.shift)
+				l[P.ny] = std::max(l[P.ny], P.shift+1);
+			else
+				h[P.ny] = std::min(h[P.ny], P.shift);
+		}
+		size_t inner = 1;
+		for (int n=0; n<3; ++n)
+		{
+			h[n] = std::max(h[n], l[n]);   // fewer lines than the two layers of both planes: no inner nodes
+			inner *= h[n]-l[n];
+		}
+		mur_shell.B = main_start;
+		mur_shell.E = main_stop;
+		mur_shell.L.nx = l[0]; mur_shell.L.ny = l[1]; mur_shell.L.nz = l[2];
+		mur_shell.H.nx = h[0]; mur_shell.H.ny = h[1]; mur_shell.H.nz = h[2];
+		mur_shell_count = (size_t)(e[0]-b[0])*(e[1]-b[1])*(e[2]-b[2]) - inner;
+	}
+	if (verbose)
+	{
+		std::cout << "GPU_Backend_HIP: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
+		if (mur_mode==1)
+		{
+			static const char* const faces[6] = {"x-low", "x-high", "y-low", "y-high", "z-low", "z-high"};
+			std::vector<std::pair<size_t, int> > order;
+			for (size_t k=0; k<mur_planes.size(); ++k)
+				order.push_back(std::make_pair(mur_planes[k].seq, 2*mur_planes[k].ny + (mur_planes[k].line>0 ? 1 : 0)));
+			std::sort(order.begin(), order.end());
+			std::cout << "GPU_Backend_HIP: Mur planes in apply order (edges take the last):";
+			for (size_t k=0; k<order.size(); ++k)
+				std::cout << " " << faces[order[k].second];
+			std::cout << std::endl;
+		}
+	}
 }
 
 void* GPU_Backend_HIP::Impl::AllocCompressible(size_t bytes, HIP_AllocClass cls)
@@ -953,6 +1335,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
 	d->ResetZSlabs();
+	if (const char* env = getenv("OPENEMS_HIP_MUR_FUSED"))
+		d->mur_knob = std::max(0, std::min(1, atoi(env)));
 
 	// the main updates launch one block per x line along z, which the device limits (64k on AMD and NVIDIA);
 	// from the properties: hipDeviceGetAttribute calls the CUDA driver API on NVIDIA (MSVC keeps
@@ -1020,6 +1404,7 @@ void GPU_Backend_HIP::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
 	const bool fused = d->DecideFusedStep();
+	d->DecideMurFused();   // once, after the pre hooks of the first timestep (the UPML decides its regions there)
 	d->LogCompressible();   // once: after the buffers of Init(), the extensions and the fused step
 	if (fused)
 	{
@@ -1059,6 +1444,16 @@ void GPU_Backend_HIP::UpdateVoltages()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
+	if ((d->mur_mode==1) && d->mur.active)
+	{
+		// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component)
+		HIP_Launch(d, "update_voltages_inner", update_voltages_inner, threads_z, E.ny-B.ny, E.nx-B.nx,
+		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, d->mur_shell);
+		HIP_Launch(d, "mur_shell", mur_shell, d->mur_shell_count, 1, 1,
+		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim,
+		            d->mur_shell, (const HIP_MurFace*)d->mur_dev, d->mur.active);
+		return;
+	}
 	HIP_Launch(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
@@ -1347,13 +1742,20 @@ GPU_Extension* GPU_Backend_HIP::CreateExtension(Engine_Extension* eng_ext, Engin
 	if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
 	    && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
 		d->fused_blockers++;
+	// in the extension order of the engine (see Impl::ext_log)
+	const Impl::ExtRecord record = {eng_ext, d->volt_modified.size(), 0, d->ext_nodes.size(), 0};
 	for (size_t n=0; n<sizeof(HIP_EXTENSIONS)/sizeof(HIP_EXTENSIONS[0]); ++n)
 	{
 		if (HIP_EXTENSIONS[n]==NULL)
 			continue;
 		GPU_Extension* gpu_ext = HIP_EXTENSIONS[n](d, eng_ext, eng);
 		if (gpu_ext)
+		{
+			d->ext_log.push_back(record);
+			d->ext_log.back().vm_end = d->volt_modified.size();
+			d->ext_log.back().nodes_end = d->ext_nodes.size();
 			return gpu_ext;
+		}
 	}
 	d->fused_blockers++;   // host fallback
 	return NULL;

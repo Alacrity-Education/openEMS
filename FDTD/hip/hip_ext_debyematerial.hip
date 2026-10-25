@@ -133,6 +133,7 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
 	m_Pos = d->Alloc<size_t>(count, flat.data());
+	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_HIP::Impl::MurRefusal()
 
 	m_Pole  = d->Alloc<float>((size_t)m_Param.poles*3*count);
 	m_Pre   = d->Alloc<float>(3*(size_t)count);

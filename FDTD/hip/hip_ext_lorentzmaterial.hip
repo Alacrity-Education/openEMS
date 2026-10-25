@@ -142,6 +142,7 @@ void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, un
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
 	ord.pos = d->Alloc<size_t>(count, flat.data());
+	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_HIP::Impl::MurRefusal()
 
 	ord.ade = d->Alloc<float>(3*(size_t)count);
 	ord.lor = d->Alloc<float>(3*(size_t)count);

@@ -67,20 +67,29 @@ class HIP_Ext_Mur_ABC : public GPU_Extension
 {
 public:
 	HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_ABC* op_ext, Engine_Ext_Mur_ABC* eng_ext, Engine* eng);
+	virtual ~HIP_Ext_Mur_ABC();
 
+	// OPENEMS_HIP_MUR_FUSED (GPU_Backend_HIP::Impl::mur_mode): 0 (and the timestep of the decision, which the
+	// first voltage update makes) pre, post and apply; 1 nothing here, the main update does it (mur_shell), the
+	// pre hook only tells it whether this plane is active in the timestep
 	virtual void DoPreVoltageUpdates()
 	{
-		if (IsActive())
+		const bool active = IsActive();
+		if (active)
+			d->mur.active |= 1u<<m_Face;
+		else
+			d->mur.active &= ~(1u<<m_Face);
+		if (active && (d->mur_mode!=1))
 			HIP_Launch(d, "mur_pre", mur_pre, m_Param.nj, m_Param.ni, 1, (const float*)d->volt, m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, d->dim, m_Param);
 	}
 	virtual void DoPostVoltageUpdates()
 	{
-		if (IsActive())
+		if (IsActive() && (d->mur_mode!=1))
 			HIP_Launch(d, "mur_post", mur_post, m_Param.nj, m_Param.ni, 1, (const float*)d->volt, m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, d->dim, m_Param);
 	}
 	virtual void Apply2Voltages()
 	{
-		if (IsActive())
+		if (IsActive() && (d->mur_mode!=1))
 			HIP_Launch(d, "mur_apply", mur_apply, m_Param.nj, m_Param.ni, 1, d->volt, (const float*)m_Volt_nyP, (const float*)m_Volt_nyPP, d->dim, m_Param);
 	}
 
@@ -92,6 +101,7 @@ protected:
 	Engine* m_Eng;
 	unsigned int m_StartTS;
 	MurParam m_Param;
+	unsigned int m_Face;   //!< 2*ny + (line>0), see HIP_MurFaces
 
 	float *m_Volt_nyP, *m_Volt_nyPP;
 	float *m_Coeff_nyP, *m_Coeff_nyPP;
@@ -115,6 +125,19 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 	m_Volt_nyPP = d->Alloc<float>(count, NULL, HIP_AllocOther, "mur_volt_nyPP");
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data(), HIP_AllocOther, "mur_coeff_nyP");
 	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data(), HIP_AllocOther, "mur_coeff_nyPP");
+
+	// for OPENEMS_HIP_MUR_FUSED: CreateExtension() logs this extension at the next position of ext_log
+	m_Face = 2*m_Param.ny + (m_Param.line>0 ? 1 : 0);
+	const HIP_MurPlane plane = {m_Param.ny, m_Param.line, m_Param.line_shift, m_Coeff_nyP, m_Coeff_nyPP, d->ext_log.size()};
+	d->mur_planes.push_back(plane);
+}
+
+HIP_Ext_Mur_ABC::~HIP_Ext_Mur_ABC()
+{
+	// the host fallback deletes the device extensions: no Mur in the main update any more
+	d->mur_released = true;
+	d->mur_mode = 0;
+	d->mur.active = 0;
 }
 
 GPU_Extension* HIP_CreateExt_Mur_ABC(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)
