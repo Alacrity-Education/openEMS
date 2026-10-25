@@ -226,12 +226,62 @@ __device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, co
 	mur_volt_component<2>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
 }
 
+// OPENEMS_HIP_MUR_FUSED=2: the Mur value of the tangential components x and y of a node L on the line of an active
+// z plane, from the node S on its shift line in the same z line, held by another lane of the same warp (the lane
+// test is in z, the lanes along z are contiguous; DecideMurFused() refuses the mode when a line and its shift line
+// fall into different warps, MurZFaceRefusal()). Called by every thread of update_voltages_inner<true> on a node of
+// the interior of the z faces and inside them, with the old values o_x, o_y and the main updates v_x, v_y of its own
+// node (index xy = x*ny + y of the plane's coefficients, as the Mur extension indexes them: i along nyP = x, j along
+// nyPP = y). The lanes of L and S exchange V_old and V_new through shuffles; L replaces its main update with
+//     v = V_old(S) - k*V_old(L);  v = v + k*V_new(S)
+// the statements of mur_pre and mur_post, which mur_apply writes. The z component of L stays its main update (the
+// z planes write only x and y), and S keeps its main update, as every main node. Node sets: this kernel writes the
+// nodes with x and y inside [S.L, S.H) on every z line of the main range (the z faces' lines and shift lines
+// included); mur_shell the others (the x-face slabs, then the y-face slabs inside x: the 2-line bands along the four
+// edges of each z face, their shift cells too), which never read a voltage this kernel writes. Interior warps
+// (no lane on a z face line or shift line) skip the branch together.
+__device__ __forceinline__ void mur_zface_lane(const HIP_MurZFaces& M, unsigned int z, size_t xy,
+                                               float o_x, float o_y, float& v_x, float& v_y)
+{
+	for (unsigned int f=0; f<2; ++f)
+	{
+		if (!((M.active>>f) & 1u))
+			continue;
+		const bool on_line = (z==M.line[f]);
+		if (!on_line && (z!=M.shift[f]))
+			continue;
+		// lanes along z: the partner's lane is this lane shifted by the z distance
+		const unsigned int lane = ((threadIdx.z*blockDim.y + threadIdx.y)*blockDim.x + threadIdx.x) % warpSize;
+		const int dz = on_line ? (int)M.shift[f] - (int)M.line[f] : (int)M.line[f] - (int)M.shift[f];
+		const int other = (int)lane + dz;
+		const HIP_LaneMask mask = ((HIP_LaneMask)1 << lane) | ((HIP_LaneMask)1 << other);
+		const float so_x = __shfl_sync(mask, o_x, other);
+		const float so_y = __shfl_sync(mask, o_y, other);
+		const float sn_x = __shfl_sync(mask, v_x, other);
+		const float sn_y = __shfl_sync(mask, v_y, other);
+		if (on_line)
+		{
+			const float k_x = M.c_x[f][xy];
+			float v = so_x - k_x * o_x;
+			v = v + k_x * sn_x;
+			v_x = v;
+			const float k_y = M.c_y[f][xy];
+			v = so_y - k_y * o_y;
+			v = v + k_y * sn_y;
+			v_y = v;
+		}
+	}
+}
+
 // The main update of the nodes inside the box [S.L, S.H), the statements of update_voltages: in one kernel with
 // the Mur nodes (all the same, see mur_shell) the registers of the Mur path halve the occupancy of every block,
-// and the warps on the outer z lines of every line run both paths.
+// and the warps on the outer z lines of every line run both paths. ZF (OPENEMS_HIP_MUR_FUSED=2): the box covers
+// the z faces too, whose interior gets its Mur values from mur_zface_lane().
+template<bool ZF>
 __global__ void update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
                                       const void* index, const float* ca, const float* cb, unsigned int mode,
-                                      HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S)
+                                      HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S,
+                                      HIP_MurZFaces M)
 {
 	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
 	unsigned int z = B.nz + tz;
@@ -273,9 +323,21 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
 	const size_t ym = (y>0) ? N.nz : 0;
 	const size_t zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
-	volt[i]      = volt_update_node(0, volt[i], curr, C, sn, i, xm, ym, zm);
-	volt[sn+i]   = volt_update_node(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
+	if (!ZF)
+	{
+		volt[i]      = volt_update_node(0, volt[i], curr, C, sn, i, xm, ym, zm);
+		volt[sn+i]   = volt_update_node(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
+		volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+		return;
+	}
+	const float o_x = volt[i];
+	const float o_y = volt[sn+i];
+	float v_x = volt_update_node(0, o_x, curr, C, sn, i, xm, ym, zm);
+	float v_y = volt_update_node(1, o_y, curr, C, sn, i, xm, ym, zm);
 	volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+	mur_zface_lane(M, z, (size_t)x*N.ny + y, o_x, o_y, v_x, v_y);
+	volt[i]    = v_x;
+	volt[sn+i] = v_y;
 }
 
 // the j-th of the n0 + (E-H) lines of an axis outside [L, H) (n0 = L-B)
@@ -286,7 +348,9 @@ __device__ __forceinline__ unsigned int mur_shell_line(unsigned int j, unsigned 
 
 // The main nodes outside the box [S.L, S.H): the lines and shift lines of the Mur planes (inactive ones too),
 // one thread per node, as the slabs of the x faces (all y, z), of the y faces (x inside) and of the z faces
-// (x and y inside). Launched right after update_voltages_inner, on nodes disjoint from its own.
+// (x and y inside; with OPENEMS_HIP_MUR_FUSED=2 S spans all z lines, so there are none: update_voltages_inner<true>
+// has them).
+// Launched right after update_voltages_inner, on nodes disjoint from its own.
 __global__ void mur_shell(float* volt, const float* curr, const void* index, const float* ca, const float* cb, unsigned int mode,
                           HIP_GridDim N, HIP_MurShell S, const HIP_MurFace* F, unsigned int active)
 {
@@ -770,6 +834,8 @@ GPU_Backend_HIP::Impl::Impl()
 	memset(&mur_shell, 0, sizeof(mur_shell));
 	mur_shell_count = 0;
 	mur_released = false;
+	mur_zf_on = false;
+	memset(&mur_zf, 0, sizeof(mur_zf));
 	window = HIP_ParseWindowKnob(NULL, 0);
 	window_used = false;
 	step_base = NULL;
@@ -952,6 +1018,51 @@ std::string GPU_Backend_HIP::Impl::MurRefusal() const
 	return std::string();
 }
 
+// true if the threads of the z positions tz_a and tz_b (thread index along z: threadIdx.x of blocks of \a block
+// threads, see MainRange()) are in the same warp of \a w threads, for every y and x thread of the block
+static bool HIP_SameWarpZ(unsigned int tz_a, unsigned int tz_b, const dim3& block, unsigned int w)
+{
+	if (tz_a/block.x != tz_b/block.x)
+		return false;   // different blocks
+	const unsigned int a = tz_a%block.x, b = tz_b%block.x;
+	for (unsigned int k=0; k<block.y*block.z; ++k)
+		if ((k*block.x + a)/w != (k*block.x + b)/w)
+			return false;
+	return true;
+}
+
+std::string GPU_Backend_HIP::Impl::MurZFaceRefusal()
+{
+	memset(&mur_zf, 0, sizeof(mur_zf));
+	if (dim.nz<6)
+		return "fewer than 6 z lines";
+	bool any = false;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+	{
+		const HIP_MurPlane& P = mur_planes[k];
+		if (P.ny!=2)
+			continue;
+		const unsigned int f = (P.line>0) ? 1 : 0;
+		mur_zf.c_x[f] = P.c_nyP;
+		mur_zf.c_y[f] = P.c_nyPP;
+		mur_zf.line[f] = P.line;
+		mur_zf.shift[f] = P.shift;
+		any = true;
+	}
+	if (!any)
+		return "no Mur plane on a z face";
+	// the launch of update_voltages_inner (UpdateVoltages()): the thread index along z of a main node, and the block
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	const dim3 block = Block(threads_z, E.ny-B.ny);
+	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+	for (unsigned int f=0; f<2; ++f)
+		if ((mur_zf.c_x[f]!=NULL) && !HIP_SameWarpZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, ctx->warp_size))
+			return std::string("the line and the shift line of the z-") + (f ? "high" : "low") + " plane are in different warps";
+	return std::string();
+}
+
 void GPU_Backend_HIP::Impl::DecideMurFused()
 {
 	if (mur_mode>=0)
@@ -964,7 +1075,11 @@ void GPU_Backend_HIP::Impl::DecideMurFused()
 		if (reason.empty())
 			mur_mode = 1;
 		else if (verbose)
+		{
+			if (mur_knob>1)
+				std::cout << "GPU_Backend_HIP: Mur fused: 2 unavailable: " << reason << std::endl;
 			std::cout << "GPU_Backend_HIP: Mur fused: 1 unavailable: " << reason << std::endl;
+		}
 	}
 	if (mur_mode==1)
 	{
@@ -1011,10 +1126,26 @@ void GPU_Backend_HIP::Impl::DecideMurFused()
 		mur_shell.L.nx = l[0]; mur_shell.L.ny = l[1]; mur_shell.L.nz = l[2];
 		mur_shell.H.nx = h[0]; mur_shell.H.ny = h[1]; mur_shell.H.nz = h[2];
 		mur_shell_count = (size_t)(e[0]-b[0])*(e[1]-b[1])*(e[2]-b[2]) - inner;
+		if (mur_knob>1)
+		{
+			const std::string reason = MurZFaceRefusal();
+			if (reason.empty())
+			{
+				// the z faces' interior moves to update_voltages_inner: mur_shell keeps its x- and y-face slabs
+				mur_zf_on = true;
+				mur_shell_count = (size_t)(e[0]-b[0] - (h[0]-l[0]))*(e[1]-b[1])*(e[2]-b[2])
+				                + (size_t)(h[0]-l[0])*(e[1]-b[1] - (h[1]-l[1]))*(e[2]-b[2]);
+			}
+			else if (verbose)
+				std::cout << "GPU_Backend_HIP: Mur fused: 2 unavailable: " << reason << std::endl;
+		}
 	}
 	if (verbose)
 	{
-		std::cout << "GPU_Backend_HIP: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
+		if (mur_zf_on)
+			std::cout << "GPU_Backend_HIP: Mur fused: 2 (" << mur_planes.size() << " planes, z faces in the kernel)" << std::endl;
+		else
+			std::cout << "GPU_Backend_HIP: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
 		if (mur_mode==1)
 		{
 			static const char* const faces[6] = {"x-low", "x-high", "y-low", "y-high", "z-low", "z-high"};
@@ -1339,7 +1470,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->upml_fused = -1;
 	d->ResetZSlabs();
 	if (const char* env = getenv("OPENEMS_HIP_MUR_FUSED"))
-		d->mur_knob = std::max(0, std::min(1, atoi(env)));
+		d->mur_knob = std::max(0, std::min(2, atoi(env)));
 	d->window = HIP_ParseWindowKnob(getenv("OPENEMS_HIP_WINDOW"), d->dim.nx);
 
 	// the main updates launch one block per x line along z, which the device limits (64k on AMD and NVIDIA);
@@ -1452,12 +1583,25 @@ void GPU_Backend_HIP::UpdateVoltages()
 	d->MainRange(B, E, threads_z);
 	if ((d->mur_mode==1) && d->mur.active)
 	{
-		// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component)
-		HIP_Launch(d, "update_voltages_inner", update_voltages_inner, threads_z, E.ny-B.ny, E.nx-B.nx,
-		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, d->mur_shell);
+		// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component); mode 2: the interior
+		// of the z faces in the first kernel (see mur_zface_lane), the box spans all z lines, so mur_shell has no
+		// z-face slabs (its threads past the count would otherwise run into them)
+		HIP_MurShell S = d->mur_shell;
+		if (d->mur_zf_on)
+		{
+			S.L.nz = d->main_start.nz;
+			S.H.nz = d->main_stop.nz;
+			HIP_MurZFaces M = d->mur_zf;
+			M.active = (d->mur.active>>4) & 3u;
+			HIP_Launch(d, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, M);
+		}
+		else
+			HIP_Launch(d, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, d->mur_zf);
 		HIP_Launch(d, "mur_shell", mur_shell, d->mur_shell_count, 1, 1,
 		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim,
-		            d->mur_shell, (const HIP_MurFace*)d->mur_dev, d->mur.active);
+		            S, (const HIP_MurFace*)d->mur_dev, d->mur.active);
 		return;
 	}
 	HIP_Launch(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,

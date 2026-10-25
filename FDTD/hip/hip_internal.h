@@ -153,6 +153,24 @@ struct HIP_MurShell
 	HIP_GridDim B, E, L, H;
 };
 
+//! The z faces of OPENEMS_HIP_MUR_FUSED=2: the interior of each (x and y inside [HIP_MurShell::L, H)) is updated
+//! by update_voltages_inner (mur_zface_lane()), which exchanges the values of the Mur line and the shift line of a
+//! z line through warp shuffles. Index 0 the z-low, 1 the z-high plane
+struct HIP_MurZFaces
+{
+	const float* c_x[2];   //!< coefficients of component x (the plane's nyP), at x*ny + y
+	const float* c_y[2];   //!< coefficients of component y (the plane's nyPP), at x*ny + y
+	unsigned int line[2], shift[2];
+	unsigned int active;   //!< bit f: plane f exists and is active in this timestep
+};
+
+//! Lane mask of the warp shuffles: 64 bit on AMD (the HIP warp sync builtins ask for it), 32 bit on NVIDIA
+#if defined(__HIP_PLATFORM_NVIDIA__)
+typedef unsigned int HIP_LaneMask;
+#else
+typedef unsigned long long HIP_LaneMask;
+#endif
+
 //! A Mur plane of the grid, registered by HIP_Ext_Mur_ABC
 struct HIP_MurPlane
 {
@@ -248,7 +266,8 @@ struct GPU_Backend_HIP::Impl
 	//! by its constructor (the dispersive materials and sheets), for the check of MurRefusal()
 	std::vector<size_t> ext_nodes;
 	//! OPENEMS_HIP_MUR_FUSED (read in Init(), default 1): 0 the three launches per Mur plane, 1 the Mur planes in
-	//! the voltage update (update_voltages_inner and mur_shell, see mur_volt_component)
+	//! the voltage update (update_voltages_inner and mur_shell, see mur_volt_component), 2 as 1 with the interior
+	//! of the z faces in update_voltages_inner (mur_zface_lane())
 	int mur_knob;
 	//! the mode in use, -1 until DecideMurFused() (the first voltage update); the Mur hooks of a timestep
 	//! that started before the decision finish it as mode 0
@@ -259,10 +278,14 @@ struct GPU_Backend_HIP::Impl
 	HIP_MurShell mur_shell;                   //!< the nodes of the two kernels of mode 1
 	size_t mur_shell_count;                   //!< number of nodes of mur_shell
 	bool mur_released;                        //!< a Mur extension was deleted (host fallback): mode 0
-	//! Decide once whether OPENEMS_HIP_MUR_FUSED=1 is used, log it
+	bool mur_zf_on;                           //!< mode 1 with the z faces of OPENEMS_HIP_MUR_FUSED=2
+	HIP_MurZFaces mur_zf;                     //!< the z planes of mode 2 (active bits set at the launch)
+	//! Decide once whether OPENEMS_HIP_MUR_FUSED=1 (or 2) is used, log it
 	void DecideMurFused();
 	//! Why mode 1 cannot be used on this grid, empty if it can
 	std::string MurRefusal() const;
+	//! Why the z faces of mode 2 cannot run in update_voltages_inner, empty if they can (call after MurRefusal())
+	std::string MurZFaceRefusal();
 
 	//! OPENEMS_HIP_WINDOW (read in Init(), see HIP_ParseWindowKnob()): windowed blocks of T timesteps and windows of W x planes
 	struct WindowKnob
