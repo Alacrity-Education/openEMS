@@ -1093,8 +1093,12 @@ void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 	if (HIP_CompressibleStats())
-		std::cout << "GPU_Backend_HIP: uniform lines at download: volt " << std::fixed << std::setprecision(1)
-		          << 100.0*HIP_UniformLineShare(volt.data(), volt.size()*sizeof(float)) << " %" << std::defaultfloat << std::endl;
+	{
+		// formatted apart: the precision must not stick to std::cout
+		std::ostringstream line;
+		line << std::fixed << std::setprecision(1) << 100.0*HIP_UniformLineShare(volt.data(), volt.size()*sizeof(float));
+		std::cout << "GPU_Backend_HIP: uniform lines at download: volt " << line.str() << " %" << std::endl;
+	}
 }
 
 void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
@@ -1104,8 +1108,12 @@ void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 	if (HIP_CompressibleStats())
-		std::cout << "GPU_Backend_HIP: uniform lines at download: curr " << std::fixed << std::setprecision(1)
-		          << 100.0*HIP_UniformLineShare(curr.data(), curr.size()*sizeof(float)) << " %" << std::defaultfloat << std::endl;
+	{
+		// formatted apart: the precision must not stick to std::cout
+		std::ostringstream line;
+		line << std::fixed << std::setprecision(1) << 100.0*HIP_UniformLineShare(curr.data(), curr.size()*sizeof(float));
+		std::cout << "GPU_Backend_HIP: uniform lines at download: curr " << line.str() << " %" << std::endl;
+	}
 }
 
 void GPU_Backend_HIP::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)

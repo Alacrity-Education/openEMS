@@ -30,6 +30,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #include "hip_internal.h"
@@ -241,7 +242,9 @@ void GPU_Backend_HIP::Impl::ReportUniformLines(const char* name, const void* hos
 {
 	const size_t lines = bytes/128;
 	const double share = host ? 100.0*HIP_UniformLineShare(host, bytes) : 100.0;
-	std::cout << "GPU_Backend_HIP: uniform lines: " << name << " " << std::fixed << std::setprecision(1) << share
-	          << " % of " << lines << " (" << std::setprecision(2) << (double)bytes/(1024.0*1024.0) << " MB)"
-	          << std::defaultfloat << std::endl;
+	// formatted apart: the precision must not stick to std::cout
+	std::ostringstream line;
+	line << std::fixed << std::setprecision(1) << share << " % of " << lines << " ("
+	     << std::setprecision(2) << (double)bytes/(1024.0*1024.0) << " MB)";
+	std::cout << "GPU_Backend_HIP: uniform lines: " << name << " " << line.str() << std::endl;
 }
