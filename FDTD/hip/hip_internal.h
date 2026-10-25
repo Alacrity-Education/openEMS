@@ -264,6 +264,26 @@ struct GPU_Backend_HIP::Impl
 	//! Why mode 1 cannot be used on this grid, empty if it can
 	std::string MurRefusal() const;
 
+	//! OPENEMS_HIP_WINDOW (read in Init(), see HIP_ParseWindowKnob()): windowed blocks of T timesteps and windows of W x planes
+	struct WindowKnob
+	{
+		bool on;              //!< set and not 0
+		bool supported;       //!< a block shape this build runs: T = 1 and W = nx (the degenerate window)
+		unsigned int T, W;    //!< W: the grid's nx for "NX"
+		std::string text;     //!< the value as set
+	};
+	WindowKnob window;
+	//! the windowed blocks run (see GPU_Backend_HIP::SetWindowExtensions()), with these extensions in the engine's order
+	bool window_used;
+	std::vector<GPU_Extension*> window_exts;
+	//! the timestep of the windowed block that runs (one int, device memory): the base the window-capable
+	//! extensions read their step from (see GPU_Extension::LaunchInWindow()); allocated in Init()
+	int* step_base;
+	//! The main voltage / current update of the nodes [x0,x1) x [y0,y1) (all z) for the windowed blocks:
+	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window
+	void WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
+	void WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
+
 	//! Field snapshots (see GPU_Backend_HIP::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy stream into a page-locked host buffer
 	//! while the next timesteps run
@@ -419,6 +439,11 @@ void HIP_Launch(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_
 	if (timed)
 		HIP_KernelTimes::End(d->Stream(), name);
 }
+
+//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset) for a grid of \a nx x lines: unset or 0 off; "1,<W>" with
+//! W = nx or the string NX the degenerate window (T = 1, one window of the whole grid); anything else is
+//! on but unsupported in this build (the backend then steps one timestep at a time)
+GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx);
 
 //! Factory of a HIP extension: the device implementation of \a eng_ext, or NULL if \a eng_ext is not of its type
 typedef GPU_Extension* (*HIP_ExtensionFactory)(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng);

@@ -160,6 +160,11 @@ protected:
 	void MarkStale(StaleField& field);
 
 	void ClearGPUExtensions();
+
+	//! Windowed blocks (GPU_Backend::IterateWindowed()): -1 not decided yet (the first IterateTS() decides), 0 no, 1 yes
+	int m_Windowed;
+	//! Decide m_Windowed: why this engine cannot run windowed blocks, passed to the backend, which decides and logs
+	void DecideWindowed();
 };
 
 #endif // ENGINE_GPU_H

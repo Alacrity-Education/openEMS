@@ -770,6 +770,9 @@ GPU_Backend_HIP::Impl::Impl()
 	memset(&mur_shell, 0, sizeof(mur_shell));
 	mur_shell_count = 0;
 	mur_released = false;
+	window = HIP_ParseWindowKnob(NULL, 0);
+	window_used = false;
+	step_base = NULL;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -1337,6 +1340,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->ResetZSlabs();
 	if (const char* env = getenv("OPENEMS_HIP_MUR_FUSED"))
 		d->mur_knob = std::max(0, std::min(1, atoi(env)));
+	d->window = HIP_ParseWindowKnob(getenv("OPENEMS_HIP_WINDOW"), d->dim.nx);
 
 	// the main updates launch one block per x line along z, which the device limits (64k on AMD and NVIDIA);
 	// from the properties: hipDeviceGetAttribute calls the CUDA driver API on NVIDIA (MSVC keeps
@@ -1373,6 +1377,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count, NULL, HIP_AllocFields, "volt");
 	d->curr = d->Alloc<float>(count, NULL, HIP_AllocFields, "curr");
+	if (d->window.on)
+		d->step_base = d->Alloc<int>(1);
 
 	// upload the final operator coefficients, including all changes by operator extensions.
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
@@ -1476,6 +1482,152 @@ void GPU_Backend_HIP::UpdateCurrents()
 	d->MainRange(B, E, threads_z);
 	HIP_Launch(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->curr, (const float*)d->volt, (const void*)d->index, (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, B, E, d->zslabs);
+}
+
+/************************** windowed blocks (OPENEMS_HIP_WINDOW) **************************/
+
+// The timestep of the block about to run, for the window-capable extensions (see GPU_Extension::LaunchInWindow()):
+// written on the work stream, so a captured block reads the value of its launch
+__global__ void set_step(int* step_base, int step)
+{
+	if (blockIdx.x*blockDim.x + threadIdx.x == 0)
+		*step_base = step;
+}
+
+GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx)
+{
+	GPU_Backend_HIP::Impl::WindowKnob k;
+	k.on = k.supported = false;
+	k.T = k.W = 0;
+	k.text = text ? text : "";
+	if (k.text.empty() || (k.text=="0"))
+		return k;
+	k.on = true;
+	// T,W[,B]: this build runs T = 1 with one window of the whole grid only
+	const size_t comma = k.text.find(',');
+	if ((comma==std::string::npos) || (k.text.find(',', comma+1)!=std::string::npos))
+		return k;
+	const std::string t = k.text.substr(0, comma), w = k.text.substr(comma+1);
+	if (t!="1")
+		return k;
+	k.T = 1;
+	if (w=="NX")
+		k.W = nx;
+	else if (!w.empty() && (w.find_first_not_of("0123456789")==std::string::npos) && (w.size()<10))
+		k.W = (unsigned int)atoi(w.c_str());
+	k.supported = (k.W>0) && (k.W==nx);
+	return k;
+}
+
+void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	const bool c = coeff_mode>0;
+	DecideMurFused();   // as UpdateVoltages(): once, after the pre hooks of the first timestep
+	LogCompressible();
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	HIP_Launch(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs);
+}
+
+void GPU_Backend_HIP::Impl::WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	const bool c = coeff_mode>0;
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	HIP_Launch(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	            curr, (const float*)volt, (const void*)index, (const float*)(c ? coeff : ii), (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, zslabs);
+}
+
+bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal)
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	d->window_used = false;
+	d->window_exts.clear();
+	if (!d->window.on)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: off" << std::endl;
+		return false;
+	}
+	if (!refusal.empty())
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: refused: " << refusal << std::endl;
+		return false;
+	}
+	if (!d->window.supported || (d->step_base==NULL))
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: unsupported in this build, single-step" << std::endl;
+		return false;
+	}
+	for (size_t n=0; n<exts.size(); ++n)
+		if (!exts[n]->WindowCapable())
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: refused: an extension is not window-capable" << std::endl;
+			return false;
+		}
+	d->window_exts = exts;
+	d->window_used = true;
+	// the windowed blocks run the separate kernels; the fused step would be decided at the first voltage update
+	const char* fused_env = getenv("OPENEMS_HIP_FUSED_STEP");
+	const bool fused = (d->fused_step>0) || ((d->fused_step<0) && (d->fused_blockers==0) && !(fused_env && (atoi(fused_env)==0)));
+	if (d->fused_step<0)
+		d->fused_step = 0;
+	if (verbose)
+	{
+		std::cout << "GPU_Backend_HIP: window: T=" << d->window.T << " W=" << d->window.W << " (degenerate, " << exts.size()
+		          << " window-capable extensions)" << std::endl;
+		if (fused)
+			std::cout << "GPU_Backend_HIP: window: separate updates, the fused step is not used on the windowed path" << std::endl;
+	}
+	return true;
+}
+
+bool GPU_Backend_HIP::IterateWindowed(unsigned int start_ts, unsigned int n)
+{
+	if (!d->window_used)
+		return false;
+	if (d->fused_step>0)
+		return false;   // decided before the windowed blocks: the fields are in its double buffers
+	// T = 1, one window [0,nx) x [0,ny): the hooks in the order of Engine_GPU::VoltageHalfStep()/CurrentHalfStep()
+	const std::vector<GPU_Extension*>& X = d->window_exts;
+	const int count = (int)X.size();
+	const unsigned int nx = d->dim.nx, ny = d->dim.ny;
+	for (unsigned int s=0; s<n; ++s)
+	{
+		HIP_Launch(d, "set_step", set_step, 1, 1, 1, d->step_base, (int)(start_ts + s));
+		for (int k=count-1; k>=0; --k)
+			X[k]->LaunchInWindow(GPU_WindowPreVoltage, 0, 0, nx, 0, ny);
+		d->WindowVoltages(0, nx, 0, ny);
+		for (int k=0; k<count; ++k)
+			X[k]->LaunchInWindow(GPU_WindowPostVoltage, 0, 0, nx, 0, ny);
+		for (int k=0; k<count; ++k)
+			X[k]->LaunchInWindow(GPU_WindowApplyVoltage, 0, 0, nx, 0, ny);
+		for (int k=count-1; k>=0; --k)
+			X[k]->LaunchInWindow(GPU_WindowPreCurrent, 0, 0, nx, 0, ny);
+		d->WindowCurrents(0, nx, 0, ny);
+		for (int k=0; k<count; ++k)
+			X[k]->LaunchInWindow(GPU_WindowPostCurrent, 0, 0, nx, 0, ny);
+		for (int k=0; k<count; ++k)
+			X[k]->LaunchInWindow(GPU_WindowApplyCurrent, 0, 0, nx, 0, ny);
+		// the end of a block of one timestep
+		for (int k=0; k<count; ++k)
+			X[k]->EndOfBlock(start_ts + s);
+	}
+	return true;
 }
 
 static void CheckSize(size_t host_count, size_t device_count)
