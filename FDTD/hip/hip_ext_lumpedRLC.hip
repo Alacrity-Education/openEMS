@@ -193,6 +193,8 @@ HIP_Ext_LumpedRLC::HIP_Ext_LumpedRLC(GPU_Backend_HIP::Impl* impl, Operator_Ext_L
 	// fused step (see update_fused): Apply2Voltages() changes these voltages after the voltage
 	// update, the currents next to them are recomputed
 	d->volt_modified.insert(d->volt_modified.end(), index.begin(), index.end());
+	for (unsigned int p=0; p<count; ++p)
+		index[p] = d->Dev(index[p]);   // the device layout (OPENEMS_HIP_ZPAD)
 	m_Data.index = d->Alloc<size_t>(count, index.data());
 	m_Data.il = d->Alloc<float>(count);
 	m_Data.vd = d->Alloc<float>(3*(size_t)count);

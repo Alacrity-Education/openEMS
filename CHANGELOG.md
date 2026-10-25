@@ -80,6 +80,16 @@ there are unreleased changes. It becomes the next release entry.
   kernels shrink from 56 to 30 us a step but the main voltage update loses
   the cache warming the old kernels gave it. A version with the sheet update
   inside the voltage kernel was bit-identical and no faster.
+- The HIP backend stores the z lines of its device layout with a stride
+  rounded up to a multiple of 64 on grids where extensions such as Mur ABC
+  or conducting sheets block the fused step (`OPENEMS_HIP_ZPAD=auto`, the
+  default; `0` off, `32`, `48`, `64` forced), so that every line starts on the
+  same alignment, and times the block of its separate main kernels on the
+  live grid at the first timestep (`OPENEMS_HIP_SHAPE=auto`, the default;
+  `0` the former block, `TZxTY` forced). The results are bit-identical; the
+  fused step keeps the unpadded layout. On an RTX 5090 a model of 3.06 Mcells
+  (40 z lines, Mur and sheets) runs at 11572 MC/s instead of 10226 (+13 %),
+  its two main kernels taking 172 us a step instead of 232.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

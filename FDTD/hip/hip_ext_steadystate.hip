@@ -87,9 +87,9 @@ HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_E
 	m_Count = op_ext->m_E_probe_dir.size();
 
 	std::vector<size_t> index(std::max(m_Count, 1u), 0);
-	for (unsigned int n=0; n<m_Count; ++n)
-		index[n] = (((size_t)op_ext->m_E_probe_dir.at(n)*d->dim.nx + op_ext->m_E_probe_pos[0].at(n))*d->dim.ny
-		            + op_ext->m_E_probe_pos[1].at(n))*d->dim.nz + op_ext->m_E_probe_pos[2].at(n);
+	for (unsigned int n=0; n<m_Count; ++n)   // in the device layout (OPENEMS_HIP_ZPAD)
+		index[n] = d->Dev((((size_t)op_ext->m_E_probe_dir.at(n)*d->dim.nx + op_ext->m_E_probe_pos[0].at(n))*d->dim.ny
+		                  + op_ext->m_E_probe_pos[1].at(n))*d->dim.nz + op_ext->m_E_probe_pos[2].at(n));
 	m_Index = d->Alloc<size_t>(index.size(), index.data());
 	m_HostRecords.resize(std::max(m_Count, 1u)*2*(size_t)m_Period);
 	m_Records = d->Alloc<float>(m_HostRecords.size());
