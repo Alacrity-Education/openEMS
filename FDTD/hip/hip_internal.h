@@ -265,7 +265,7 @@ struct GPU_Backend_HIP::Impl
 	//! Flat node indices (x*ny*nz + y*nz + z) an extension reads or writes the voltages of at its hooks, registered
 	//! by its constructor (the dispersive materials and sheets), for the check of MurRefusal()
 	std::vector<size_t> ext_nodes;
-	//! OPENEMS_HIP_MUR_FUSED (read in Init(), default 1): 0 the three launches per Mur plane, 1 the Mur planes in
+	//! OPENEMS_HIP_MUR_FUSED (read in Init(), default 2): 0 the three launches per Mur plane, 1 the Mur planes in
 	//! the voltage update (update_voltages_inner and mur_shell, see mur_volt_component), 2 as 1 with the interior
 	//! of the z faces in update_voltages_inner (mur_zface_lane())
 	int mur_knob;

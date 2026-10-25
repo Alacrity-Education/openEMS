@@ -61,13 +61,14 @@ there are unreleased changes. It becomes the next release entry.
   `OPENEMS_HIP_MUR_FUSED=0` restores them everywhere. On an RTX 5090 a board
   of 28.7 Mcells with Mur on all six faces settles at 8929 MC/s instead of
   7963 (+12 %), a model of 3.1 Mcells at 10405 instead of 9758 (+6.6 %).
-  `OPENEMS_HIP_MUR_FUSED=2` also moves the interior of the two z faces into
-  the main voltage update, where the Mur line and its shift line are lanes of
-  one warp and exchange their values through warp shuffles (bit-identical;
-  a grid with fewer than 6 z lines, no Mur plane on a z face, or the two lines
-  in different warps runs mode 1). On an RTX 5090 the model of 3.1 Mcells
-  runs at 11854 MC/s instead of 10394 (+14 %): the shell launch drops from
-  39.0 to 12.6 us a step, the voltage update from 110.2 to 94.1 us.
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are lanes of one warp and
+  exchange their values through warp shuffles (bit-identical; a grid with
+  fewer than 6 z lines, no Mur plane on a z face, or the two lines in
+  different warps keeps them in the shell launch, `OPENEMS_HIP_MUR_FUSED=1`
+  forces that). On an RTX 5090 the board settles at 12822 MC/s instead of
+  10602 with the z faces in the kernel (2.24 ms a step instead of 2.71), the
+  model of 3.1 Mcells at 11854 instead of 10394.
 - The HIP backend runs conducting sheets that lie on z planes as dense state
   per sheet plane: one launch per half-step for all planes and both
   dispersion orders, the in-plane components only, instead of two launches
