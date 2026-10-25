@@ -61,18 +61,17 @@ there are unreleased changes. It becomes the next release entry.
   `OPENEMS_HIP_MUR_FUSED=0` restores them everywhere. On an RTX 5090 a board
   of 28.7 Mcells with Mur on all six faces settles at 8929 MC/s instead of
   7963 (+12 %), a model of 3.1 Mcells at 10405 instead of 9758 (+6.6 %).
-- `OPENEMS_HIP_SHEET_PLANES=1` runs the conducting sheets of the HIP backend
-  as dense state per sheet plane when the sheets lie on z planes: one launch
-  per half-step for all planes and both dispersion orders, the in-plane
-  components only, instead of two launches per order over a position list
-  with all three components. The results are bit-identical. It is off by
-  default: on an RTX 5090, a board model of 3.06 Mcells with four copper
-  layers (266663 sheet cells) takes 30.3 us a step in the sheet kernels
-  instead of 56.0 us, but the main voltage update loses the head start the
-  old kernels gave it (98.8 to 113.9 us), so the run is 1.3 % faster
-  (9887 MC/s against 9757), within the noise of the comparison. A version
-  with the sheet update inside the voltage kernel was bit-identical and no
-  faster (9758 MC/s) and was not kept.
+- The HIP backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, instead of two launches
+  per order over a position list with all three components. The results are
+  bit-identical; `OPENEMS_HIP_SHEET_PLANES=0` restores the position lists.
+  On an RTX 5090 a board of 28.7 Mcells with four copper layers (2.5 million
+  sheet cells) settles at 10602 MC/s instead of 8929 (+19 %, 2.71 ms a step
+  instead of 3.21); a model of 3.06 Mcells gains 1.3 %, where the sheet
+  kernels shrink from 56 to 30 us a step but the main voltage update loses
+  the cache warming the old kernels gave it. A version with the sheet update
+  inside the voltage kernel was bit-identical and no faster.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

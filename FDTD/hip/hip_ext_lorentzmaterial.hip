@@ -153,10 +153,10 @@ __global__ void sheet_apply(float* field, SheetArgs A)
 	}
 }
 
-//! OPENEMS_HIP_SHEET_PLANES (read once): 1 dense per-plane state for conducting sheets on z planes, 0 (default) off
+//! OPENEMS_HIP_SHEET_PLANES (read once): 1 (default) dense per-plane state for conducting sheets on z planes, 0 off
 static int HIP_SheetPlanesKnob()
 {
-	static const int knob = getenv("OPENEMS_HIP_SHEET_PLANES") ? atoi(getenv("OPENEMS_HIP_SHEET_PLANES")) : 0;
+	static const int knob = getenv("OPENEMS_HIP_SHEET_PLANES") ? atoi(getenv("OPENEMS_HIP_SHEET_PLANES")) : 1;
 	return knob;
 }
 
