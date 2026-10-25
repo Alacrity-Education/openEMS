@@ -63,6 +63,11 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	//! Fingerprint of the built state the engine extension reads (OPENEMS_OPERATOR_FINGERPRINT=1): "0x" and 16 hex digits, or "n/a" (default). Valid after BuildExtension.
+	virtual std::string Fingerprint() const {return "n/a";}
+	//! Short factual note printed behind the fingerprint, e.g. the number of positions
+	virtual std::string FingerprintNote() const {return "";}
+
 	virtual bool IsActive() const {return m_Active;}
 	virtual void SetActive(bool active=true) {m_Active=active;}
 

@@ -87,6 +87,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 protected:
 	//! Copy constructor
 	Operator_Ext_DebyeMaterial(Operator* op, Operator_Ext_DebyeMaterial* op_ext);

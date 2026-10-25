@@ -16,6 +16,7 @@
 */
 
 #include "operator_ext_lorentzmaterial.h"
+#include "tools/fingerprint.h"
 #include "engine_ext_lorentzmaterial.h"
 #include "operator_ext_cylinder.h"
 #include "../operator_cylinder.h"
@@ -411,6 +412,40 @@ Engine_Extension* Operator_Ext_LorentzMaterial::CreateEngineExtention()
 {
 	Engine_Ext_LorentzMaterial* eng_ext_lor = new Engine_Ext_LorentzMaterial(this);
 	return eng_ext_lor;
+}
+
+std::string Operator_Ext_LorentzMaterial::Fingerprint() const
+{
+	FNVHash hash;
+	FingerprintBase(hash);
+	for (int o=0; o<m_Order; ++o)
+	{
+		bool volt_on = m_volt_ADE_On && m_volt_ADE_On[o];
+		bool curr_on = m_curr_ADE_On && m_curr_ADE_On[o];
+		bool volt_lor = m_volt_Lor_ADE_On && m_volt_Lor_ADE_On[o];
+		bool curr_lor = m_curr_Lor_ADE_On && m_curr_Lor_ADE_On[o];
+		hash.AddValue((uint8_t)volt_lor);
+		hash.AddValue((uint8_t)curr_lor);
+		size_t count = ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0;
+		for (int n=0; n<3; ++n)
+		{
+			hash.AddArray((volt_on && v_int_ADE) ? v_int_ADE[o][n] : NULL, count);
+			hash.AddArray((volt_on && v_ext_ADE) ? v_ext_ADE[o][n] : NULL, count);
+			hash.AddArray((curr_on && i_int_ADE) ? i_int_ADE[o][n] : NULL, count);
+			hash.AddArray((curr_on && i_ext_ADE) ? i_ext_ADE[o][n] : NULL, count);
+			hash.AddArray((volt_lor && v_Lor_ADE) ? v_Lor_ADE[o][n] : NULL, count);
+			hash.AddArray((curr_lor && i_Lor_ADE) ? i_Lor_ADE[o][n] : NULL, count);
+		}
+	}
+	return hash.Hex();
+}
+
+std::string Operator_Ext_LorentzMaterial::FingerprintNote() const
+{
+	std::string positions;
+	for (size_t o=0; o<m_LM_Count.size(); ++o)
+		positions += (o ? "/" : "") + std::to_string(m_LM_Count[o]);
+	return std::to_string(m_Order) + " orders, positions " + positions;
 }
 
 void Operator_Ext_LorentzMaterial::ShowStat(std::ostream &ostr)  const

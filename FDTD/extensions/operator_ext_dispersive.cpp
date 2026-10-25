@@ -16,6 +16,7 @@
 */
 
 #include "operator_ext_dispersive.h"
+#include "tools/fingerprint.h"
 
 using namespace std;
 
@@ -61,6 +62,21 @@ Operator_Ext_Dispersive::~Operator_Ext_Dispersive()
 	m_LM_pos=NULL;
 	m_Order=0;
 	m_LM_Count.clear();
+}
+
+void Operator_Ext_Dispersive::FingerprintBase(FNVHash& hash) const
+{
+	hash.AddValue((int32_t)m_Order);
+	hash.AddValue((uint64_t)m_LM_Count.size());
+	for (size_t o=0; o<m_LM_Count.size(); ++o)
+		hash.AddValue((uint64_t)m_LM_Count[o]);
+	for (int o=0; o<m_Order; ++o)
+	{
+		hash.AddValue((uint8_t)(m_volt_ADE_On ? m_volt_ADE_On[o] : false));
+		hash.AddValue((uint8_t)(m_curr_ADE_On ? m_curr_ADE_On[o] : false));
+		for (int n=0; n<3; ++n)
+			hash.AddArray((m_LM_pos && (size_t)o<m_LM_Count.size()) ? m_LM_pos[o][n] : NULL, ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0);
+	}
 }
 
 void Operator_Ext_Dispersive::ShowStat(ostream &ostr)  const
