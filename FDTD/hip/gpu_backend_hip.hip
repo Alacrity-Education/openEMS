@@ -959,6 +959,9 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	// that call, GCC folds it away), which the plugin links only for hip_compressible.hip
 	hipDeviceProp_t prop;
 	HIP_Check(hipGetDeviceProperties(&prop, d->ctx->device), "hipGetDeviceProperties");
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << "GPU_Backend_HIP: " << prop.name << ": " << prop.multiProcessorCount << " multiprocessors, L2 cache "
+		          << prop.l2CacheSize/(1024*1024) << " MiB, warp size " << d->ctx->warp_size << std::endl;
 	int max_grid_z = prop.maxGridSize[2];
 	if ((max_grid_z>0) && (d->dim.nx>(unsigned int)max_grid_z))
 	{
