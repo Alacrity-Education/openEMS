@@ -55,6 +55,9 @@ protected:
 	//! Copy constructor
 	Operator_Ext_LorentzMaterial(Operator* op, Operator_Ext_LorentzMaterial* op_ext);
 
+	//! x-slabs [start, stop] of the threaded build, one per thread: AvailableThreads() or OPENEMS_SHEET_THREADS=<n>
+	static void BuildSlabs(unsigned int numX, std::vector<unsigned int>& start, std::vector<unsigned int>& stop);
+
 	//ADE update coefficients, array setup: coeff[N_order][direction][mesh_pos_index]
 	FDTD_FLOAT ***v_int_ADE;
 	FDTD_FLOAT ***v_ext_ADE;

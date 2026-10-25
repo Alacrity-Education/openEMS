@@ -22,8 +22,50 @@
 #include "../operator_cylinder.h"
 
 #include "CSPropLorentzMaterial.h"
+#include "tools/global.h"
+#include "tools/useful.h"
 
+#include <cstdlib>
+#include <thread>
+
+namespace
+{
+//! The results of one x-slab of the Lorentz build (one order), merged in slab order
+struct LorentzSlab
+{
+	std::vector<unsigned int> v_pos[3];
+	std::vector<double> v_int[3];
+	std::vector<double> v_ext[3];
+	std::vector<double> i_int[3];
+	std::vector<double> i_ext[3];
+	std::vector<double> v_Lor[3];
+	std::vector<double> i_Lor[3];
+	bool volt_ADE = false;
+	bool curr_ADE = false;
+	bool volt_Lor_ADE = false;
+	bool curr_Lor_ADE = false;
+	std::vector<CSPrimitives*> used;
+};
+}
+
+using std::cout;
 using std::endl;
+
+void Operator_Ext_LorentzMaterial::BuildSlabs(unsigned int numX, std::vector<unsigned int>& start, std::vector<unsigned int>& stop)
+{
+	unsigned int threads = AvailableThreads();
+	const char* env = getenv("OPENEMS_SHEET_THREADS");
+	if (env && (atoi(env)>0))
+		threads = atoi(env);
+	std::vector<unsigned int> jobs = AssignJobs2Threads(numX, threads, true);
+	unsigned int line = 0;
+	for (size_t n=0; n<jobs.size(); ++n)
+	{
+		start.push_back(line);
+		line += jobs.at(n);
+		stop.push_back(line-1);
+	}
+}
 
 Operator_Ext_LorentzMaterial::Operator_Ext_LorentzMaterial(Operator* op) : Operator_Ext_Dispersive(op)
 {
@@ -119,27 +161,17 @@ Operator_Extension* Operator_Ext_LorentzMaterial::Clone(Operator* op)
 bool Operator_Ext_LorentzMaterial::BuildExtension()
 {
 	double dT = m_Op->GetTimestep();
-	unsigned int pos[] = {0,0,0};
-	double coord[3];
 	unsigned int numLines[3] = {m_Op->GetNumberOfLines(0,true),m_Op->GetNumberOfLines(1,true),m_Op->GetNumberOfLines(2,true)};
-	CSPropLorentzMaterial* mat = NULL;
 
-	bool b_pos_on;
 	std::vector<unsigned int> v_pos[3];
 
 	// drude material parameter
-	double w_plasma,t_relax;
-	double L_D[3], C_D[3];
-	double R_D[3], G_D[3];
 	std::vector<double> v_int[3];
 	std::vector<double> v_ext[3];
 	std::vector<double> i_int[3];
 	std::vector<double> i_ext[3];
 
 	//additional Dorentz material parameter
-	double w_Lor_Pol;
-	double C_L[3];
-	double L_L[3];
 	std::vector<double> v_Lor[3];
 	std::vector<double> i_Lor[3];
 
@@ -153,6 +185,30 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 		if (LorMat->GetDispersionOrder()>m_Order)
 			m_Order=LorMat->GetDispersionOrder();
 	}
+
+	// The cells are built by x-slabs in parallel, one thread per slab (OPENEMS_SHEET_THREADS=<n>, default: the
+	// --threads count; one slab runs inline). Each slab keeps its own lists, flags and used primitives; they are
+	// merged in slab order after the join, so the lists equal the serial ones.
+	std::vector<unsigned int> start, stop;
+	BuildSlabs(numLines[0], start, stop);
+	// A weight function is evaluated by a new CSFunctionParser per query, whose constructor calls setlocale(),
+	// which is not thread safe: keep the build serial if any is given.
+	for (size_t n=0;(n<LD_props.size()) && (start.size()>1);++n)
+	{
+		CSPropLorentzMaterial* LorMat = dynamic_cast<CSPropLorentzMaterial*>(LD_props.at(n));
+		for (int order=0;order<LorMat->GetDispersionOrder();++order)
+			for (int ny=0;ny<3;++ny)
+				if (!LorMat->GetEpsPlasmaFreqWeightFunction(order,ny).empty() || !LorMat->GetEpsLorPoleFreqWeightFunction(order,ny).empty() ||
+					!LorMat->GetEpsRelaxTimeWeightFunction(order,ny).empty() || !LorMat->GetMuePlasmaFreqWeightFunction(order,ny).empty() ||
+					!LorMat->GetMueLorPoleFreqWeightFunction(order,ny).empty() || !LorMat->GetMueRelaxTimeWeightFunction(order,ny).empty())
+				{
+					start.resize(1);
+					stop.assign(1, numLines[0]-1);
+				}
+	}
+	if (g_settings.GetVerboseLevel()>1)
+		cout << "Operator_Ext_LorentzMaterial: building with " << start.size() << " threads" << endl;
+
 	m_LM_pos = new unsigned int**[m_Order];
 
 	m_volt_ADE_On = new bool[m_Order];
@@ -189,140 +245,194 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 			i_Lor[n].clear();
 		}
 
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+		std::vector<LorentzSlab> slabs(start.size());
+		auto build_slab = [&](size_t s)
 		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			LorentzSlab& slab = slabs[s];
+			unsigned int pos[] = {0,0,0};
+			double coord[3];
+			CSPropLorentzMaterial* mat = NULL;
+			bool b_pos_on;
+			double w_plasma,t_relax;
+			double L_D[3], C_D[3];
+			double R_D[3], G_D[3];
+			double w_Lor_Pol;
+			double C_L[3];
+			double L_L[3];
+			for (pos[0]=start[s]; pos[0]<=stop[s]; ++pos[0])
 			{
-				std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
-					pos[0], pos[1], -1,
-					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-				);
-
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+				for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 				{
-					unsigned int index = m_Op->MainOp->SetPos(pos[0],pos[1],pos[2]);
-					//calc epsilon lorentz material
-					b_pos_on = false;
-					for (int n=0; n<3; ++n)
-					{
-						L_D[n]=0;
-						R_D[n]=0;
-						C_L[n]=0;
-						if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
-							continue;
-						if (m_CC_R0_included && (n==2) && (pos[0]==0))
-							coord[1] = m_Op->GetDiscLine(1,0);
+					std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
+						pos[0], pos[1], -1,
+						(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+					);
 
-						if (m_Op->GetVI(n,pos[0],pos[1],pos[2])==0)
-							continue;
+					for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+					{
+						unsigned int index = m_Op->MainOp->GetPos(pos[0],pos[1],pos[2]);
+						//calc epsilon lorentz material
+						b_pos_on = false;
+						for (int n=0; n<3; ++n)
+						{
+							L_D[n]=0;
+							R_D[n]=0;
+							C_L[n]=0;
+							if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
+								continue;
+							if (m_CC_R0_included && (n==2) && (pos[0]==0))
+								coord[1] = m_Op->GetDiscLine(1,0);
+
+							if (m_Op->GetVI(n,pos[0],pos[1],pos[2])==0)
+								continue;
 
 //						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), true);
-						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, true);
+							CSPrimitives* found = NULL;
+							CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &found);
+							if (found && (slab.used.empty() || (slab.used.back()!=found)))
+								slab.used.push_back(found); //SetPrimitiveUsed(true) after the join
 
-						if (prop==NULL) continue;
+							if (prop==NULL) continue;
 
-						if ((mat = prop->ToLorentzMaterial()))
-						{
-							w_plasma = mat->GetEpsPlasmaFreqWeighted(order,n,coord) * 2 * PI;
-							if ((w_plasma>0) && (m_Op->EC_C[n][index]>0))
+							if ((mat = prop->ToLorentzMaterial()))
 							{
-								b_pos_on = true;
-								m_volt_ADE_On[order] = true;
-								L_D[n] = 1/(w_plasma*w_plasma*m_Op->EC_C[n][index]);
-							}
-							t_relax = mat->GetEpsRelaxTimeWeighted(order,n,coord);
-							if ((t_relax>0) && m_volt_ADE_On[order])
-							{
-								R_D[n] = L_D[n]/t_relax;
-							}
-							w_Lor_Pol = mat->GetEpsLorPoleFreqWeighted(order,n,coord) * 2 * PI;
-							if ((w_Lor_Pol>0) && (L_D[n]>0))
-							{
-								m_volt_Lor_ADE_On[order] = true;
-								C_L[n] = 1/(w_Lor_Pol*w_Lor_Pol*L_D[n]);
+								w_plasma = mat->GetEpsPlasmaFreqWeighted(order,n,coord) * 2 * PI;
+								if ((w_plasma>0) && (m_Op->EC_C[n][index]>0))
+								{
+									b_pos_on = true;
+									slab.volt_ADE = true;
+									L_D[n] = 1/(w_plasma*w_plasma*m_Op->EC_C[n][index]);
+								}
+								t_relax = mat->GetEpsRelaxTimeWeighted(order,n,coord);
+								if ((t_relax>0) && slab.volt_ADE)
+								{
+									R_D[n] = L_D[n]/t_relax;
+								}
+								w_Lor_Pol = mat->GetEpsLorPoleFreqWeighted(order,n,coord) * 2 * PI;
+								if ((w_Lor_Pol>0) && (L_D[n]>0))
+								{
+									slab.volt_Lor_ADE = true;
+									C_L[n] = 1/(w_Lor_Pol*w_Lor_Pol*L_D[n]);
+								}
 							}
 						}
-					}
 
-					for (int n=0; n<3; ++n)
-					{
-						C_D[n]=0;
-						G_D[n]=0;
-						L_L[n]=0;
-						if (m_Op->GetYeeCoords(n,pos,coord,true)==false)
-							continue;
-						if (m_Op->GetIV(n,pos[0],pos[1],pos[2])==0)
-							continue;
+						for (int n=0; n<3; ++n)
+						{
+							C_D[n]=0;
+							G_D[n]=0;
+							L_L[n]=0;
+							if (m_Op->GetYeeCoords(n,pos,coord,true)==false)
+								continue;
+							if (m_Op->GetIV(n,pos[0],pos[1],pos[2])==0)
+								continue;
 
 //						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), true);
-						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, true);
+							CSPrimitives* found = NULL;
+							CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &found);
+							if (found && (slab.used.empty() || (slab.used.back()!=found)))
+								slab.used.push_back(found); //SetPrimitiveUsed(true) after the join
 
-						if (prop==NULL) continue;
+							if (prop==NULL) continue;
 
-						if ((mat = prop->ToLorentzMaterial()))
-						{
-							w_plasma = mat->GetMuePlasmaFreqWeighted(order,n,coord) * 2 * PI;
-							if ((w_plasma>0) && (m_Op->EC_L[n][index]>0))
+							if ((mat = prop->ToLorentzMaterial()))
 							{
-								b_pos_on = true;
-								m_curr_ADE_On[order] = true;
-								C_D[n] = 1/(w_plasma*w_plasma*m_Op->EC_L[n][index]);
-							}
-							t_relax = mat->GetMueRelaxTimeWeighted(order,n,coord);
-							if ((t_relax>0) && m_curr_ADE_On[order])
-							{
-								G_D[n] = C_D[n]/t_relax;
-							}
-							w_Lor_Pol = mat->GetMueLorPoleFreqWeighted(order,n,coord) * 2 * PI;
-							if ((w_Lor_Pol>0) && (C_D[n]>0))
-							{
-								m_curr_Lor_ADE_On[order] = true;
-								L_L[n] = 1/(w_Lor_Pol*w_Lor_Pol*C_D[n]);
+								w_plasma = mat->GetMuePlasmaFreqWeighted(order,n,coord) * 2 * PI;
+								if ((w_plasma>0) && (m_Op->EC_L[n][index]>0))
+								{
+									b_pos_on = true;
+									slab.curr_ADE = true;
+									C_D[n] = 1/(w_plasma*w_plasma*m_Op->EC_L[n][index]);
+								}
+								t_relax = mat->GetMueRelaxTimeWeighted(order,n,coord);
+								if ((t_relax>0) && slab.curr_ADE)
+								{
+									G_D[n] = C_D[n]/t_relax;
+								}
+								w_Lor_Pol = mat->GetMueLorPoleFreqWeighted(order,n,coord) * 2 * PI;
+								if ((w_Lor_Pol>0) && (C_D[n]>0))
+								{
+									slab.curr_Lor_ADE = true;
+									L_L[n] = 1/(w_Lor_Pol*w_Lor_Pol*C_D[n]);
+								}
 							}
 						}
-					}
 
-					if (b_pos_on) //this position has active drude material
-					{
-						for (unsigned int n=0; n<3; ++n)
+						if (b_pos_on) //this position has active drude material
 						{
-							v_pos[n].push_back(pos[n]);
-							if (L_D[n]>0)
+							for (unsigned int n=0; n<3; ++n)
 							{
-								v_int[n].push_back((2.0*L_D[n]-dT*R_D[n])/(2.0*L_D[n]+dT*R_D[n]));
-								// check for r==0 in clyindrical coords and get special VI coefficient
-								if (m_CC_R0_included && n==2 && pos[0]==0)
-									v_ext[n].push_back(dT/(L_D[n]+dT*R_D[n]/2.0)*m_Op_Cyl->m_Cyl_Ext->vi_R0[pos[2]]);
+								slab.v_pos[n].push_back(pos[n]);
+								if (L_D[n]>0)
+								{
+									slab.v_int[n].push_back((2.0*L_D[n]-dT*R_D[n])/(2.0*L_D[n]+dT*R_D[n]));
+									// check for r==0 in clyindrical coords and get special VI coefficient
+									if (m_CC_R0_included && n==2 && pos[0]==0)
+										slab.v_ext[n].push_back(dT/(L_D[n]+dT*R_D[n]/2.0)*m_Op_Cyl->m_Cyl_Ext->vi_R0[pos[2]]);
+									else
+										slab.v_ext[n].push_back(dT/(L_D[n]+dT*R_D[n]/2.0)*m_Op->GetVI(n,pos[0],pos[1],pos[2]));
+								}
 								else
-									v_ext[n].push_back(dT/(L_D[n]+dT*R_D[n]/2.0)*m_Op->GetVI(n,pos[0],pos[1],pos[2]));
+								{
+									slab.v_int[n].push_back(1);
+									slab.v_ext[n].push_back(0);
+								}
+								if (C_D[n]>0)
+								{
+									slab.i_int[n].push_back((2.0*C_D[n]-dT*G_D[n])/(2.0*C_D[n]+dT*G_D[n]));
+									slab.i_ext[n].push_back(dT/(C_D[n]+dT*G_D[n]/2.0)*m_Op->GetIV(n,pos[0],pos[1],pos[2]));
+								}
+								else
+								{
+									slab.i_int[n].push_back(1);
+									slab.i_ext[n].push_back(0);
+								}
+								if (C_L[n]>0)
+									slab.v_Lor[n].push_back(dT/C_L[n]/m_Op->GetVI(n,pos[0],pos[1],pos[2]));
+								else
+									slab.v_Lor[n].push_back(0);
+								if (L_L[n]>0)
+									slab.i_Lor[n].push_back(dT/L_L[n]/m_Op->GetIV(n,pos[0],pos[1],pos[2]));
+								else
+									slab.i_Lor[n].push_back(0);
 							}
-							else
-							{
-								v_int[n].push_back(1);
-								v_ext[n].push_back(0);
-							}
-							if (C_D[n]>0)
-							{
-								i_int[n].push_back((2.0*C_D[n]-dT*G_D[n])/(2.0*C_D[n]+dT*G_D[n]));
-								i_ext[n].push_back(dT/(C_D[n]+dT*G_D[n]/2.0)*m_Op->GetIV(n,pos[0],pos[1],pos[2]));
-							}
-							else
-							{
-								i_int[n].push_back(1);
-								i_ext[n].push_back(0);
-							}
-							if (C_L[n]>0)
-								v_Lor[n].push_back(dT/C_L[n]/m_Op->GetVI(n,pos[0],pos[1],pos[2]));
-							else
-								v_Lor[n].push_back(0);
-							if (L_L[n]>0)
-								i_Lor[n].push_back(dT/L_L[n]/m_Op->GetIV(n,pos[0],pos[1],pos[2]));
-							else
-								i_Lor[n].push_back(0);
 						}
 					}
 				}
 			}
+		};
+		m_Op->MainOp->SetPos(0,0,0);
+		if (start.size()>1)
+		{
+			std::vector<std::thread> threads;
+			for (size_t s=0; s<start.size(); ++s)
+				threads.push_back(std::thread(build_slab, s));
+			for (size_t s=0; s<threads.size(); ++s)
+				threads[s].join();
+		}
+		else
+			build_slab(0);
+		m_Op->MainOp->SetPos(numLines[0]-1,numLines[1]-1,numLines[2]-1); //where the serial loop left it
+
+		// merge in slab order
+		for (size_t s=0; s<slabs.size(); ++s)
+		{
+			m_volt_ADE_On[order] = m_volt_ADE_On[order] || slabs[s].volt_ADE;
+			m_curr_ADE_On[order] = m_curr_ADE_On[order] || slabs[s].curr_ADE;
+			m_volt_Lor_ADE_On[order] = m_volt_Lor_ADE_On[order] || slabs[s].volt_Lor_ADE;
+			m_curr_Lor_ADE_On[order] = m_curr_Lor_ADE_On[order] || slabs[s].curr_Lor_ADE;
+			for (int n=0; n<3; ++n)
+			{
+				v_pos[n].insert(v_pos[n].end(), slabs[s].v_pos[n].begin(), slabs[s].v_pos[n].end());
+				v_int[n].insert(v_int[n].end(), slabs[s].v_int[n].begin(), slabs[s].v_int[n].end());
+				v_ext[n].insert(v_ext[n].end(), slabs[s].v_ext[n].begin(), slabs[s].v_ext[n].end());
+				i_int[n].insert(i_int[n].end(), slabs[s].i_int[n].begin(), slabs[s].i_int[n].end());
+				i_ext[n].insert(i_ext[n].end(), slabs[s].i_ext[n].begin(), slabs[s].i_ext[n].end());
+				v_Lor[n].insert(v_Lor[n].end(), slabs[s].v_Lor[n].begin(), slabs[s].v_Lor[n].end());
+				i_Lor[n].insert(i_Lor[n].end(), slabs[s].i_Lor[n].begin(), slabs[s].i_Lor[n].end());
+			}
+			for (size_t i=0; i<slabs[s].used.size(); ++i)
+				slabs[s].used[i]->SetPrimitiveUsed(true);
 		}
 
 		//copy all vectors into the array's

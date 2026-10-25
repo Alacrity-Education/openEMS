@@ -18,11 +18,38 @@
 #include "operator_ext_conductingsheet.h"
 #include "tools/arraylib/array_nijk.h"
 #include "tools/constants.h"
+#include "tools/global.h"
 #include "cond_sheet_parameter.h"
 
 #include "CSPropConductingSheet.h"
 
+#include <algorithm>
+#include <map>
+#include <sstream>
+#include <thread>
+
+namespace
+{
+//! Dimension and bounding box of a sheet primitive, read before the threaded build
+struct SheetPrimitive
+{
+	int dim;
+	double box[6];
+};
+
+//! The results of one x-slab of the sheet build, merged in slab order
+struct SheetSlab
+{
+	std::vector<unsigned int> v_pos[3];
+	unsigned int pec[3] = {0,0,0};
+	std::vector<CSPrimitives*> used;
+	std::ostringstream err;
+	bool ok = true;
+};
+}
+
 using std::cerr;
+using std::cout;
 using std::endl;
 
 Operator_Ext_ConductingSheet::Operator_Ext_ConductingSheet(Operator* op, double f_max) : Operator_Ext_LorentzMaterial(op)
@@ -44,7 +71,6 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 {
 	double dT = m_Op->GetTimestep();
 	unsigned int pos[] = {0,0,0};
-	double coord[3];
 	unsigned int numLines[3] = {m_Op->GetNumberOfLines(0,true),m_Op->GetNumberOfLines(1,true),m_Op->GetNumberOfLines(2,true)};
 
 	m_Order = 0;
@@ -53,97 +79,181 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	ArrayLib::ArrayNIJK<float> Conductivity("Conductivity", numLines);
 	ArrayLib::ArrayNIJK<float> Thickness("Thickness", numLines);
 
-	CSPrimitives* cs_sheet = NULL;
-	double box[6];
-	int nP, nPP;
-	bool b_pos_on;
-	bool disable_pos;
-	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+	// The cells are built by x-slabs in parallel, one thread per slab (OPENEMS_SHEET_THREADS=<n>, default: the
+	// --threads count; one slab runs inline). Each slab keeps its own positions, PEC counts, used primitives and
+	// messages; they are merged in slab order after the join, so the position lists equal the serial ones.
+	std::vector<unsigned int> start, stop;
+	BuildSlabs(numLines[0], start, stop);
+
+	// GetDimension() and GetBoundBox() of a primitive write it (they recompute its dimension), so the threads must
+	// not call them: read them once here for every sheet primitive, in the order the loop calls them.
+	std::map<CSPrimitives*, SheetPrimitive> sheetPrims;
+	if (start.size()>1)
 	{
-		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+		std::vector<CSPrimitives*> prims = m_Op->GetGeometryCSX()->GetAllPrimitives(false, CSProperties::CONDUCTINGSHEET);
+		for (size_t i=0; i<prims.size(); ++i)
 		{
-			std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
-				pos[0], pos[1], -1,
-				(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-			);
-
-			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+			SheetPrimitive& sp = sheetPrims[prims[i]];
+			sp.dim = prims[i]->GetDimension();
+			std::fill(sp.box, sp.box+6, 0.0);
+			if (sp.dim!=2)
+				continue;
+			prims[i]->GetBoundBox(sp.box);
+			if (prims[i]->GetDimension()!=sp.dim)
 			{
-				b_pos_on = false;
-				disable_pos = false;
-				// disable conducting sheet model inside the boundary conditions, especially inside a pml
-				for (int m=0;m<3;++m)
-					if ((pos[m]<=(unsigned int)m_Op->GetBCSize(2*m)) || (pos[m]>=(numLines[m]-m_Op->GetBCSize(2*m+1)-1)))
-						disable_pos = true;
+				// the serial loop would see another dimension at the next cell: keep it serial
+				start.resize(1);
+				stop.assign(1, numLines[0]-1);
+				break;
+			}
+		}
+	}
+	if (g_settings.GetVerboseLevel()>1)
+		cout << "Operator_Ext_ConductingSheet: building with " << start.size() << " threads" << endl;
 
-				for (int n=0; n<3; ++n)
+	std::vector<SheetSlab> slabs(start.size());
+	auto build_slab = [&](size_t s)
+	{
+		SheetSlab& slab = slabs[s];
+		std::ostream& err = (start.size()>1) ? static_cast<std::ostream&>(slab.err) : cerr;
+		unsigned int pos[] = {0,0,0};
+		double coord[3];
+		CSPrimitives* cs_sheet = NULL;
+		double box[6];
+		int nP, nPP;
+		bool b_pos_on;
+		bool disable_pos;
+		for (pos[0]=start[s]; pos[0]<=stop[s]; ++pos[0])
+		{
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			{
+				std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
+					pos[0], pos[1], -1,
+					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+				);
+
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 				{
-					nP = (n+1)%3;
-					nPP = (n+2)%3;
+					b_pos_on = false;
+					disable_pos = false;
+					// disable conducting sheet model inside the boundary conditions, especially inside a pml
+					for (int m=0;m<3;++m)
+						if ((pos[m]<=(unsigned int)m_Op->GetBCSize(2*m)) || (pos[m]>=(numLines[m]-m_Op->GetBCSize(2*m+1)-1)))
+							disable_pos = true;
 
-					tanDir(n, pos[0], pos[1], pos[2]) = -1; //deactivate by default
-					Conductivity(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
-					Thickness(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
-
-					if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
-						continue;
-
-					// Ez at r==0 not supported --> set to PEC
-					if (m_CC_R0_included && (n==2) && (pos[0]==0))
-						disable_pos = true;
-
-//					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
-					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
-					CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
-					if (cs_prop)
-					{
-						if (cs_sheet==NULL)
-							return false; //sanity check, this should never happen
-						if (cs_sheet->GetDimension()!=2)
-						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-						cs_sheet->SetPrimitiveUsed(true);
-
-						if (disable_pos)
-						{
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-
-						Conductivity(n, pos[0], pos[1], pos[2]) = cs_prop->GetConductivity();
-						Thickness(n, pos[0], pos[1], pos[2]) = cs_prop->GetThickness();
-
-						if ((Conductivity(n, pos[0], pos[1], pos[2])<=0) || (Thickness(n, pos[0], pos[1], pos[2])<=0))
-						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-
-						cs_sheet->GetBoundBox(box);
-						if (box[2*nP]!=box[2*nP+1])
-							tanDir(n, pos[0], pos[1], pos[2]) = nP;
-						if (box[2*nPP]!=box[2*nPP+1])
-							tanDir(n, pos[0], pos[1], pos[2]) = nPP;
-						b_pos_on = true;
-					}
-				}
-				if (b_pos_on)
-				{
 					for (int n=0; n<3; ++n)
-						v_pos[n].push_back(pos[n]);
+					{
+						nP = (n+1)%3;
+						nPP = (n+2)%3;
+
+						tanDir(n, pos[0], pos[1], pos[2]) = -1; //deactivate by default
+						Conductivity(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
+						Thickness(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
+
+						if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
+							continue;
+
+						// Ez at r==0 not supported --> set to PEC
+						if (m_CC_R0_included && (n==2) && (pos[0]==0))
+							disable_pos = true;
+
+//						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
+						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
+						CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
+						if (cs_prop)
+						{
+							if (cs_sheet==NULL)
+							{
+								slab.ok = false;
+								return; //sanity check, this should never happen
+							}
+							const SheetPrimitive* sp = NULL;
+							if (start.size()>1)
+							{
+								std::map<CSPrimitives*, SheetPrimitive>::const_iterator it = sheetPrims.find(cs_sheet);
+								if (it==sheetPrims.end())
+								{
+									slab.ok = false;
+									return; //sanity check, every sheet primitive is in the list
+								}
+								sp = &it->second;
+							}
+							int dim = sp ? sp->dim : cs_sheet->GetDimension();
+							if (dim!=2)
+							{
+								err << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << dim << " found, fallback to PEC!" << endl;
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++slab.pec[n];
+								continue;
+							}
+							if (slab.used.empty() || (slab.used.back()!=cs_sheet))
+								slab.used.push_back(cs_sheet); //SetPrimitiveUsed(true) after the join
+
+							if (disable_pos)
+							{
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++slab.pec[n];
+								continue;
+							}
+
+							Conductivity(n, pos[0], pos[1], pos[2]) = cs_prop->GetConductivity();
+							Thickness(n, pos[0], pos[1], pos[2]) = cs_prop->GetThickness();
+
+							if ((Conductivity(n, pos[0], pos[1], pos[2])<=0) || (Thickness(n, pos[0], pos[1], pos[2])<=0))
+							{
+								err << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++slab.pec[n];
+								continue;
+							}
+
+							if (sp)
+								std::copy(sp->box, sp->box+6, box);
+							else
+								cs_sheet->GetBoundBox(box);
+							if (box[2*nP]!=box[2*nP+1])
+								tanDir(n, pos[0], pos[1], pos[2]) = nP;
+							if (box[2*nPP]!=box[2*nPP+1])
+								tanDir(n, pos[0], pos[1], pos[2]) = nPP;
+							b_pos_on = true;
+						}
+					}
+					if (b_pos_on)
+					{
+						for (int n=0; n<3; ++n)
+							slab.v_pos[n].push_back(pos[n]);
+					}
 				}
 			}
 		}
+	};
+	if (start.size()>1)
+	{
+		std::vector<std::thread> threads;
+		for (size_t s=0; s<start.size(); ++s)
+			threads.push_back(std::thread(build_slab, s));
+		for (size_t s=0; s<threads.size(); ++s)
+			threads[s].join();
+	}
+	else
+		build_slab(0);
+
+	// merge in slab order; a failed slab ends the merge where the serial loop would have returned
+	for (size_t s=0; s<slabs.size(); ++s)
+	{
+		cerr << slabs[s].err.str();
+		for (int n=0; n<3; ++n)
+		{
+			m_Op->m_Nr_PEC[n] += slabs[s].pec[n];
+			v_pos[n].insert(v_pos[n].end(), slabs[s].v_pos[n].begin(), slabs[s].v_pos[n].end());
+		}
+		for (size_t i=0; i<slabs[s].used.size(); ++i)
+			slabs[s].used[i]->SetPrimitiveUsed(true);
+		if (!slabs[s].ok)
+			return false;
 	}
 
 	size_t numCS = v_pos[0].size();
