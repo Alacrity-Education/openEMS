@@ -90,6 +90,18 @@ there are unreleased changes. It becomes the next release entry.
   fused step keeps the unpadded layout. On an RTX 5090 a model of 3.06 Mcells
   (40 z lines, Mur and sheets) runs at 11572 MC/s instead of 10226 (+13 %),
   its two main kernels taking 172 us a step instead of 232.
+- `OPENEMS_HIP_COEFF=sets|full|factor` selects how the HIP backend stores the
+  update coefficients, as `OPENEMS_SYCL_COEFF` does for the SYCL backend:
+  deduplicated sets (the default, exact, falling back to full arrays), the
+  full arrays, or `factor`, a material factor per edge times the edge geometry
+  rebuilt in the kernel from 1-D tables (a double-float product rounded once;
+  nodes off by more than 2 ulp keep their exact coefficients, Cartesian meshes
+  only). The default kernels are unchanged instruction for instruction (the
+  coefficient form is a compile-time choice). With `factor` the 38 golden cases
+  stay within 7.5e-6 of the peak, the same deviations as the SYCL backend; a
+  model of 3.06 Mcells goes from 605968 exact sets (29 MB, 32 bit index) to
+  14327 normalized sets (0.69 MB, 16 bit index) with no exception node and
+  runs at 15601 MC/s instead of 13912 on an RTX 5090. Opt-in.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

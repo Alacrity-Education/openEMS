@@ -53,9 +53,6 @@ __device__ __forceinline__ I nijk(const HIP_GridDim& N, unsigned int n, unsigned
 	return (((I)n*N.nx + x)*N.ny + y)*N.nzd + z;
 }
 
-//! Main update coefficients of node i, see GPU_Backend_HIP::Impl::coeff_mode:
-//! a[n*s] and b[n*s] are vv/vi (voltages, set_offset 0) or ii/iv (currents, set_offset 6)
-//! of direction n. Mode 0: ca/cb are the full arrays, else ca is the table of sets.
 //! The raw values of a dump on the device, see Engine_GatherRegion: value e of component n is
 //! the edge (n, lines[n][0][a], lines[n][1][b], lines[n][2][c]) with e = start[n] + (a*size[n][1] + b)*size[n][2] + c
 struct HIP_GatherRegion
@@ -77,7 +74,14 @@ __device__ __forceinline__ size_t region_field_index(const HIP_GatherRegion& R, 
 	return nijk(N, n, R.lines[n][0][a], R.lines[n][1][b], R.lines[n][2][c]);
 }
 
-template<typename I> struct HIP_MainCoeffT { const float* a; const float* b; I s; };
+//! Main update coefficients of node i, see GPU_Backend_HIP::Impl::coeff_mode: a[n*s] and b[n*s] are vv/vi
+//! (voltages, set_offset 0) or ii/iv (currents, set_offset 6) of direction n. FACTOR false (modes 0-2):
+//! pointers, read where the kernel uses them; mode 0: into the full arrays ca/cb, 1/2: into the table of sets.
+//! FACTOR true (modes 3/4, OPENEMS_HIP_COEFF=factor): the values, reconstructed by main_coeff(), s is 1. A
+//! compile time choice, so that the kernels of the default modes contain no factor code: every kernel that
+//! reads main coefficients is built for both, the launches pick it by coeff_mode>=3 (GPU_Backend_HIP::Impl::Factor()).
+template<typename I, bool FACTOR = false> struct HIP_MainCoeffT { const float* a; const float* b; I s; };
+template<typename I> struct HIP_MainCoeffT<I, true> { float a[3]; float b[3]; static constexpr I s = 1; };
 typedef HIP_MainCoeffT<size_t> HIP_MainCoeff;
 
 template<typename I = size_t>
@@ -96,10 +100,101 @@ __device__ __forceinline__ HIP_MainCoeffT<I> main_coeff(const void* index, const
 	return c;
 }
 
+//! The value of a HIP_MainCoeffT that is not read (a node whose update is skipped)
+template<typename I, bool FACTOR>
+__device__ __forceinline__ HIP_MainCoeffT<I, FACTOR> main_coeff_unused(const float* ca, const float* cb)
+{
+	if constexpr (!FACTOR)
+		return HIP_MainCoeffT<I>{ca, cb, 0};
+	else
+	{
+		(void)ca; (void)cb;
+		return HIP_MainCoeffT<I, true>{};
+	}
+}
+
+//! Factorized coefficients (coeff_mode 3/4, OPENEMS_HIP_COEFF=factor): the buffer ca (= cb) holds
+//!   [0]                           the first exact set (uint32 bits), then padding up to HIP_FACTOR_HDR,
+//!   [HIP_FACTOR_HDR + 2*t*L + o]  four geometry tables t of L = nx+ny+nz values, o = x, nx+y, nx+ny+z (mesh
+//!                                 lines, not the padded layout), each as a high float and (at + L) the low
+//!                                 float of the double value: t=0 primal edge length, 1 inverse dual edge
+//!                                 length (voltages), t=2 dual edge length, 3 inverse primal edge length (currents),
+//!   [HIP_FactorSets(N)]           the sets of 12, normalized (set < exact_start) or exact.
+//! A normalized set holds vv, ii as they are and vi, iv divided by the geometry of the edge, len_n * inv_p *
+//! inv_q (p<q the other two directions). HIP_FactorMul() multiplies it back, with the same operations on the
+//! host (FactorizeCoefficients() checks every node) and on the device.
+#define HIP_FACTOR_HDR 4
+__host__ __device__ __forceinline__ size_t HIP_FactorSets(const HIP_GridDim& N)
+{
+	return HIP_FACTOR_HDR + 8*((size_t)N.nx+N.ny+N.nz);
+}
+
+//! r*(a*b*c) for the double values a, b, c given as high and low floats: the products in double-float
+//! (Dekker with fma), so that the result is r times the double geometry, rounded once or nearly (not the
+//! three roundings of a float product of the rounded factors, which reach 4 ulp). One statement per
+//! rounding, with explicit fma: the same on the host and the device (no contraction, --fmad=false)
+__host__ __device__ __forceinline__ float HIP_FactorMul(float r, float ah, float al, float bh, float bl, float ch, float cl)
+{
+	const float p  = ah*bh;
+	const float p1 = ah*bl;
+	const float p2 = al*bh;
+	const float pe = fmaf(ah, bh, -p) + (p1 + p2);
+	const float q  = p*ch;
+	const float q1 = p*cl;
+	const float q2 = pe*ch;
+	const float qe = fmaf(p, ch, -q) + (q1 + q2);
+	const float t  = r*q;
+	const float t1 = r*qe;
+	const float te = fmaf(r, q, -t) + t1;
+	return t + te;
+}
+
+//! main_coeff() of the form FACTOR for node i = (x, y, z) of the grid N: FACTOR false is main_coeff() above
+//! (N, x, y, z unused); FACTOR true: mode 3/4 the 16/32 bit set index, ca the factorized buffer (see HIP_FACTOR_HDR)
+template<typename I, bool FACTOR>
+__device__ __forceinline__ HIP_MainCoeffT<I, FACTOR> main_coeff(const void* index, const float* ca, const float* cb, unsigned int mode,
+                                                                typename HIP_NoDeduce<I>::type sn, typename HIP_NoDeduce<I>::type i,
+                                                                unsigned int set_offset, const HIP_GridDim& N,
+                                                                unsigned int x, unsigned int y, unsigned int z)
+{
+	if constexpr (!FACTOR)
+	{
+		(void)N; (void)x; (void)y; (void)z;
+		return main_coeff<I>(index, ca, cb, mode, sn, i, set_offset);
+	}
+	else
+	{
+		(void)cb; (void)sn;
+		HIP_MainCoeffT<I, true> c;
+		const unsigned int set = (mode&1) ? (unsigned int)((const unsigned short*)index)[i] : ((const unsigned int*)index)[i];
+		const float* T = ca + HIP_FactorSets(N) + (size_t)12*set + set_offset;
+		for (unsigned int n=0; n<3; ++n)
+		{
+			c.a[n] = T[n];
+			c.b[n] = T[3+n];
+		}
+		if (set < ((const unsigned int*)ca)[0])
+		{
+			const unsigned int L = N.nx+N.ny+N.nz;
+			const float* len = ca + HIP_FACTOR_HDR + (set_offset ? 4 : 0)*(size_t)L;   // high, low
+			const float* inv = len + 2*L;
+			const unsigned int ox = x, oy = N.nx+y, oz = N.nx+N.ny+z;
+			const float lxh = len[ox], lxl = len[L+ox], lyh = len[oy], lyl = len[L+oy], lzh = len[oz], lzl = len[L+oz];
+			const float wxh = inv[ox], wxl = inv[L+ox], wyh = inv[oy], wyl = inv[L+oy], wzh = inv[oz], wzl = inv[L+oz];
+			c.b[0] = HIP_FactorMul(c.b[0], lxh, lxl, wyh, wyl, wzh, wzl);
+			c.b[1] = HIP_FactorMul(c.b[1], lyh, lyl, wxh, wxl, wzh, wzl);
+			c.b[2] = HIP_FactorMul(c.b[2], lzh, lzl, wxh, wxl, wyh, wyl);
+		}
+		return c;
+	}
+}
+
 //! The main voltage update of component \a n of node \a i from its old value \a old: the statements of
 //! update_voltages, for the kernels of OPENEMS_HIP_MUR_FUSED (see GPU_Backend_HIP::Impl::mur_mode), which
 //! must reproduce its results bit for bit. xm, ym, zm: the shifts to the previous line (0 on the first).
-__device__ __forceinline__ float volt_update_node(unsigned int n, float old, const float* curr, const HIP_MainCoeff& C,
+//! FACTOR: the coefficient form (see HIP_MainCoeffT)
+template<bool FACTOR = false>
+__device__ __forceinline__ float volt_update_node(unsigned int n, float old, const float* curr, const HIP_MainCoeffT<size_t, FACTOR>& C,
                                                   size_t sn, size_t i, size_t xm, size_t ym, size_t zm)
 {
 	float v;
@@ -122,6 +217,7 @@ __device__ __forceinline__ float volt_update_node(unsigned int n, float old, con
 }
 
 //! volt_update_node() of the node (x, y, z)
+template<bool FACTOR = false>
 __device__ __forceinline__ float volt_update_at(unsigned int n, float old, const float* curr, const void* index, const float* ca,
                                                 const float* cb, unsigned int mode, const HIP_GridDim& N,
                                                 unsigned int x, unsigned int y, unsigned int z)
@@ -131,7 +227,7 @@ __device__ __forceinline__ float volt_update_at(unsigned int n, float old, const
 	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;
 	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
-	return volt_update_node(n, old, curr, main_coeff(index, ca, cb, mode, sn, i, 0), sn, i, xm, ym, zm);
+	return volt_update_node<FACTOR>(n, old, curr, main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z), sn, i, xm, ym, zm);
 }
 
 //! Mur planes of OPENEMS_HIP_MUR_FUSED=1 (mur_shell), face f = 2*ny + (line>0); the
@@ -260,8 +356,11 @@ struct GPU_Backend_HIP::Impl
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_HIP::CalcFastEnergy()
 	size_t energy_count;
 	std::vector<float2> energy_host;
-	//! Main update coefficients: 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index per node and the sets (see main_coeff())
+	//! Main update coefficients (OPENEMS_HIP_COEFF, see Init()): 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index
+	//! per node and the sets; 3/4: a 16/32 bit set index and the factorized sets and geometry tables in coeff (see main_coeff())
 	unsigned int coeff_mode;
+	//! the kernels of the factorized coefficients run (coeff_mode 3/4), see HIP_MainCoeffT
+	bool Factor() const {return coeff_mode>=3;}
 	float *vv, *vi, *ii, *iv;
 	void* index;
 	float* coeff;

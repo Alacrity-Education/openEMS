@@ -17,7 +17,9 @@
 
 #include "hip/hip_runtime.h"
 #include <algorithm>
+#include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,10 +30,12 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "hip_internal.h"
 #include "gpu_build_id.h"
 #include "FDTD/operator.h"
+#include "FDTD/operator_cylinder.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
@@ -48,6 +52,9 @@
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
 // y-threads, x along the grid z-dimension. The coefficients are read with main_coeff().
 // Nodes below Z.z_lo or from Z.z_hi on belong to UPML regions along z (see HIP_ZSlabs).
+// FACTOR: the factorized coefficients (coeff_mode 3/4), else modes 0-2 (see HIP_MainCoeffT); every kernel that
+// reads main coefficients is built for both, the launches pick it with Impl::Factor().
+template<bool FACTOR>
 __global__ void update_voltages(float* __restrict__ volt, const float* __restrict__ curr,
                                 const void* index, const float* ca, const float* cb, unsigned int mode,
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
@@ -77,12 +84,12 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 		return;
 	if (z<Z.z_lo)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
 		return;
 	}
 	if (z>=Z.z_hi)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
 	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
@@ -90,7 +97,7 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
 	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
-	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	const HIP_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	const float* vv = C.a;
 	const float* vi = C.b;
 	const size_t s = C.s;
@@ -131,10 +138,10 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 // So for each component c a thread on no line of an active a- or b-plane writes its own main update, on the
 // shift line of an a-plane the Mur value of the a-line cell next to it, the same for b, and on both shift lines
 // the edge E. The normal component of a line cell is the main update of its own thread.
-template<unsigned int c>
+template<unsigned int c, bool FACTOR>
 __device__ __forceinline__ void mur_volt_component(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
                                                    unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
-                                                   unsigned int x, unsigned int y, unsigned int z, const HIP_MainCoeff& C,
+                                                   unsigned int x, unsigned int y, unsigned int z, const HIP_MainCoeffT<size_t, FACTOR>& C,
                                                    size_t sn, size_t i, size_t xm, size_t ym, size_t zm)
 {
 	const unsigned int a = (c+1)%3;
@@ -152,7 +159,7 @@ __device__ __forceinline__ void mur_volt_component(float* volt, const float* cur
 	const bool sb0 = b0 && (p[b]==F[2*b].shift);
 	const bool sb = sb0 || (b1 && (p[b]==F[2*b+1].shift));
 	const float old = volt[c*sn+i];
-	const float nv = volt_update_node(c, old, curr, C, sn, i, xm, ym, zm);
+	const float nv = volt_update_node<FACTOR>(c, old, curr, C, sn, i, xm, ym, zm);
 	if (!sa && !sb)
 	{
 		volt[c*sn+i] = nv;
@@ -181,7 +188,7 @@ __device__ __forceinline__ void mur_volt_component(float* volt, const float* cur
 		{
 			// the a-plane is applied last: its shift cell of E is Lb (q = Lb)
 			const float k = A.c_nyPP[(size_t)lb*n[c] + p[c]];
-			const float new_b = volt_update_at(c, old_b, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			const float new_b = volt_update_at<FACTOR>(c, old_b, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
 			v_e = old_b - k * old_e;
 			v_e = v_e + k * new_b;
 		}
@@ -191,7 +198,7 @@ __device__ __forceinline__ void mur_volt_component(float* volt, const float* cur
 			q[a] = la;
 			q[b] = p[b];
 			const float k = B.c_nyP[(size_t)p[c]*n[a] + la];
-			const float new_a = volt_update_at(c, old_a, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			const float new_a = volt_update_at<FACTOR>(c, old_a, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
 			v_e = old_a - k * old_e;
 			v_e = v_e + k * new_a;
 		}
@@ -216,6 +223,7 @@ __device__ __forceinline__ void mur_volt_component(float* volt, const float* cur
 }
 
 // all components of node (x, y, z) on the line or the shift line of a Mur plane
+template<bool FACTOR>
 __device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
                                               unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
                                               unsigned int x, unsigned int y, unsigned int z)
@@ -225,10 +233,10 @@ __device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, co
 	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;
 	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
-	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
-	mur_volt_component<0>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
-	mur_volt_component<1>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
-	mur_volt_component<2>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	const HIP_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
+	mur_volt_component<0, FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<1, FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<2, FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
 }
 
 // OPENEMS_HIP_MUR_FUSED=2: the Mur value of the tangential components x and y of a node L on the line of an active
@@ -281,8 +289,8 @@ __device__ __forceinline__ void mur_zface_lane(const HIP_MurZFaces& M, unsigned 
 // The main update of the nodes inside the box [S.L, S.H), the statements of update_voltages: in one kernel with
 // the Mur nodes (all the same, see mur_shell) the registers of the Mur path halve the occupancy of every block,
 // and the warps on the outer z lines of every line run both paths. ZF (OPENEMS_HIP_MUR_FUSED=2): the box covers
-// the z faces too, whose interior gets its Mur values from mur_zface_lane().
-template<bool ZF>
+// the z faces too, whose interior gets its Mur values from mur_zface_lane(). FACTOR: see update_voltages.
+template<bool ZF, bool FACTOR>
 __global__ void update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
                                       const void* index, const float* ca, const float* cb, unsigned int mode,
                                       HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S,
@@ -312,12 +320,12 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
 		return;
 	if (z<Z.z_lo)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
 		return;
 	}
 	if (z>=Z.z_hi)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
 	if ((x<S.L.nx) || (x>=S.H.nx) || (y<S.L.ny) || (y>=S.H.ny) || (z<S.L.nz) || (z>=S.H.nz))
@@ -327,19 +335,19 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
 	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
 	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
-	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	const HIP_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	if (!ZF)
 	{
-		volt[i]      = volt_update_node(0, volt[i], curr, C, sn, i, xm, ym, zm);
-		volt[sn+i]   = volt_update_node(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
-		volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+		volt[i]      = volt_update_node<FACTOR>(0, volt[i], curr, C, sn, i, xm, ym, zm);
+		volt[sn+i]   = volt_update_node<FACTOR>(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
+		volt[2*sn+i] = volt_update_node<FACTOR>(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
 		return;
 	}
 	const float o_x = volt[i];
 	const float o_y = volt[sn+i];
-	float v_x = volt_update_node(0, o_x, curr, C, sn, i, xm, ym, zm);
-	float v_y = volt_update_node(1, o_y, curr, C, sn, i, xm, ym, zm);
-	volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+	float v_x = volt_update_node<FACTOR>(0, o_x, curr, C, sn, i, xm, ym, zm);
+	float v_y = volt_update_node<FACTOR>(1, o_y, curr, C, sn, i, xm, ym, zm);
+	volt[2*sn+i] = volt_update_node<FACTOR>(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
 	mur_zface_lane(M, z, (size_t)x*N.ny + y, o_x, o_y, v_x, v_y);
 	volt[i]    = v_x;
 	volt[sn+i] = v_y;
@@ -355,7 +363,8 @@ __device__ __forceinline__ unsigned int mur_shell_line(unsigned int j, unsigned 
 // one thread per node, as the slabs of the x faces (all y, z), of the y faces (x inside) and of the z faces
 // (x and y inside; with OPENEMS_HIP_MUR_FUSED=2 S spans all z lines, so there are none: update_voltages_inner<true>
 // has them).
-// Launched right after update_voltages_inner, on nodes disjoint from its own.
+// Launched right after update_voltages_inner, on nodes disjoint from its own. FACTOR: see update_voltages.
+template<bool FACTOR>
 __global__ void mur_shell(float* volt, const float* curr, const void* index, const float* ca, const float* cb, unsigned int mode,
                           HIP_GridDim N, HIP_MurShell S, const HIP_MurFace* F, unsigned int active)
 {
@@ -388,10 +397,11 @@ __global__ void mur_shell(float* volt, const float* curr, const void* index, con
 	}
 	else
 		return;
-	mur_volt_node(volt, curr, index, ca, cb, mode, N, F, active, x, y, z);
+	mur_volt_node<FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z);
 }
 
-// the currents on the last mesh line of each direction are not updated
+// the currents on the last mesh line of each direction are not updated; FACTOR: see update_voltages
+template<bool FACTOR>
 __global__ void update_currents(float* __restrict__ curr, const float* __restrict__ volt,
                                 const void* index, const float* ca, const float* cb, unsigned int mode,
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
@@ -421,12 +431,12 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 		return;
 	if (z<Z.z_lo)
 	{
-		upml_fused_curr_node(curr, curr, volt, Z.curr_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		upml_fused_curr_node<FACTOR>(curr, curr, volt, Z.curr_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
 		return;
 	}
 	if (z>=Z.z_hi)
 	{
-		upml_fused_curr_node(curr, curr, volt, Z.curr_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		upml_fused_curr_node<FACTOR>(curr, curr, volt, Z.curr_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
 	if (z+1>=N.nz || y+1>=N.ny || x+1>=N.nx)
@@ -435,7 +445,7 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 	const size_t i  = nijk(N, 0, x, y, z);
 	const size_t xp = (size_t)N.ny*N.nzd;
 	const size_t yp = N.nzd;
-	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 6);
+	const HIP_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 6, N, x, y, z);
 	const float* ii = C.a;
 	const float* iv = C.b;
 	const size_t s = C.s;
@@ -460,7 +470,7 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 // ---- fused step
 
 // the voltages of node (x,y,z), the same operations as update_voltages
-template<typename I>
+template<typename I, bool FACTOR>
 __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const float* __restrict__ curr,
                                            const void* index, const float* va, const float* vb, unsigned int mode,
                                            const HIP_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
@@ -470,7 +480,7 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
 	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
-	const HIP_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0);
+	const HIP_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, va, vb, mode, sn, i, 0, N, x, y, z);
 	float t;
 	t  = volt[i] * C.a[0];
 	t += C.b[0] * (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
@@ -505,7 +515,8 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 // With the UPML regions in the kernel (F.count>0, [B, E) is the whole grid), the region nodes
 // are computed like the main nodes, from the current flux (the new voltage flux goes to a
 // second buffer, written by the node's own block; the current flux in place).
-template<typename I, unsigned int TZ, unsigned int TY>
+// FACTOR: see update_voltages.
+template<typename I, unsigned int TZ, unsigned int TY, bool FACTOR>
 __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
@@ -529,9 +540,9 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 		{
 			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
-				fused_volt<I>(volt_in, curr_in, index, va, vb, mode, N, x, y, z, v);
+				fused_volt<I, FACTOR>(volt_in, curr_in, index, va, vb, mode, N, x, y, z, v);
 			else
-				upml_volt_value<I>(volt_in, curr_in, F.volt[r], N, F.R[r], x, y, z, owner && (x<xe), v);
+				upml_volt_value<I, FACTOR>(volt_in, curr_in, F.volt[r], N, F.R[r], x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
@@ -568,11 +579,11 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 			}
 			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r>=0)
-				upml_curr_value<I>(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, update, curl);
+				upml_curr_value<I, FACTOR>(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, update, curl);
 			else if (update)
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
-				const HIP_MainCoeffT<I> C = main_coeff<I>(index, ia, ib, mode, sn, i, 6);
+				const HIP_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ia, ib, mode, sn, i, 6, N, x, y, z);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -612,34 +623,38 @@ struct HIP_FusedArgs
 	unsigned int xc;
 };
 
-template<typename I, unsigned int TZ, unsigned int TY>
+template<typename I, unsigned int TZ, unsigned int TY, bool FACTOR>
 static void launch_fused(hipStream_t stream, const HIP_FusedArgs& a)
 {
 	const dim3 block(TZ, TY, 1);
 	const dim3 grid((a.E.nz-a.B.nz+TZ-2)/(TZ-1), (a.E.ny-a.B.ny+TY-2)/(TY-1), (a.E.nx-a.B.nx+a.xc-1)/a.xc);
-	update_fused<I, TZ, TY><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
+	update_fused<I, TZ, TY, FACTOR><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
 	                                                 a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.xc);
 }
 
-template<typename I, unsigned int TZ>
+template<typename I, unsigned int TZ, bool FACTOR>
 static void launch_fused_ty(hipStream_t stream, const HIP_FusedArgs& a, unsigned int ty)
 {
 	switch (ty)
 	{
-		case 4:  launch_fused<I, TZ, 4>(stream, a); break;
-		case 16: launch_fused<I, TZ, 16>(stream, a); break;
-		default: launch_fused<I, TZ, 8>(stream, a); break;
+		case 4:  launch_fused<I, TZ, 4, FACTOR>(stream, a); break;
+		case 16: launch_fused<I, TZ, 16, FACTOR>(stream, a); break;
+		default: launch_fused<I, TZ, 8, FACTOR>(stream, a); break;
 	}
 }
 
-// the index type of the fused step, see GPU_Backend_HIP::Impl::index32
+// the index type of the fused step, see GPU_Backend_HIP::Impl::index32, and the coefficient form (factor: coeff_mode 3/4)
 template<unsigned int TZ>
-static void launch_fused_tz(hipStream_t stream, const HIP_FusedArgs& a, unsigned int ty, bool index32)
+static void launch_fused_tz(hipStream_t stream, const HIP_FusedArgs& a, unsigned int ty, bool index32, bool factor)
 {
-	if (index32)
-		launch_fused_ty<unsigned int, TZ>(stream, a, ty);
+	if (index32 && factor)
+		launch_fused_ty<unsigned int, TZ, true>(stream, a, ty);
+	else if (index32)
+		launch_fused_ty<unsigned int, TZ, false>(stream, a, ty);
+	else if (factor)
+		launch_fused_ty<size_t, TZ, true>(stream, a, ty);
 	else
-		launch_fused_ty<size_t, TZ>(stream, a, ty);
+		launch_fused_ty<size_t, TZ, false>(stream, a, ty);
 }
 
 // the raw values of a dump region (see HIP_GatherRegion) for a snapshot: only these go over
@@ -673,7 +688,8 @@ __global__ void field_dft(const float* __restrict__ f, HIP_GatherRegion R, HIP_G
 }
 
 // the currents of the given main nodes again (update_currents), after the voltage extensions
-// changed voltages they read (see GPU_Backend_HIP::Impl::fixup)
+// changed voltages they read (see GPU_Backend_HIP::Impl::fixup); FACTOR: see update_voltages
+template<bool FACTOR>
 __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* __restrict__ curr_out, const float* __restrict__ volt,
                                       const size_t* nodes, unsigned int count,
                                       const void* index, const float* ia, const float* ib, unsigned int mode, HIP_GridDim N)
@@ -685,7 +701,14 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 	const size_t i  = nodes[k];
 	const size_t xp = (size_t)N.ny*N.nzd;
 	const size_t yp = N.nzd;
-	const HIP_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
+	unsigned int x = 0, y = 0, z = 0;
+	if constexpr (FACTOR)
+	{
+		x = (unsigned int)(i/xp);   // i is a node of the device layout (stride nzd)
+		y = (unsigned int)((i/yp)%N.ny);
+		z = (unsigned int)(i%yp);
+	}
+	const HIP_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ia, ib, mode, sn, i, 6, N, x, y, z);
 	float c;
 	c  = curr_in[i] * C.a[0];
 	c += C.b[0] * (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
@@ -1313,11 +1336,12 @@ void GPU_Backend_HIP::Impl::DecideShape()
 			{
 				const dim3 block(candidates[k][0], candidates[k][1], 1);
 				const dim3 grid = Grid(block, nt, nj, nk);
+				const bool f = Factor();
 				for (unsigned int p=0; p<n; ++p)
 				{
-					update_voltages<<<grid, block, 0, Stream()>>>(v, (const float*)i, (const void*)index, (const float*)(c ? coeff : vv),
+					(f ? update_voltages<true> : update_voltages<false>)<<<grid, block, 0, Stream()>>>(v, (const float*)i, (const void*)index, (const float*)(c ? coeff : vv),
 					                                               (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, Z);
-					update_currents<<<grid, block, 0, Stream()>>>(i, (const float*)v, (const void*)index, (const float*)(c ? coeff : ii),
+					(f ? update_currents<true> : update_currents<false>)<<<grid, block, 0, Stream()>>>(i, (const float*)v, (const void*)index, (const float*)(c ? coeff : ii),
 					                                               (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, Z);
 				}
 				CheckLaunch("shape tuning");
@@ -1569,6 +1593,323 @@ std::string GPU_Backend_HIP::GetName() const
 	return "HIP (" + d->ctx->name + ")";
 }
 
+namespace
+{
+//! Result of FactorizeCoefficients()
+struct HIP_FactorResult
+{
+	std::vector<float> buffer;    //!< the device buffer, see HIP_FACTOR_HDR
+	GPU_CoeffSets index;          //!< the set index per node (mode 1/2: 16/32 bit), table empty
+	size_t normalized, exact;     //!< number of normalized and of exact sets
+	size_t exceptions;            //!< nodes with an exact set
+	size_t exact_nodes;           //!< nodes with a normalized set that reproduces all coefficients bit for bit
+};
+
+//! distance in units in the last place of two finite floats of the same sign (else large)
+inline uint32_t UlpDistance(float a, float b)
+{
+	if (a==b)
+		return 0;
+	uint32_t ua, ub;
+	std::memcpy(&ua, &a, 4);
+	std::memcpy(&ub, &b, 4);
+	if ((ua ^ ub) & 0x80000000u)
+		return UINT32_MAX;
+	return (ua>ub) ? ua-ub : ub-ua;
+}
+}
+
+// Factorized coefficients (OPENEMS_HIP_COEFF=factor, Cartesian meshes): on a graded mesh the
+// exact sets of a node's 12 coefficients are nearly as many as the nodes, since vi and iv carry
+// the mesh spacing: vi(n) = M_v(material) * len_n / (dual_p * dual_q) (Operator::Calc_ECPos,
+// Calc_ECOperatorPos), iv(n) the same with primal and dual swapped, while vv and ii depend on the
+// material only. So the sets hold vv, ii and vi, iv divided by that geometry (in double), and the
+// kernels multiply it back from 1-D tables (main_coeff(), HIP_FactorMul()). The normalized values
+// of one material differ only by the rounding of the stored floats: they are grouped by their value
+// rounded to 20 mantissa bits (relative 1e-6) and replaced by the middle of the group, plus values
+// that reproduce sampled members exactly. Every node is checked by reconstructing its coefficients
+// as the kernel does; a node with a coefficient more than max_ulp (OPENEMS_HIP_COEFF_ULP, default 2)
+// units in the last place off keeps its exact 12 floats as an exact set (appended to the table, not
+// multiplied). Returns false if the sets do not pay (as GPU_FindSets). The same procedure as the SYCL
+// backend's (FDTD/sycl/gpu_backend_sycl.cpp); the set index is per node of the host layout (numLines).
+static bool FactorizeCoefficients(const Operator* op, const unsigned int numLines[3], uint32_t max_ulp, HIP_FactorResult& R)
+{
+	const size_t L = (size_t)numLines[0]+numLines[1]+numLines[2];
+	const size_t nodes = (size_t)numLines[0]*numLines[1]*numLines[2];
+	// the geometry tables in double, and as the kernel reads them (high and low floats)
+	std::vector<double> geo_d(4*L, 0.0);
+	std::vector<float> geo(8*L, 0.0f);
+	const size_t off[3] = {0, numLines[0], (size_t)numLines[0]+numLines[1]};
+	for (int a=0; a<3; ++a)
+		for (unsigned int p=0; p<numLines[a]; ++p)
+		{
+			unsigned int pos[3] = {0, 0, 0};
+			pos[a] = p;
+			const double primal = op->GetEdgeLength(a, pos, false);
+			const double dual = op->GetEdgeLength(a, pos, true);
+			const double v[4] = {primal, dual ? 1.0/dual : 0.0, dual, primal ? 1.0/primal : 0.0};
+			for (int t=0; t<4; ++t)
+			{
+				const float hi = (float)v[t];
+				geo_d[t*L + off[a] + p] = v[t];
+				geo[2*t*L + off[a] + p] = hi;
+				geo[(2*t+1)*L + off[a] + p] = (float)(v[t] - (double)hi);
+			}
+		}
+	// the geometry of the edge: f = the high and low floats of length, inverse p, inverse q; g in double
+	struct Geometry
+	{
+		float f[6];
+		double g;
+		bool operator==(const Geometry& o) const {return std::equal(f, f+6, o.f);}
+	};
+	// of component c (0: vi, 1: iv) of direction n at xyz
+	auto geometry = [&](int c, int n, const unsigned int xyz[3], Geometry& G)
+	{
+		const int ax[3] = {n, (n==0) ? 1 : 0, (n==2) ? 1 : 2};
+		G.g = 1.0;
+		for (int k=0; k<3; ++k)
+		{
+			const int t = 2*c + (k ? 1 : 0);
+			const size_t o = off[ax[k]] + xyz[ax[k]];
+			G.f[2*k] = geo[2*t*L + o];
+			G.f[2*k+1] = geo[(2*t+1)*L + o];
+			G.g *= geo_d[t*L + o];
+		}
+	};
+	// the operations of main_coeff()
+	auto reconstruct = [](float r, const Geometry& G) -> float
+	{
+		return HIP_FactorMul(r, G.f[0], G.f[1], G.f[2], G.f[3], G.f[4], G.f[5]);
+	};
+	auto key_of = [](double v) -> uint64_t
+	{
+		uint64_t u;
+		std::memcpy(&u, &v, 8);
+		return (u + (1ull<<31)) & ~((1ull<<32)-1);   // 20 of the 52 mantissa bits, rounded
+	};
+	// the coefficients of a node, the geometry and normalized values of vi, iv (index 3*c+n; NaN:
+	// cannot be normalized)
+	struct Node
+	{
+		float raw[12];
+		Geometry G[6];
+		double norm[6];
+	};
+	auto load = [&](size_t i, Node& N)
+	{
+		GPU_NodeCoefficients(op, numLines, i, N.raw);
+		const unsigned int xyz[3] = {(unsigned int)(i/((size_t)numLines[1]*numLines[2])),
+		                             (unsigned int)((i/numLines[2]) % numLines[1]), (unsigned int)(i % numLines[2])};
+		for (int k=0; k<6; ++k)
+		{
+			geometry(k/3, k%3, xyz, N.G[k]);
+			const float b = N.raw[(k<3 ? 3 : 9) + k%3];
+			const double g = N.G[k].g;
+			N.norm[k] = (b==0) ? 0.0 : ((g>0 && std::isfinite(g)) ? (double)b/g : std::numeric_limits<double>::quiet_NaN());
+		}
+	};
+
+	// pass 1: the groups of normalized values: their range, and their distinct members (the
+	// stored coefficient and its geometry) with their counts, up to MAX_MEMBERS per group and
+	// MAX_TRACKED in all (host memory)
+	const unsigned int MAX_MEMBERS = 256, MAX_EXTRA = 32;
+	const size_t MAX_TRACKED = 4000000;
+	struct MemberKey
+	{
+		uint64_t key;
+		uint32_t b;
+		uint32_t f[6];
+		bool operator==(const MemberKey& o) const {return (key==o.key) && (b==o.b) && std::equal(f, f+6, o.f);}
+	};
+	struct MemberHash
+	{
+		size_t operator()(const MemberKey& m) const
+		{
+			uint64_t h = (1469598103934665603ULL ^ m.key) * 1099511628211ULL;   // FNV-1a
+			h = (h ^ m.b) * 1099511628211ULL;
+			for (int k=0; k<6; ++k)
+				h = (h ^ m.f[k]) * 1099511628211ULL;
+			return h;
+		}
+	};
+	struct MemberInfo { size_t count; double v; };
+	struct Group { double lo, hi; unsigned int n; };
+	std::unordered_map<uint64_t, Group> groups;
+	std::unordered_map<MemberKey, MemberInfo, MemberHash> members;
+	{
+		Node N;
+		for (size_t i=0; i<nodes; ++i)
+		{
+			load(i, N);
+			for (int k=0; k<6; ++k)
+			{
+				const double v = N.norm[k];
+				if (std::isnan(v) || (v==0))
+					continue;
+				const float b = N.raw[(k<3 ? 3 : 9) + k%3];
+				MemberKey mk;
+				mk.key = key_of(v);
+				std::memcpy(&mk.b, &b, 4);
+				std::memcpy(mk.f, N.G[k].f, sizeof(mk.f));
+				auto gi = groups.find(mk.key);
+				if (gi==groups.end())
+					gi = groups.emplace(mk.key, Group{v, v, 0}).first;
+				Group& g = gi->second;
+				g.lo = std::min(g.lo, v);
+				g.hi = std::max(g.hi, v);
+				auto mi = members.find(mk);
+				if (mi!=members.end())
+					mi->second.count++;
+				else if ((g.n<MAX_MEMBERS) && (members.size()<MAX_TRACKED))
+				{
+					members.emplace(mk, MemberInfo{1, v});
+					g.n++;
+				}
+			}
+		}
+	}
+	// the members of each group, the most frequent first
+	std::unordered_map<uint64_t, std::vector<std::pair<size_t, const MemberKey*>>> by_group;
+	for (const auto& m : members)
+		by_group[m.first.key].push_back(std::make_pair(m.second.count, &m.first));
+	// the normalized values of a group: first the middle of its range, then, for the most frequent
+	// members it does not reproduce exactly, values that do (within 2 ulp of the member's own
+	// value; at most MAX_EXTRA), so that a mesh with few distinct spacings is reproduced bit for bit
+	std::unordered_map<uint64_t, std::vector<float>> rep;
+	rep.reserve(groups.size());
+	for (const auto& kv : groups)
+	{
+		const Group& g = kv.second;
+		std::vector<float>& reps = rep[kv.first];
+		reps.push_back((float)(0.5*(g.lo + g.hi)));
+		auto bg = by_group.find(kv.first);
+		if (bg==by_group.end())
+			continue;
+		std::vector<std::pair<size_t, const MemberKey*>>& list = bg->second;
+		std::sort(list.begin(), list.end(), [](const std::pair<size_t, const MemberKey*>& x, const std::pair<size_t, const MemberKey*>& y)
+		          {return x.first>y.first;});
+		for (const auto& e : list)
+		{
+			if (reps.size()>MAX_EXTRA)
+				break;
+			const MemberKey& m = *e.second;
+			Geometry G;
+			std::memcpy(G.f, m.f, sizeof(G.f));
+			float b;
+			std::memcpy(&b, &m.b, 4);
+			bool hit = false;
+			for (float r : reps)
+				hit = hit || (reconstruct(r, G)==b);
+			if (hit)
+				continue;
+			float c = (float)members[m].v;
+			c = std::nextafter(std::nextafter(c, -INFINITY), -INFINITY);
+			for (int t=0; t<5; ++t, c = std::nextafter(c, INFINITY))
+				if (reconstruct(c, G)==b)
+				{
+					reps.push_back(c);
+					break;
+				}
+		}
+	}
+	by_group.clear();
+	members.clear();
+	groups.clear();
+
+	// pass 2: the normalized sets; nodes that do not reconstruct get a placeholder set (all NaN)
+	std::vector<size_t> exc;
+	size_t exact_nodes = 0;   // nodes whose coefficients are all reproduced bit for bit
+	Node N;
+	const bool ok = GPU_FindSets(nodes, 12, [&](size_t i, float* values)
+	{
+		load(i, N);
+		bool good = true, exact = true;
+		for (int k=0; k<6 && good; ++k)
+		{
+			const int c = (k<3 ? 3 : 9) + k%3;
+			const float b = N.raw[c];
+			if (std::isnan(N.norm[k]))
+			{
+				good = false;
+				break;
+			}
+			// the normalized value of the group that reconstructs b exactly, else the nearest
+			float r = 0.0f;
+			uint32_t dist = 0;
+			if (N.norm[k]!=0)
+			{
+				dist = UINT32_MAX;
+				for (float cand : rep[key_of(N.norm[k])])
+				{
+					const uint32_t d = UlpDistance(reconstruct(cand, N.G[k]), b);
+					if (d<dist)
+					{
+						dist = d;
+						r = cand;
+					}
+					if (d==0)
+						break;
+				}
+			}
+			good = dist<=max_ulp;
+			exact = exact && (dist==0);
+			values[c] = r;
+		}
+		if (!good)
+		{
+			exc.push_back(i);
+			std::fill(values, values+12, std::numeric_limits<float>::quiet_NaN());
+			return;
+		}
+		exact_nodes += exact;
+		for (int n=0; n<3; ++n)
+		{
+			values[n] = N.raw[n];
+			values[6+n] = N.raw[6+n];
+		}
+	}, R.index);
+	if (!ok)
+		return false;
+	R.normalized = R.index.count;
+	R.exceptions = exc.size();
+	R.exact_nodes = exact_nodes;
+	std::vector<float> table;
+	table.swap(R.index.table);
+
+	// the exact sets of the exceptions, deduplicated (else one per node)
+	GPU_CoeffSets ex;
+	if (!exc.empty() && !GPU_FindSets(exc.size(), 12, [&](size_t k, float* values) {GPU_NodeCoefficients(op, numLines, exc[k], values);}, ex))
+	{
+		ex.count = exc.size();
+		ex.index.resize(exc.size());
+		ex.table.resize(12*exc.size());
+		for (size_t k=0; k<exc.size(); ++k)
+		{
+			ex.index[k] = k;
+			GPU_NodeCoefficients(op, numLines, exc[k], &ex.table[12*k]);
+		}
+	}
+	R.exact = exc.empty() ? 0 : ex.count;
+	for (size_t k=0; k<exc.size(); ++k)
+		R.index.index[exc[k]] = (uint32_t)(R.normalized + ex.index[k]);
+	const size_t total = R.normalized + R.exact;
+	if (total > std::numeric_limits<uint32_t>::max())
+		return false;
+	R.index.count = total;
+	R.index.mode = (total <= (size_t)std::numeric_limits<uint16_t>::max()+1) ? 1 : 2;
+
+	// the buffer: header, geometry, normalized sets, exact sets
+	R.buffer.assign(HIP_FACTOR_HDR, 0.0f);
+	const uint32_t exact_start = (uint32_t)R.normalized;
+	std::memcpy(&R.buffer[0], &exact_start, 4);
+	R.buffer.insert(R.buffer.end(), geo.begin(), geo.end());
+	R.buffer.insert(R.buffer.end(), table.begin(), table.end());
+	if (R.exact)
+		R.buffer.insert(R.buffer.end(), ex.table.begin(), ex.table.end());
+	return true;
+}
+
 bool GPU_Backend_HIP::Init(const Operator* op)
 {
 	unsigned int numLines[3];
@@ -1698,10 +2039,56 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 		d->step_base = d->Alloc<int>(1);
 
 	// upload the final operator coefficients, including all changes by operator extensions.
-	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
-	// every distinct set of the 12 coefficients of a node once and a set index per node
+	// OPENEMS_HIP_COEFF selects the storage (read once here, logged at verbose level 2):
+	//   sets (default): every distinct set of the 12 coefficients of a node once and a 16/32 bit set index per
+	//     node (most nodes share one of a few sets: same material and mesh spacing), the full arrays if the
+	//     sets do not pay (a graded mesh with many distinct spacings);
+	//   factor: sets of the coefficients divided by the mesh geometry, which the kernels multiply back from 1-D
+	//     tables (see FactorizeCoefficients(), main_coeff()): few sets on graded meshes too. Cartesian meshes only
+	//     (else sets); the reconstruction may differ from the stored coefficients by up to OPENEMS_HIP_COEFF_ULP
+	//     (default 2) units in the last place, nodes further off keep their exact coefficients;
+	//   full: the full arrays (48 bytes per node).
+	const char* coeff_env = getenv("OPENEMS_HIP_COEFF");
+	const std::string coeff_req = coeff_env ? coeff_env : "sets";
+	if (coeff_req=="factor")
+	{
+		if (dynamic_cast<const Operator_Cylinder*>(op))
+		{
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_HIP: coefficients: factor unavailable (needs a Cartesian mesh), using sets" << std::endl;
+		}
+		else
+		{
+			const uint32_t max_ulp = getenv("OPENEMS_HIP_COEFF_ULP") ? (uint32_t)std::max(0, atoi(getenv("OPENEMS_HIP_COEFF_ULP"))) : 2;
+			HIP_FactorResult F;
+			const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+			if (FactorizeCoefficients(op, numLines, max_ulp, F))
+			{
+				d->coeff_mode = 2 + F.index.mode;
+				d->index = d->AllocIndex(F.index, d->dim.nzd!=d->dim.nz);   // per node of the device layout
+				d->coeff = d->Alloc<float>(F.buffer.size(), F.buffer.data(), HIP_AllocCoeff, "coeff");
+				if (g_settings.GetVerboseLevel()>1)
+				{
+					const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+					const size_t geo_bytes = 32*((size_t)numLines[0]+numLines[1]+numLines[2]);
+					std::ostringstream kb;
+					kb << std::fixed << std::setprecision(1) << 48.0*(F.normalized + F.exact)/1000.0;
+					std::cout << "GPU_Backend_HIP: coefficients: factor, " << F.normalized << " normalized sets (" << kb.str() << " kB, "
+					          << (F.index.mode==1 ? 16 : 32) << " bit index), " << F.exceptions << " exception nodes, geometry tables "
+					          << geo_bytes << " bytes (" << F.exact << " exact sets, max " << max_ulp << " ulp, " << F.exact_nodes
+					          << " of " << d->numCells << " nodes reproduced bit for bit, buffer " << F.buffer.size()*sizeof(float)
+					          << " bytes, " << std::setprecision(3) << sec << " s)" << std::endl;
+				}
+				return true;
+			}
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_HIP: coefficients: factor does not pay, using sets" << std::endl;
+		}
+	}
+	else if ((coeff_req!="sets") && (coeff_req!="full"))
+		std::cerr << "GPU_Backend_HIP: unknown OPENEMS_HIP_COEFF=" << coeff_req << " (sets, factor or full), using sets" << std::endl;
 	GPU_CoeffSets sets;
-	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
+	if ((coeff_req!="full") && GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets, d->dim.nzd!=d->dim.nz);   // per node of the device layout
@@ -1714,6 +2101,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
+	if ((coeff_req=="full") && (g_settings.GetVerboseLevel()>1))
+		std::cout << "GPU_Backend_HIP: coefficients: full arrays (OPENEMS_HIP_COEFF=full)" << std::endl;
 	std::vector<float> values;
 	auto upload = [&](int c, const char* name)
 	{
@@ -1760,10 +2149,10 @@ void GPU_Backend_HIP::UpdateVoltages()
 		// only AMD has wavefronts of 64; compiling them for NVIDIA would be dead code
 		static const unsigned int tz = getenv("OPENEMS_HIP_FUSED_TZ") ? atoi(getenv("OPENEMS_HIP_FUSED_TZ")) : 0;
 		if (tz ? (tz>=64) : (d->ctx->warp_size>=64))
-			launch_fused_tz<64>(d->Stream(), a, ty, d->index32);
+			launch_fused_tz<64>(d->Stream(), a, ty, d->index32, d->Factor());
 		else
 #endif
-			launch_fused_tz<32>(d->Stream(), a, ty, d->index32);
+			launch_fused_tz<32>(d->Stream(), a, ty, d->index32, d->Factor());
 		d->CheckLaunch("update_fused");
 		if (timed)
 			HIP_KernelTimes::End(d->Stream(), "update_fused");
@@ -1774,6 +2163,7 @@ void GPU_Backend_HIP::UpdateVoltages()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
+	const bool f = d->Factor();
 	if ((d->mur_mode==1) && d->mur.active)
 	{
 		// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component); mode 2: the interior
@@ -1786,18 +2176,18 @@ void GPU_Backend_HIP::UpdateVoltages()
 			S.H.nz = d->main_stop.nz;
 			HIP_MurZFaces M = d->mur_zf;
 			M.active = (d->mur.active>>4) & 3u;
-			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			HIP_LaunchMain(d, "update_voltages_inner", f ? update_voltages_inner<true, true> : update_voltages_inner<true, false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, M);
 		}
 		else
-			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			HIP_LaunchMain(d, "update_voltages_inner", f ? update_voltages_inner<false, true> : update_voltages_inner<false, false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, d->mur_zf);
-		HIP_Launch(d, "mur_shell", mur_shell, d->mur_shell_count, 1, 1,
+		HIP_Launch(d, "mur_shell", f ? mur_shell<true> : mur_shell<false>, d->mur_shell_count, 1, 1,
 		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim,
 		            S, (const HIP_MurFace*)d->mur_dev, d->mur.active);
 		return;
 	}
-	HIP_LaunchMain(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(d, "update_voltages", f ? update_voltages<true> : update_voltages<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
@@ -1808,7 +2198,7 @@ void GPU_Backend_HIP::UpdateCurrents()
 	{
 		// done by update_fused, but for the currents next to voltages changed by extensions since
 		if (d->fixup_count)
-			HIP_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
+			HIP_Launch(d, "update_currents_nodes", d->Factor() ? update_currents_nodes<true> : update_currents_nodes<false>, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
 			            (const size_t*)d->fixup, d->fixup_count, (const void*)d->index,
 			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim);
 		std::swap(d->curr, d->curr_next);
@@ -1817,7 +2207,7 @@ void GPU_Backend_HIP::UpdateCurrents()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	HIP_LaunchMain(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(d, "update_currents", d->Factor() ? update_currents<true> : update_currents<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->curr, (const float*)d->volt, (const void*)d->index, (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
@@ -1869,7 +2259,7 @@ void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, uns
 	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
 	if ((E.nx<=B.nx) || (E.ny<=B.ny))
 		return;
-	HIP_LaunchMain(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(this, "update_voltages", Factor() ? update_voltages<true> : update_voltages<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs);
 }
 
@@ -1883,7 +2273,7 @@ void GPU_Backend_HIP::Impl::WindowCurrents(unsigned int x0, unsigned int x1, uns
 	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
 	if ((E.nx<=B.nx) || (E.ny<=B.ny))
 		return;
-	HIP_LaunchMain(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(this, "update_currents", Factor() ? update_currents<true> : update_currents<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            curr, (const float*)volt, (const void*)index, (const float*)(c ? coeff : ii), (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, zslabs);
 }
 

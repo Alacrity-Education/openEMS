@@ -64,17 +64,20 @@ __global__ void upml_post(float* field, UPMLFusedArgs A, unsigned int set_offset
 	}
 }
 
-// the fused kernels of a whole region, in place or from one buffer of the fused step into the other
+// the fused kernels of a whole region, in place or from one buffer of the fused step into the other;
+// FACTOR: the form of the main coefficients (see HIP_MainCoeffT), picked at the launch
+template<bool FACTOR>
 __global__ void upml_fused_volt(float* volt_out, const float* volt_in, const float* curr, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_volt_node(volt_out, volt_in, curr, A, N, R, x, y, z);
+	upml_fused_volt_node<FACTOR>(volt_out, volt_in, curr, A, N, R, x, y, z);
 }
 
+template<bool FACTOR>
 __global__ void upml_fused_curr(float* curr_out, const float* curr_in, const float* volt, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
+	upml_fused_curr_node<FACTOR>(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
 class HIP_Ext_UPML : public GPU_Extension
@@ -138,11 +141,11 @@ protected:
 	// in place, or in the fused step from the current buffers into the next ones (see update_fused)
 	void FuseVolt(float* volt_out)
 	{
-		HIP_Launch(d, "upml_fused_volt", upml_fused_volt, m_Region.lz*m_Region.ly, 1, m_Region.lx, volt_out, (const float*)d->volt, (const float*)d->curr, VoltArgs(), d->dim, m_Region);
+		HIP_Launch(d, "upml_fused_volt", d->Factor() ? upml_fused_volt<true> : upml_fused_volt<false>, m_Region.lz*m_Region.ly, 1, m_Region.lx, volt_out, (const float*)d->volt, (const float*)d->curr, VoltArgs(), d->dim, m_Region);
 	}
 	void FuseCurr(float* curr_out)
 	{
-		HIP_Launch(d, "upml_fused_curr", upml_fused_curr, m_Region.lz*m_Region.ly, 1, m_Region.lx, curr_out, (const float*)d->curr, (const float*)d->volt, CurrArgs(), d->dim, m_Region);
+		HIP_Launch(d, "upml_fused_curr", d->Factor() ? upml_fused_curr<true> : upml_fused_curr<false>, m_Region.lz*m_Region.ly, 1, m_Region.lx, curr_out, (const float*)d->curr, (const float*)d->volt, CurrArgs(), d->dim, m_Region);
 	}
 	UPMLFusedArgs Args(float* flux, const float* c_old, const float* c_fo, const float* c_fn, const float* full_a, const float* full_b)
 	{
