@@ -166,6 +166,7 @@ protected:
 	unsigned int m_TS0;   //!< the timestep of the engine at the creation, where the slots are [0,1,2]
 	unsigned int* m_X;    //!< x and y line of the elements, for the windows (OPENEMS_HIP_WINDOW only)
 	unsigned int* m_Y;
+	unsigned int m_XMin, m_XMax;   //!< the x lines of the elements: windows outside skip the launch
 };
 
 HIP_Ext_LumpedRLC::HIP_Ext_LumpedRLC(GPU_Backend_HIP::Impl* impl, Operator_Ext_LumpedRLC* op_ext, Engine* eng)
@@ -174,6 +175,13 @@ HIP_Ext_LumpedRLC::HIP_Ext_LumpedRLC(GPU_Backend_HIP::Impl* impl, Operator_Ext_L
 	m_TS0 = eng->GetNumberOfTimesteps();
 	m_X = m_Y = NULL;
 	const unsigned int count = op_ext->RLC_count;
+	m_XMin = UINT_MAX;
+	m_XMax = 0;
+	for (unsigned int p=0; p<count; ++p)
+	{
+		m_XMin = std::min(m_XMin, op_ext->v_RLC_pos[0][p]);
+		m_XMax = std::max(m_XMax, op_ext->v_RLC_pos[0][p]);
+	}
 	m_Param.count = count;
 	// slot order as initialized by the host: v_Vdn[k] and v_Jn[k] in slot k
 	m_Param.vd0 = 0; m_Param.vd1 = 1; m_Param.vd2 = 2;
@@ -244,7 +252,7 @@ void HIP_Ext_LumpedRLC::Apply2Voltages()
 
 void HIP_Ext_LumpedRLC::LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
 {
-	if (m_Param.count==0)
+	if ((m_Param.count==0) || (x1<=m_XMin) || (x0>m_XMax))
 		return;
 	const RLCWindow win = {(const int*)d->step_base, step_in_block, m_TS0, x0, x1, y0, y1, (const unsigned int*)m_X, (const unsigned int*)m_Y};
 	if (phase==GPU_WindowPreVoltage)

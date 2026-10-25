@@ -51,7 +51,7 @@ __global__ void ssd_record_window(const float* volt, float* records, const size_
 	records[n*P.length + TS%P.length] = volt[index[n]];
 }
 
-class HIP_Ext_SteadyState : public GPU_Extension
+class HIP_Ext_SteadyState : public GPU_Extension, public HIP_WindowHooks
 {
 public:
 	HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_Ext_SteadyState* op_ext, Engine_Ext_SteadyState* eng_ext, Engine_GPU* eng);
@@ -60,8 +60,10 @@ public:
 
 	virtual bool WindowCapable() const {return true;}
 	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
-	//! The check of Apply2Voltages() for timestep \a ts, which the windowed blocks cannot do per timestep (see EndOfBlock())
-	virtual void EndOfBlock(unsigned int ts);
+	//! The check of Apply2Voltages() needs the host: the windowed schedule runs its timesteps alone and calls HostStep()
+	//! right after the record launch, where Apply2Voltages() checks (same records, same fields for the energy)
+	virtual unsigned int NextHostStep(unsigned int ts) const;
+	virtual void HostStep(unsigned int ts);
 
 protected:
 	void CheckPeriod(unsigned int rel_pos);
@@ -75,6 +77,7 @@ protected:
 	float* m_Records;            //!< [probe][2*period]: the two periods CheckPeriod() compares
 	unsigned int* m_X;           //!< x and y line of the probes, for the windows (OPENEMS_HIP_WINDOW only)
 	unsigned int* m_Y;
+	unsigned int m_XMin, m_XMax;  //!< the x lines of the probes (windowed blocks)
 	std::vector<float> m_HostRecords;
 };
 
@@ -94,6 +97,13 @@ HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_E
 	m_HostRecords.resize(std::max(m_Count, 1u)*2*(size_t)m_Period);
 	m_Records = d->Alloc<float>(m_HostRecords.size());
 	m_X = m_Y = NULL;
+	m_XMin = UINT_MAX;
+	m_XMax = 0;
+	for (unsigned int n=0; n<m_Count; ++n)
+	{
+		m_XMin = std::min(m_XMin, op_ext->m_E_probe_pos[0].at(n));
+		m_XMax = std::max(m_XMax, op_ext->m_E_probe_pos[0].at(n));
+	}
 	if (d->window.on)
 	{
 		std::vector<unsigned int> x(std::max(m_Count, 1u), 0), y(std::max(m_Count, 1u), 0);
@@ -109,7 +119,7 @@ HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_E
 
 void HIP_Ext_SteadyState::LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
 {
-	if ((phase!=GPU_WindowApplyVoltage) || (m_Count==0))
+	if ((phase!=GPU_WindowApplyVoltage) || (m_Count==0) || (x1<=m_XMin) || (x0>m_XMax))
 		return;
 	const unsigned int p = m_Period;
 	const SSDParam param = {m_Count, 2*p, 0};
@@ -117,10 +127,18 @@ void HIP_Ext_SteadyState::LaunchInWindow(GPU_WindowPhase phase, unsigned int ste
 	HIP_Launch(d, "ssd_record_window", ssd_record_window, m_Count, 1, 1, (const float*)d->volt, m_Records, (const size_t*)m_Index, param, win);
 }
 
-// The check needs the records up to a period boundary and the energy, on the host: after the block. With blocks
-// of one timestep this is after the current update of the timestep, where Apply2Voltages() checks before it: the
-// records are the same, the energy has the currents of the next half-step.
-void HIP_Ext_SteadyState::EndOfBlock(unsigned int ts)
+// The timesteps Apply2Voltages() checks at
+unsigned int HIP_Ext_SteadyState::NextHostStep(unsigned int ts) const
+{
+	const unsigned int p = m_Period;
+	if (p==0)
+		return UINT_MAX;
+	const unsigned long long first = std::max((unsigned long long)ts, 2ull*p);
+	const unsigned long long next = (first + p - 1)/p*p;
+	return (next>=UINT_MAX) ? UINT_MAX : (unsigned int)next;
+}
+
+void HIP_Ext_SteadyState::HostStep(unsigned int ts)
 {
 	const unsigned int p = m_Period;
 	if ((ts%p==0) && (ts>=2*p))

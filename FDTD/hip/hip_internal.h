@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <map>
 #include <memory>
 #include <set>
@@ -276,6 +277,7 @@ struct HIP_MurPlane
 	unsigned int line, shift;
 	const float *c_nyP, *c_nyPP;
 	size_t seq;   //!< position of its extension in the extension order (see GPU_Backend_HIP::Impl::ext_log)
+	unsigned int start_ts;   //!< the plane is active from this timestep on (see Engine_Ext_Mur_ABC::GetStartTimestep())
 };
 
 #include "hip_upml.hiph"
@@ -314,6 +316,16 @@ bool HIP_CompressibleFree(void* ptr);
 double HIP_UniformLineShare(const void* data, size_t bytes);
 //! true if OPENEMS_HIP_COMPRESSIBLE_STATS is set to a non-zero value (read once)
 bool HIP_CompressibleStats();
+
+//! What the dependency checker of the windowed schedule (OPENEMS_HIP_WINDOW_CHECK=1) checks before a launch, see window_check
+enum HIP_WindowCheckKind {HIP_CheckVolt, HIP_CheckCurr, HIP_CheckPreVolt, HIP_CheckApplyVolt, HIP_CheckPreCurr, HIP_CheckApplyCurr, HIP_CheckEnd};
+//! The first violation the checker found (device memory): node, the half-step of the launch, the stamp expected and found,
+//! and the node whose stamp it was
+struct HIP_WindowCheckRecord
+{
+	int flag, kind;
+	int x, y, z, half_step, expected, found, qx, qy, qz;
+};
 
 //! State of one grid
 struct GPU_Backend_HIP::Impl
@@ -421,8 +433,9 @@ struct GPU_Backend_HIP::Impl
 	struct WindowKnob
 	{
 		bool on;              //!< set and not 0
-		bool supported;       //!< a block shape this build runs: T = 1 and W = nx (the degenerate window)
-		unsigned int T, W;    //!< W: the grid's nx for "NX"
+		bool valid;           //!< auto, or T,W[,B] with T, W > 0
+		bool automatic;       //!< auto: T = 8 and W from the L2 rule (see HIP_WindowRule())
+		unsigned int T, W, B; //!< forced; W: the grid's nx for "NX"; B (y-tile rows) is accepted and unused
 		std::string text;     //!< the value as set
 	};
 	WindowKnob window;
@@ -432,10 +445,52 @@ struct GPU_Backend_HIP::Impl
 	//! the timestep of the windowed block that runs (one int, device memory): the base the window-capable
 	//! extensions read their step from (see GPU_Extension::LaunchInWindow()); allocated in Init()
 	int* step_base;
+	//! WindowPrepare() ran: 1 the schedule runs, 0 refused at the first block (window_refusal), -1 not yet
+	int window_ready;
+	//! the schedule: blocks of at most win_T timesteps, windows of win_W x planes (win_B: unused y tiles)
+	unsigned int win_T, win_W, win_B;
+	//! V frontiers that would split the line and the shift line of a Mur plane on an x face (see WindowFrontiers())
+	std::vector<unsigned int> win_forbidden;
+	size_t l2_bytes;                //!< L2 cache of the device (Init())
+	size_t coeff_table_bytes;       //!< the coefficient table shared by all nodes (the sets of coeff_mode 1/2), 0 with full arrays
+	//! bytes per node of the main update coefficients the kernels read besides the table: the set index, or the
+	//! four full arrays (see coeff_mode); for the window rule
+	size_t CoeffBytesPerNode() const {return (coeff_mode==0) ? 48 : (((coeff_mode==2) || (coeff_mode==4)) ? 4 : 2);}
+	unsigned long long launches;    //!< kernel launches issued by HIP_Launch()/HIP_LaunchMain() (captured ones included)
+	//! graphs: one per (block length, W, active Mur planes), captured at the first block of its kind and replayed
+	struct WindowGraph { hipGraphExec_t exec; unsigned long long launches, checks; double capture_ms; };
+	std::map<std::vector<unsigned int>, WindowGraph> window_graphs;
+	bool window_graphs_on;          //!< not with OPENEMS_HIP_KERNEL_TIMES, OPENEMS_HIP_WINDOW_GRAPH=0, or after a failed capture
+	bool window_logged;             //!< the schedule's line is printed (after the first chunk)
+	unsigned long long window_steps, window_blocks, window_chunks;
+	unsigned long long window_block_launches;   //!< the launches of the last block of T steps launched without a graph
+	//! OPENEMS_HIP_WINDOW_CHECK=1, the dependency checker (development, slow): per node the half-step of its last voltage
+	//! (stamp_v) and current (stamp_i) update, checked before every launch of the schedule (see window_check)
+	bool window_check;
+	int *stamp_v, *stamp_i;
+	HIP_WindowCheckRecord* check_rec;
+	unsigned long long checked_steps, checked_launches;
 	//! The main voltage / current update of the nodes [x0,x1) x [y0,y1) (all z) for the windowed blocks:
-	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window
-	void WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
-	void WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
+	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window, the Mur
+	//! planes of \a mur_active in the voltage update as UpdateVoltages() has them (mode 1 and 2)
+	void WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int step_in_block, unsigned int mur_active);
+	void WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int step_in_block);
+	//! The decisions of the first timestep (UPML, shape, Mur), the schedule's T and W, the checker; false: refused
+	bool WindowPrepare();
+	//! The frontiers of the window whose V frontier of step 0 is \a F, for a block of \a L timesteps
+	void WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const;
+	//! The launches of a block of \a L timesteps from timestep \a ts with windows of \a W planes (the step base is
+	//! written before); \a host: the extension whose HostStep() runs after its apply-voltage launch (L = 1, W = nx)
+	void WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host);
+	//! n timesteps from \a start_ts as blocks (graphs when possible)
+	void WindowRun(unsigned int start_ts, unsigned int n);
+	//! The hook for the tuner (G7): WindowRun() with the current win_T, win_W, timed on the device, in ms
+	float WindowTimedRun(unsigned int start_ts, unsigned int n);
+	//! the Mur planes active at timestep \a ts (bit 2*ny + (line>0)), and the next timestep after \a ts where that changes
+	unsigned int MurActive(unsigned int ts) const;
+	unsigned int MurNextChange(unsigned int ts) const;
+	//! Checker (window_check): \a kind (HIP_WindowCheckKind) of the nodes [B, E) at step_in_block \a sib
+	void WindowCheck(unsigned int kind, const HIP_GridDim& B, const HIP_GridDim& E, unsigned int sib);
 
 	//! Field snapshots (see GPU_Backend_HIP::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy stream into a page-locked host buffer
@@ -596,15 +651,33 @@ void HIP_Launch(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_
 	if (timed)
 		HIP_KernelTimes::Begin(d->Stream());
 	kernel<<<GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk), block, 0, d->Stream()>>>(args...);
+	++d->launches;
 	d->CheckLaunch(name);
 	if (timed)
 		HIP_KernelTimes::End(d->Stream(), name);
 }
 
-//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset) for a grid of \a nx x lines: unset or 0 off; "1,<W>" with
-//! W = nx or the string NX the degenerate window (T = 1, one window of the whole grid); anything else is
-//! on but unsupported in this build (the backend then steps one timestep at a time)
+//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset) for a grid of \a nx x lines: unset or 0 off; auto; T,W[,B] with
+//! T, W > 0 (W may be the string NX: the grid's nx; B, the rows of a y tile, is accepted and not used). Anything
+//! else is on but not valid (the backend then steps one timestep at a time)
 GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx);
+//! The window rule of auto: W = (0.65 * L2 - table) / plane_bytes - (2T + 1), at least 1, at most nx; the coefficient table
+//! (read by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes);
+
+//! What the windowed schedule needs of a window-capable HIP extension besides GPU_Extension::LaunchInWindow()
+class HIP_WindowHooks
+{
+public:
+	virtual ~HIP_WindowHooks() {}
+	//! The decisions the extension makes in its first hook, before the first block (nothing may synchronize in a capture)
+	virtual void WindowPrepare() {}
+	//! The first timestep >= \a ts at which HostStep() must run, UINT_MAX if none: the schedule runs that timestep alone,
+	//! over the whole grid, and calls HostStep() right after this extension's apply-voltage launch (where the single
+	//! step does its host work)
+	virtual unsigned int NextHostStep(unsigned int ts) const {UNUSED(ts); return UINT_MAX;}
+	virtual void HostStep(unsigned int ts) {UNUSED(ts);}
+};
 
 //! Launch \a kernel, one of the main kernels, with one thread per (i,j,k) and the block of OPENEMS_HIP_SHAPE (see
 //! GPU_Backend_HIP::Impl::MainBlock()) on the stream of \a d; the kernel checks its bounds
@@ -618,6 +691,7 @@ void HIP_LaunchMain(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, s
 	if (timed)
 		HIP_KernelTimes::Begin(d->Stream());
 	kernel<<<GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk), block, 0, d->Stream()>>>(args...);
+	++d->launches;
 	d->CheckLaunch(name);
 	if (timed)
 		HIP_KernelTimes::End(d->Stream(), name);
