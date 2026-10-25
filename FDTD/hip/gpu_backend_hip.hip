@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -543,6 +544,8 @@ GPU_Backend_HIP::Impl::Impl()
 	snap_dev = NULL;
 	snap_host = NULL;
 	snap_taken = false;
+	m_CompressibleRefused = 0;
+	m_CompressibleLogged = false;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -558,7 +561,8 @@ GPU_Backend_HIP::Impl::~Impl()
 	(void)hipEventDestroy(snap_evaluated);
 	(void)hipEventDestroy(snap_done);
 	for (size_t n=0; n<m_Allocations.size(); ++n)
-		(void)hipFree(m_Allocations.at(n));
+		if (!FreeCompressible(m_Allocations.at(n)))
+			(void)hipFree(m_Allocations.at(n));
 	for (std::set<void*>::iterator it=m_Pinned.begin(); it!=m_Pinned.end(); ++it)
 		(void)hipHostUnregister(*it);
 }
@@ -639,6 +643,70 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		std::cout << std::endl;
 	}
 	return true;
+}
+
+void* GPU_Backend_HIP::Impl::AllocCompressible(size_t bytes, HIP_AllocClass cls)
+{
+	const size_t g = HIP_CompressibleGranularity(ctx->device);
+	if ((g>0) && (bytes<std::max(g, (size_t)2<<20)))
+		return NULL;
+	bool granted = false;
+	void* ptr = HIP_CompressibleAlloc(ctx->device, bytes, granted);
+	if (ptr==NULL)
+	{
+		++m_CompressibleRefused;
+		return NULL;
+	}
+	m_Compressible[ptr] = std::make_pair(cls, (bytes + g - 1)/g*g);
+	return ptr;
+}
+
+bool GPU_Backend_HIP::Impl::FreeCompressible(void* ptr)
+{
+	std::map<void*, std::pair<HIP_AllocClass, size_t> >::iterator it = m_Compressible.find(ptr);
+	if (it==m_Compressible.end())
+		return false;
+	m_Compressible.erase(it);
+	return HIP_CompressibleFree(ptr);
+}
+
+void GPU_Backend_HIP::Impl::LogCompressible()
+{
+	if (m_CompressibleLogged)
+		return;
+	m_CompressibleLogged = true;
+	if ((g_settings.GetVerboseLevel()<1) || (m_Compressible.empty() && (m_CompressibleRefused==0)))
+		return;
+	if (m_Compressible.empty())
+	{
+		std::cout << "GPU_Backend_HIP: compressible memory requested but not granted by the driver, plain memory" << std::endl;
+		return;
+	}
+	size_t count[3] = {0, 0, 0};
+	size_t bytes = 0;
+	for (std::map<void*, std::pair<HIP_AllocClass, size_t> >::const_iterator it=m_Compressible.begin(); it!=m_Compressible.end(); ++it)
+	{
+		++count[it->second.first];
+		bytes += it->second.second;
+	}
+	std::ostringstream line;
+	const char* sep = "";
+	const HIP_AllocClass order[3] = {HIP_AllocFields, HIP_AllocCoeff, HIP_AllocOther};
+	const char* const names[3] = {"fields", "coeff", "other"};
+	for (int n=0; n<3; ++n)
+		if (count[order[n]])
+		{
+			line << sep << names[n];
+			sep = ", ";
+		}
+	line << " (" << m_Compressible.size() << " buffers, ";
+	line.setf(std::ios::fixed);
+	line.precision(1);
+	line << bytes/1e6 << " MB, granularity ";
+	line.unsetf(std::ios::fixed);
+	line.precision(6);
+	line << HIP_CompressibleGranularity(ctx->device)/1048576.0 << " MiB)";
+	std::cout << "GPU_Backend_HIP: compressible memory: " << line.str() << std::endl;
 }
 
 void GPU_Backend_HIP::Impl::ResetZSlabs()
@@ -887,8 +955,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->ResetZSlabs();
 
 	// the main updates launch one block per x line along z, which the device limits (64k on AMD and NVIDIA);
-	// from the properties: hipDeviceGetAttribute calls the CUDA driver API on NVIDIA, which the
-	// plugin does not link (MSVC keeps that call, GCC folds it away)
+	// from the properties: hipDeviceGetAttribute calls the CUDA driver API on NVIDIA (MSVC keeps
+	// that call, GCC folds it away), which the plugin links only for hip_compressible.hip
 	hipDeviceProp_t prop;
 	HIP_Check(hipGetDeviceProperties(&prop, d->ctx->device), "hipGetDeviceProperties");
 	int max_grid_z = prop.maxGridSize[2];
@@ -948,7 +1016,9 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 void GPU_Backend_HIP::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
-	if (d->DecideFusedStep())
+	const bool fused = d->DecideFusedStep();
+	d->LogCompressible();   // once: after the buffers of Init(), the extensions and the fused step
+	if (fused)
 	{
 		// the main nodes, or the whole grid with the UPML regions in the kernel (see update_fused)
 		HIP_GridDim B = d->main_start;

@@ -485,6 +485,10 @@ ENDIF()
 IF(ENABLE_HIP AND OPENEMS_HIP_AS_CUDA)
   target_include_directories( ${HIP_TARGET} PRIVATE ${HIP_INCLUDE_DIR} )
   target_compile_definitions( ${HIP_TARGET} PRIVATE __HIP_PLATFORM_NVIDIA__=1 )
+  # the HIP headers map the virtual memory API (compressible memory, see
+  # FDTD/hip/hip_compressible.hip) inline to the CUDA driver API
+  find_package(CUDAToolkit REQUIRED)
+  TARGET_LINK_LIBRARIES( ${HIP_TARGET} CUDA::cuda_driver )
 ENDIF()
 IF(ENABLE_SYCL AND NOT _sycl_subbuild)
   ADD_SUBDIRECTORY( FDTD/sycl )

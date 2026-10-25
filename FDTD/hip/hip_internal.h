@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -111,8 +112,20 @@ struct HIP_Context
 	~HIP_Context();
 };
 
-//! Class of a device buffer for the compressible memory (see hip_compressible.hip)
+//! What a device buffer holds: the classes of OPENEMS_HIP_COMPRESSIBLE (see hip_compressible.hip)
 enum HIP_AllocClass {HIP_AllocOther, HIP_AllocFields, HIP_AllocCoeff};
+
+//! Compressible device memory (see hip_compressible.hip). The classes OPENEMS_HIP_COMPRESSIBLE
+//! asks for, one bit per HIP_AllocClass (read once): unset or 0 none, 1 or all every class,
+//! else a comma separated list of fields, coeff
+unsigned HIP_CompressibleClasses();
+//! Allocation granularity of compressible memory on \a device (queried once), 0 if unknown
+size_t HIP_CompressibleGranularity(int device);
+//! Compressible buffer of at least \a bytes, padded to the granularity; NULL (\a granted false)
+//! if the driver hands back plain memory or anything fails, with nothing left allocated
+void* HIP_CompressibleAlloc(int device, size_t bytes, bool& granted);
+//! Unmap and release \a ptr if it is a buffer of HIP_CompressibleAlloc(); false otherwise
+bool HIP_CompressibleFree(void* ptr);
 //! share (0..1) of the complete 128-byte lines of \a data whose bytes all equal the line's first 4 bytes (host memory)
 double HIP_UniformLineShare(const void* data, size_t bytes);
 //! true if OPENEMS_HIP_COMPRESSIBLE_STATS is set to a non-zero value (read once)
@@ -188,15 +201,18 @@ struct GPU_Backend_HIP::Impl
 
 	hipStream_t Stream() const {return ctx->stream;}
 
-	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl
+	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl.
+	//! \a cls: compressible memory if OPENEMS_HIP_COMPRESSIBLE asks for the class (see AllocCompressible())
 	template <typename T>
 	T* Alloc(size_t count, const T* host=NULL, HIP_AllocClass cls=HIP_AllocOther, const char* name=NULL)
 	{
-		(void)cls;
 		if (name && HIP_CompressibleStats())
 			ReportUniformLines(name, host, count*sizeof(T));
 		T* ptr = NULL;
-		HIP_Check(hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "hipMalloc");
+		if (HIP_CompressibleClasses() & (1u<<cls))
+			ptr = static_cast<T*>(AllocCompressible(std::max(count, (size_t)1)*sizeof(T), cls));
+		if (ptr==NULL)
+			HIP_Check(hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "hipMalloc");
 		m_Allocations.push_back(ptr);
 		// on the work stream: it does not synchronize with the legacy default stream
 		if (host && count)
@@ -208,14 +224,15 @@ struct GPU_Backend_HIP::Impl
 	}
 
 	//! Uninitialized device buffer of \a count elements for an optional optimization, freed with
-	//! this Impl or by Free(); NULL if the device memory is not sufficient
+	//! this Impl or by Free(); NULL if the device memory is not sufficient. \a cls as for Alloc()
 	template <typename T>
 	T* TryAlloc(size_t count, HIP_AllocClass cls=HIP_AllocOther, const char* name=NULL)
 	{
-		(void)cls;
 		(void)name;
 		T* ptr = NULL;
-		if (hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess)
+		if (HIP_CompressibleClasses() & (1u<<cls))
+			ptr = static_cast<T*>(AllocCompressible(std::max(count, (size_t)1)*sizeof(T), cls));
+		if ((ptr==NULL) && (hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess))
 		{
 			(void)hipGetLastError();   // not sticky, but reported by the next CheckLaunch()
 			return NULL;
@@ -230,8 +247,18 @@ struct GPU_Backend_HIP::Impl
 		if (ptr==NULL)
 			return;
 		m_Allocations.erase(std::remove(m_Allocations.begin(), m_Allocations.end(), ptr), m_Allocations.end());
-		(void)hipFree(ptr);
+		if (!FreeCompressible(ptr))
+			(void)hipFree(ptr);
 	}
+
+	//! Compressible buffer of \a bytes of class \a cls for Alloc()/TryAlloc() (counted for
+	//! LogCompressible()); NULL if it is smaller than the granularity or than 2 MiB (these stay
+	//! plain: padding, and they do not stream), or not granted
+	void* AllocCompressible(size_t bytes, HIP_AllocClass cls);
+	//! Release \a ptr if it is a compressible buffer of this Impl; false otherwise (then hipFree it)
+	bool FreeCompressible(void* ptr);
+	//! Report the compressible buffers once (verbose level 1 and up), after the last of Init() and DecideFusedStep()
+	void LogCompressible();
 
 	//! Device buffer of the set indices of \a sets (16 or 32 bit)
 	void* AllocIndex(const GPU_CoeffSets& sets)
@@ -269,6 +296,10 @@ struct GPU_Backend_HIP::Impl
 protected:
 	std::vector<void*> m_Allocations;
 	std::set<void*> m_Pinned;
+	//! Compressible buffers among m_Allocations: class and padded size; requests not granted
+	std::map<void*, std::pair<HIP_AllocClass, size_t> > m_Compressible;
+	unsigned int m_CompressibleRefused;
+	bool m_CompressibleLogged;
 };
 
 //! Kernel timing for development (environment variable OPENEMS_HIP_KERNEL_TIMES=1): the
