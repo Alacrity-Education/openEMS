@@ -51,16 +51,16 @@ there are unreleased changes. It becomes the next release entry.
   stay plain. `OPENEMS_HIP_COMPRESSIBLE_STATS=1` prints the share of
   uniform 128-byte lines of every large buffer at upload and of the fields
   at every download, which tells how much a model could compress.
-- `OPENEMS_HIP_MUR_FUSED=1` runs the Mur ABC of the HIP backend inside the
-  voltage update, with bit-identical results: the voltages of the Mur planes
-  (the boundary line and the line next to it) are updated in one launch with
-  their Mur values, beside the main update of the other nodes (two launches per
-  timestep instead of one plus three per plane). A grid where this does not
-  apply (a Mur plane through a UPML region, TF/SF, steady-state detection, or a
-  material or lumped element on a plane) runs the separate launches, which
-  `--verbose=2` prints. It is off by default. On an RTX 5090 a board model of
-  3.1 Mcells with Mur on all six faces runs at 10405 MC/s instead of 9758 MC/s
-  (+6.6 %).
+- The HIP backend runs the Mur ABC inside the voltage update, with
+  bit-identical results: the voltages of the Mur planes (the boundary line and
+  the line next to it) are updated in one launch with their Mur values, beside
+  the main update of the other nodes (two launches per timestep instead of one
+  plus three per plane). A grid where this does not apply (a Mur plane through
+  a UPML region, TF/SF, steady-state detection, or a material or lumped element
+  on a plane) runs the separate launches, which `--verbose=2` prints, and
+  `OPENEMS_HIP_MUR_FUSED=0` restores them everywhere. On an RTX 5090 a board
+  of 28.7 Mcells with Mur on all six faces settles at 8929 MC/s instead of
+  7963 (+12 %), a model of 3.1 Mcells at 10405 instead of 9758 (+6.6 %).
 - `OPENEMS_HIP_SHEET_PLANES=1` runs the conducting sheets of the HIP backend
   as dense state per sheet plane when the sheets lie on z planes: one launch
   per half-step for all planes and both dispersion orders, the in-plane

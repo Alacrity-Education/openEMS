@@ -763,7 +763,7 @@ GPU_Backend_HIP::Impl::Impl()
 	snap_taken = false;
 	m_CompressibleRefused = 0;
 	m_CompressibleLogged = false;
-	mur_knob = 0;
+	mur_knob = 1;
 	mur_mode = -1;
 	memset(&mur, 0, sizeof(mur));
 	mur_dev = NULL;
