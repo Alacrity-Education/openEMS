@@ -24,6 +24,7 @@
 #include "CSPropConductingSheet.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <sstream>
 #include <thread>
@@ -373,4 +374,11 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 		}
 	}
 	return true;
+}
+
+std::string Operator_Ext_ConductingSheet::CacheKey() const
+{
+	char buf[48];
+	snprintf(buf, sizeof(buf), "f_max %.17g", m_f_max);
+	return std::string(buf);
 }

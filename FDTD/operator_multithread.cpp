@@ -51,6 +51,7 @@ Engine* Operator_Multithread::CreateEngine()
 
 Operator_Multithread::Operator_Multithread() : Operator_SSE_Compressed()
 {
+	m_SkipBuild=false;
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
 
@@ -61,6 +62,7 @@ Operator_Multithread::Operator_Multithread() : Operator_SSE_Compressed()
 void Operator_Multithread::Init()
 {
 	Operator_SSE_Compressed::Init();
+	m_SkipBuild=false;
 
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
@@ -162,6 +164,14 @@ bool Operator_Multithread::Calc_EC()
 	return true;
 }
 
+void Operator_Multithread::SkipBuildThreads()
+{
+	// the workers wait for the start of Calc_EC: let them pass, they end without building
+	m_SkipBuild=true;
+	m_CalcEC_Start->wait();
+	m_thread_group.join_all();
+}
+
 bool Operator_Multithread::CalcPEC()
 {
 	m_Nr_PEC[0]=0;
@@ -198,6 +208,8 @@ void Operator_Thread::operator()()
 {
 	//************** calculate EC (Calc_EC) ***********************//
 	m_OpPtr->m_CalcEC_Start->wait();
+	if (m_OpPtr->m_SkipBuild)
+		return;
 	m_OpPtr->Calc_EC_Range(m_start,m_stop);
 	m_OpPtr->m_CalcEC_Stop->wait();
 

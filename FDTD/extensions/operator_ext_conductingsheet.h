@@ -44,6 +44,8 @@ public:
 		return std::string("Conducting Sheet Extension");
 	}
 
+	virtual std::string CacheKey() const;
+
 protected:
 	//! Copy constructor
 	Operator_Ext_ConductingSheet(Operator* op, Operator_Ext_ConductingSheet* op_ext);

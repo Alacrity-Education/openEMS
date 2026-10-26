@@ -17,6 +17,7 @@
 
 #include "operator_ext_debyematerial.h"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
 #include "engine_ext_debyematerial.h"
 #include "operator_ext_cylinder.h"
 #include "../operator_cylinder.h"
@@ -307,4 +308,64 @@ void Operator_Ext_DebyeMaterial::ShowStat(std::ostream &ostr)  const
 	Operator_Extension::ShowStat(ostr);
 	ostr << " Debye poles N       \t: " << m_PoleCount << endl;
 	ostr << " Active cells        \t: " << m_LM_Count.at(0) << endl;
+}
+
+bool Operator_Ext_DebyeMaterial::Serialize(std::ostream& out) const
+{
+	SerializeBase(out);
+	Operator_Cache::WriteValue(out, (int32_t)m_PoleCount);
+	size_t count = m_LM_Count.size() ? m_LM_Count[0] : 0;
+	uint8_t has[3] = {v_solve_ADE!=NULL, v_relax_ADE!=NULL, v_drive_ADE!=NULL};
+	Operator_Cache::Write(out, has, 3);
+	for (int n=0; has[0] && (n<3); ++n)
+		Operator_Cache::Write(out, v_solve_ADE[n], count);
+	for (int o=0; o<m_PoleCount; ++o)
+		for (int n=0; n<3; ++n)
+		{
+			if (has[1])
+				Operator_Cache::Write(out, v_relax_ADE[o][n], count);
+			if (has[2])
+				Operator_Cache::Write(out, v_drive_ADE[o][n], count);
+		}
+	return true;
+}
+
+bool Operator_Ext_DebyeMaterial::Deserialize(std::istream& in)
+{
+	DeserializeBase(in);
+	m_PoleCount = Operator_Cache::ReadValue<int32_t>(in);
+	if ((m_PoleCount<0) || (m_PoleCount>1024))
+		return false;
+	size_t count = m_LM_Count.size() ? m_LM_Count[0] : 0;
+	uint8_t has[3];
+	Operator_Cache::Read(in, has, 3);
+	if (has[0])
+	{
+		v_solve_ADE = new FDTD_FLOAT*[3];
+		for (int n=0; n<3; ++n)
+		{
+			v_solve_ADE[n] = new FDTD_FLOAT[count];
+			Operator_Cache::Read(in, v_solve_ADE[n], count);
+		}
+	}
+	if (has[1]!=has[2])
+		return false;
+	if (has[1])
+	{
+		v_relax_ADE = new FDTD_FLOAT**[m_PoleCount];
+		v_drive_ADE = new FDTD_FLOAT**[m_PoleCount];
+		for (int o=0; o<m_PoleCount; ++o)
+		{
+			v_relax_ADE[o] = new FDTD_FLOAT*[3];
+			v_drive_ADE[o] = new FDTD_FLOAT*[3];
+			for (int n=0; n<3; ++n)
+			{
+				v_relax_ADE[o][n] = new FDTD_FLOAT[count];
+				Operator_Cache::Read(in, v_relax_ADE[o][n], count);
+				v_drive_ADE[o][n] = new FDTD_FLOAT[count];
+				Operator_Cache::Read(in, v_drive_ADE[o][n], count);
+			}
+		}
+	}
+	return true;
 }
