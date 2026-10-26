@@ -16,12 +16,13 @@ there are unreleased changes. It becomes the next release entry.
 ### Added
 
 - **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
-  backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
-  is selected like the other engines, runs Cartesian and cylindrical meshes
-  (including multi-grid) with the usual extensions on the device, and writes
-  the same probes and dumps. Without a usable GPU the setup fails with an
-  error instead of running something slower. `--engine=gpu-reference` runs it
-  on a CPU reference backend, to check the device backends against. With
+  backend on macOS, a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs and a
+  SYCL backend for Intel GPUs (Level Zero). It is selected like the other
+  engines, runs Cartesian and cylindrical meshes (including multi-grid) with
+  the usual extensions on the device, and writes the same probes and dumps.
+  Without a usable GPU the setup fails with an error instead of running
+  something slower. `--engine=gpu-reference` runs it on a CPU reference
+  backend, to check the device backends against. With
   several GPUs it takes a discrete one before an integrated one, then the one
   with more memory; `--gpu-device=N` (`gpu_device=N`) picks device N of the
   list printed at `--verbose=1`.
@@ -127,6 +128,13 @@ there are unreleased changes. It becomes the next release entry.
   combine with MSVC: build all of openEMS with it, or only the plugin in a
   second build with `-DOPENEMS_GPU_BUILD_ID` of the first, as the Windows
   package does.
+- `ENABLE_SYCL` CMake option for the SYCL backend, on when the Intel oneAPI
+  DPC++ compiler `icpx` is found. Either build all of openEMS with it
+  (`-DCMAKE_CXX_COMPILER=icpx`, with `-ffp-model=precise -ffp-contract=off`
+  to keep the results of a GCC build), or keep the usual compiler and build
+  only the plugin `openEMS_gpu_sycl` with `OPENEMS_ICPX`. It is compiled for
+  the Intel Arc B-series (`OPENEMS_SYCL_AOT_DEVICES`, `ocloc` device names,
+  empty for SPIR-V only); other Intel GPUs compile the SPIR-V at start-up.
 - C++17 is now required (was C++11), e.g. GCC 8 or newer, also for the
   Python bindings and the GPU sources (HIP/CUDA, were C++14).
 - VTK is no longer needed: openEMS writes its VTK files (`.vtr`, `.vts`,
