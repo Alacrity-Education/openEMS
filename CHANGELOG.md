@@ -44,6 +44,19 @@ there are unreleased changes. It becomes the next release entry.
   RTX 5090 a PCB model of 28.7 Mcells with Mur on all six faces settles at
   8929 MC/s instead of 7963 (+12 %), a model of 3.1 Mcells at 10405 instead
   of 9758 (+6.6 %).
+- The HIP backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, instead of two launches
+  per order over a position list with all three components. The results are
+  bit-identical; a sheet that does not fit (positions off the z planes, more
+  than 32 planes, orders on different positions) keeps the position list,
+  which `--verbose=2` prints. On an RTX 5090 a PCB model of 28.7 Mcells with
+  four copper layers (2.5 million sheet cells) settles at 10602 MC/s instead
+  of 8929 (+19 %, 2.71 ms a step instead of 3.21); a model of 3.06 Mcells
+  gains 1.3 %, where the sheet kernels shrink from 56 to 30 us a step but the
+  main voltage update loses the cache warming the old kernels gave it. A
+  version with the sheet update inside the voltage kernel was bit-identical
+  and no faster.
 
 ### Fixed
 
