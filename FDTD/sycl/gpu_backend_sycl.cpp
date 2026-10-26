@@ -51,7 +51,8 @@
 // dimension 1, x along dimension 0 (one work-group per x line). The coefficients are read with main_coeff().
 // Nodes below Z.z_lo or from Z.z_hi on belong to UPML regions along z (see SYCL_ZSlabs).
 // The index type I is unsigned int if the fields fit (see GPU_Backend_SYCL::Impl::index32), else size_t.
-template<typename I>
+// FACTOR: the factorized coefficients (coeff_mode 3/4), else modes 0-2 (see main_coeff()).
+template<typename I, bool FACTOR>
 inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt, const float* __restrict__ curr,
                             const void* index, const float* ca, const float* cb, unsigned int mode,
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
@@ -81,12 +82,12 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 		return;
 	if (z<Z.z_lo)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
 		return;
 	}
 	if (z>=Z.z_hi)
 	{
-		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
 	const I sn = (I)N.nx*N.ny*N.nz;
@@ -94,7 +95,7 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 	const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
 	const I ym = (y>0) ? N.nz : 0;
 	const I zm = (z>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
+	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	const float* vv = C.a;
 	const float* vi = C.b;
 	const I s = C.s;
@@ -117,7 +118,7 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 }
 
 // the currents on the last mesh line of each direction are not updated
-template<typename I>
+template<typename I, bool FACTOR>
 inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr, const float* __restrict__ volt,
                             const void* index, const float* ca, const float* cb, unsigned int mode,
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
@@ -147,12 +148,12 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 		return;
 	if (z<Z.z_lo)
 	{
-		upml_fused_curr_node(curr, curr, volt, Z.curr_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		upml_fused_curr_node<FACTOR>(curr, curr, volt, Z.curr_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
 		return;
 	}
 	if (z>=Z.z_hi)
 	{
-		upml_fused_curr_node(curr, curr, volt, Z.curr_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		upml_fused_curr_node<FACTOR>(curr, curr, volt, Z.curr_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
 	if (z+1>=N.nz || y+1>=N.ny || x+1>=N.nx)
@@ -161,7 +162,7 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 	const I i  = nijk<I>(N, 0, x, y, z);
 	const I xp = (I)N.ny*N.nz;
 	const I yp = N.nz;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 6, N, x, y, z);
+	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 6, N, x, y, z);
 	const float* ii = C.a;
 	const float* iv = C.b;
 	const I s = C.s;
@@ -186,7 +187,7 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 // ---- fused step
 
 // the voltages of node (x,y,z), the same operations as update_voltages
-template<typename I>
+template<typename I, bool FACTOR>
 inline void fused_volt(const float* __restrict__ volt, const float* __restrict__ curr,
                        const void* index, const float* va, const float* vb, unsigned int mode,
                        const SYCL_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
@@ -196,7 +197,7 @@ inline void fused_volt(const float* __restrict__ volt, const float* __restrict__
 	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
 	const I ym = (y>0) ? N.nz : 0;
 	const I zm = (z>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0, N, x, y, z);
+	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, va, vb, mode, sn, i, 0, N, x, y, z);
 	float t;
 	t  = volt[i] * C.a[0];
 	t += C.b[0] * (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
@@ -267,7 +268,8 @@ struct SYCL_FusedArgs
 // z_lo or z_hi run both code paths.
 // sV is the local memory tile sV[3][TY*TZ]: the place of a work-item is its local linear id
 // ty*TZ + tz, a row (line along z) is rowlen (TZ, or sw in slab tiles) places long.
-template<typename I, unsigned int TZ, unsigned int TY, bool SLABS>
+// FACTOR: coeff_mode 3/4 (see main_coeff()).
+template<typename I, unsigned int TZ, unsigned int TY, bool SLABS, bool FACTOR>
 inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<float, 1>& sV,
                          const SYCL_FusedArgs& a, const SYCL_ZSlabs& Z)
 {
@@ -346,9 +348,9 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 		if (main_yz && (x<E.nx))
 		{
 			if (!slab)
-				fused_volt<I>(volt_in, curr_in, a.index, a.va, a.vb, a.mode, N, x, y, z, v);
+				fused_volt<I, FACTOR>(volt_in, curr_in, a.index, a.va, a.vb, a.mode, N, x, y, z, v);
 			else if constexpr (SLABS)
-				upml_volt_value<I>(volt_in, curr_in, Av, N, R, x, y, z, owner && (x<xe), v);
+				upml_volt_value<I, FACTOR>(volt_in, curr_in, Av, N, R, x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
@@ -387,12 +389,12 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 			if (slab)
 			{
 				if constexpr (SLABS)
-					upml_curr_value<I>(curr_in, curr_out, Ac, N, R, x, y, z, update, curl);
+					upml_curr_value<I, FACTOR>(curr_in, curr_out, Ac, N, R, x, y, z, update, curl);
 			}
 			else if (update)
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
-				const SYCL_MainCoeffT<I> C = main_coeff<I>(a.index, a.ia, a.ib, a.mode, sn, i, 6, N, x, y, z);
+				const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(a.index, a.ia, a.ib, a.mode, sn, i, 6, N, x, y, z);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -417,7 +419,7 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 // One launch of update_fused: work-groups of (1, TY, TZ) work-items (TZ along z, dimension 2),
 // one sub-group of TZ per tile row. Z: the UPML z slabs in the kernel, or NULL. aligned: slab
 // tiles and main tiles from z_lo (see update_fused), else one tiling from B.nz.
-template<typename I, unsigned int TZ, unsigned int TY>
+template<typename I, unsigned int TZ, unsigned int TY, bool FACTOR>
 static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& args, const SYCL_ZSlabs* Z, bool aligned)
 {
 	SYCL_FusedArgs a = args;
@@ -474,7 +476,7 @@ static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& args, 
 				h.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> it)
 					[[sycl::reqd_work_group_size(1, TY, TZ)]] [[sycl::reqd_sub_group_size(TZ)]]
 				{
-					update_fused<I, TZ, TY, true>(it, sV, a, slabs);
+					update_fused<I, TZ, TY, true, FACTOR>(it, sV, a, slabs);
 				});
 			}
 			else
@@ -482,7 +484,7 @@ static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& args, 
 					[[sycl::reqd_work_group_size(1, TY, TZ)]] [[sycl::reqd_sub_group_size(TZ)]]
 				{
 					const SYCL_ZSlabs none = {};   // never read
-					update_fused<I, TZ, TY, false>(it, sV, a, none);
+					update_fused<I, TZ, TY, false, FACTOR>(it, sV, a, none);
 				});
 		});
 	}
@@ -497,29 +499,35 @@ static void launch_fused(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& args, 
 	}
 }
 
-template<typename I, unsigned int TZ>
+template<typename I, unsigned int TZ, bool FACTOR>
 static void launch_fused_ty(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_ZSlabs* Z, bool aligned, unsigned int ty)
 {
 	switch (ty)
 	{
-		case 4:  launch_fused<I, TZ, 4>(d, a, Z, aligned); break;
-		case 16: launch_fused<I, TZ, 16>(d, a, Z, aligned); break;
-		default: launch_fused<I, TZ, 8>(d, a, Z, aligned); break;
+		case 4:  launch_fused<I, TZ, 4, FACTOR>(d, a, Z, aligned); break;
+		case 16: launch_fused<I, TZ, 16, FACTOR>(d, a, Z, aligned); break;
+		default: launch_fused<I, TZ, 8, FACTOR>(d, a, Z, aligned); break;
 	}
 }
 
-// the index type of the fused step, see GPU_Backend_SYCL::Impl::index32
+// the index type of the fused step, see GPU_Backend_SYCL::Impl::index32, and the coefficient form (factor: coeff_mode 3/4)
 template<unsigned int TZ>
-static void launch_fused_tz(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_ZSlabs* Z, bool aligned, unsigned int ty, bool index32)
+static void launch_fused_tz(GPU_Backend_SYCL::Impl* d, const SYCL_FusedArgs& a, const SYCL_ZSlabs* Z, bool aligned, unsigned int ty, bool index32,
+                            bool factor)
 {
-	if (index32)
-		launch_fused_ty<unsigned int, TZ>(d, a, Z, aligned, ty);
+	if (index32 && factor)
+		launch_fused_ty<unsigned int, TZ, true>(d, a, Z, aligned, ty);
+	else if (index32)
+		launch_fused_ty<unsigned int, TZ, false>(d, a, Z, aligned, ty);
+	else if (factor)
+		launch_fused_ty<size_t, TZ, true>(d, a, Z, aligned, ty);
 	else
-		launch_fused_ty<size_t, TZ>(d, a, Z, aligned, ty);
+		launch_fused_ty<size_t, TZ, false>(d, a, Z, aligned, ty);
 }
 
 // the currents of the given main nodes again (update_currents), after the voltage extensions
 // changed voltages they read (see GPU_Backend_SYCL::Impl::fixup)
+template<bool FACTOR>
 inline void update_currents_nodes(const sycl::nd_item<3>& it, const float* __restrict__ curr_in, float* __restrict__ curr_out,
                                   const float* __restrict__ volt, const size_t* nodes, unsigned int count,
                                   const void* index, const float* ia, const float* ib, unsigned int mode, const SYCL_GridDim& N)
@@ -532,7 +540,7 @@ inline void update_currents_nodes(const sycl::nd_item<3>& it, const float* __res
 	const size_t xp = (size_t)N.ny*N.nz;
 	const size_t yp = N.nz;
 	const unsigned int x = i/xp, y = (i/yp)%N.ny, z = i%N.nz;
-	const SYCL_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6, N, x, y, z);
+	const SYCL_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ia, ib, mode, sn, i, 6, N, x, y, z);
 	float c;
 	c  = curr_in[i] * C.a[0];
 	c += C.b[0] * (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
@@ -604,7 +612,7 @@ inline void energy_lines(const sycl::nd_item<3>& it, const float* __restrict__ v
 }
 
 // The launches: the kernel arguments are captured by value (all trivially copyable)
-template<typename I>
+template<typename I, bool FACTOR>
 static void launch_update_voltages(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
 {
 	const bool c = d->coeff_mode>0;
@@ -619,11 +627,11 @@ static void launch_update_voltages(GPU_Backend_SYCL::Impl* d, unsigned int threa
 	const SYCL_ZSlabs Z = d->zslabs;
 	SYCL_Launch(d, "update_voltages", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
 	{
-		update_voltages<I>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z);
+		update_voltages<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z);
 	});
 }
 
-template<typename I>
+template<typename I, bool FACTOR>
 static void launch_update_currents(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
 {
 	const bool c = d->coeff_mode>0;
@@ -638,7 +646,7 @@ static void launch_update_currents(GPU_Backend_SYCL::Impl* d, unsigned int threa
 	const SYCL_ZSlabs Z = d->zslabs;
 	SYCL_Launch(d, "update_currents", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
 	{
-		update_currents<I>(it, curr, volt, index, ca, cb, mode, N, Bk, Ek, Z);
+		update_currents<I, FACTOR>(it, curr, volt, index, ca, cb, mode, N, Bk, Ek, Z);
 	});
 }
 
@@ -1737,9 +1745,9 @@ void GPU_Backend_SYCL::UpdateVoltages()
 		}
 		const SYCL_ZSlabs* Z = (d->zslab_lo || d->zslab_hi) ? &slabs : NULL;
 		if (tz==16)
-			launch_fused_tz<16>(d, a, Z, aligned, ty, d->index32);
+			launch_fused_tz<16>(d, a, Z, aligned, ty, d->index32, d->coeff_mode>=3);
 		else
-			launch_fused_tz<32>(d, a, Z, aligned, ty, d->index32);
+			launch_fused_tz<32>(d, a, Z, aligned, ty, d->index32, d->coeff_mode>=3);
 		// only the voltages: UpdateCurrents swaps the currents, once the fix-up has read the old ones
 		std::swap(d->volt, d->volt_next);
 		return;
@@ -1747,10 +1755,15 @@ void GPU_Backend_SYCL::UpdateVoltages()
 	SYCL_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	if (d->index32)
-		launch_update_voltages<unsigned int>(d, threads_z, B, E);
+	const bool factor = d->coeff_mode>=3;
+	if (d->index32 && factor)
+		launch_update_voltages<unsigned int, true>(d, threads_z, B, E);
+	else if (d->index32)
+		launch_update_voltages<unsigned int, false>(d, threads_z, B, E);
+	else if (factor)
+		launch_update_voltages<size_t, true>(d, threads_z, B, E);
 	else
-		launch_update_voltages<size_t>(d, threads_z, B, E);
+		launch_update_voltages<size_t, false>(d, threads_z, B, E);
 }
 
 void GPU_Backend_SYCL::UpdateCurrents()
@@ -1771,10 +1784,16 @@ void GPU_Backend_SYCL::UpdateCurrents()
 			const float* ib = c ? d->coeff : d->iv;
 			const unsigned int mode = d->coeff_mode;
 			const SYCL_GridDim N = d->dim;
-			SYCL_Launch(d, "update_currents_nodes", count, 1, 1, [=](sycl::nd_item<3> it)
-			{
-				update_currents_nodes(it, curr_in, curr_out, volt, nodes, count, index, ia, ib, mode, N);
-			});
+			if (mode>=3)
+				SYCL_Launch(d, "update_currents_nodes", count, 1, 1, [=](sycl::nd_item<3> it)
+				{
+					update_currents_nodes<true>(it, curr_in, curr_out, volt, nodes, count, index, ia, ib, mode, N);
+				});
+			else
+				SYCL_Launch(d, "update_currents_nodes", count, 1, 1, [=](sycl::nd_item<3> it)
+				{
+					update_currents_nodes<false>(it, curr_in, curr_out, volt, nodes, count, index, ia, ib, mode, N);
+				});
 		}
 		std::swap(d->curr, d->curr_next);
 		return;
@@ -1782,10 +1801,15 @@ void GPU_Backend_SYCL::UpdateCurrents()
 	SYCL_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	if (d->index32)
-		launch_update_currents<unsigned int>(d, threads_z, B, E);
+	const bool factor = d->coeff_mode>=3;
+	if (d->index32 && factor)
+		launch_update_currents<unsigned int, true>(d, threads_z, B, E);
+	else if (d->index32)
+		launch_update_currents<unsigned int, false>(d, threads_z, B, E);
+	else if (factor)
+		launch_update_currents<size_t, true>(d, threads_z, B, E);
 	else
-		launch_update_currents<size_t>(d, threads_z, B, E);
+		launch_update_currents<size_t, false>(d, threads_z, B, E);
 }
 
 static void CheckSize(size_t host_count, size_t device_count)
