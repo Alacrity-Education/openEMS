@@ -102,17 +102,27 @@ there are unreleased changes. It becomes the next release entry.
   model of 3.06 Mcells goes from 605968 exact sets (29 MB, 32 bit index) to
   14327 normalized sets (0.69 MB, 16 bit index) with no exception node and
   runs at 15601 MC/s instead of 13912 on an RTX 5090. Opt-in.
-- `OPENEMS_HIP_WINDOW=auto` or `T,W` (development, off by default) runs the
-  HIP backend's timesteps as blocks of T steps marched along x in windows of
-  W planes that stay in the L2 cache, each block captured once as a graph
-  and replayed. The voltage and current frontiers step back one plane per
+- The HIP backend runs its timesteps as blocks of T steps marched along x in
+  windows of W planes that stay in the L2 cache, each block captured once as
+  a graph and replayed (`OPENEMS_HIP_WINDOW=auto`, the default; `0` one
+  timestep at a time, `rule` without the tuner, `T,W` forced). The voltage and current frontiers step back one plane per
   timestep, so every cell is updated once per step from the values the
   single step would give it: the results are bit-identical, and
   `OPENEMS_HIP_WINDOW_CHECK=1` checks every launch's half-steps on the
   device. Grids with TF/SF, Debye materials, absorbing sheets, cylindrical
   coordinates, multi-grids or Mur planes outside the voltage update keep the
   single step. On an RTX 5090 a model of 3.06 Mcells (Mur, four sheet
-  planes) runs at 21806 MC/s instead of 13901 (+57 %, auto: T=8, W=143).
+  planes) runs at 21806 MC/s instead of 13901 (+57 %, T=8, W=143), a board
+  of 28.7 Mcells at 22944 instead of 13877 (+65 %, T=8, W=34). `auto` tunes
+  T and W on the first few hundred timesteps of a run (real timesteps, each
+  candidate bit-identical; the model of 3.06 Mcells: T=16, W=193, 23906
+  MC/s, +9.3 % over T=8, W=143) and keeps the choice per device, grid,
+  extensions and build in `~/.openems_hip_window_cache`, so that the next
+  run skips the tune (`OPENEMS_HIP_WINDOW_CACHE=0` tunes every run).
+  `auto` keeps the fused step on grids where it folds the UPML regions into
+  its kernel and one window covers the grid (no L2 gain there). The
+  environment knobs of the HIP backend are listed with their defaults and
+  measured effects at the top of `FDTD/hip/gpu_backend_hip.hip`.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
