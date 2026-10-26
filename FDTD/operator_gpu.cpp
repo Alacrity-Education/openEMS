@@ -69,6 +69,13 @@ void Operator_GPU::ThreadRanges(std::vector<unsigned int>& start, std::vector<un
 	}
 }
 
+unsigned int Operator_GPU::SetupThreads() const
+{
+	std::vector<unsigned int> start, stop;
+	ThreadRanges(start, stop);
+	return start.size();
+}
+
 bool Operator_GPU::Calc_EC()
 {
 	if (CSX==NULL)

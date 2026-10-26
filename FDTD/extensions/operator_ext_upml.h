@@ -76,6 +76,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 	//! Create the UPML
 	static bool Create_UPML(
 		Operator* op,

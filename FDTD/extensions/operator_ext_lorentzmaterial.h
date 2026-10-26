@@ -47,6 +47,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 protected:
 	//! Copy constructor
 	Operator_Ext_LorentzMaterial(Operator* op, Operator_Ext_LorentzMaterial* op_ext);

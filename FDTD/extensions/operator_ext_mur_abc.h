@@ -64,6 +64,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 protected:
 	Operator_Ext_Mur_ABC(Operator* op, Operator_Ext_Mur_ABC* op_ext);
 	void Initialize();

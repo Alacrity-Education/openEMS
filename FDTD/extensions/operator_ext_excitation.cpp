@@ -22,6 +22,7 @@
 
 #include "CSPrimCurve.h"
 #include "CSPropExcitation.h"
+#include "tools/fingerprint.h"
 
 using std::cout;
 using std::cerr;
@@ -366,6 +367,34 @@ void Operator_Ext_Excitation::setupCurrentExcitation(
 Engine_Extension* Operator_Ext_Excitation::CreateEngineExtention()
 {
 	return new Engine_Ext_Excitation(this);
+}
+
+std::string Operator_Ext_Excitation::Fingerprint() const
+{
+	FNVHash hash;
+	hash.AddValue((uint64_t)Volt_Count);
+	for (int n=0; n<3; ++n)
+		hash.AddValue((uint64_t)Volt_Count_Dir[n]);
+	for (int n=0; n<3; ++n)
+		hash.AddArray(Volt_index[n], Volt_Count);
+	hash.AddArray(Volt_dir, Volt_Count);
+	hash.AddArray(Volt_amp, Volt_Count);
+	hash.AddArray(Volt_delay, Volt_Count);
+
+	hash.AddValue((uint64_t)Curr_Count);
+	for (int n=0; n<3; ++n)
+		hash.AddValue((uint64_t)Curr_Count_Dir[n]);
+	for (int n=0; n<3; ++n)
+		hash.AddArray(Curr_index[n], Curr_Count);
+	hash.AddArray(Curr_dir, Curr_Count);
+	hash.AddArray(Curr_amp, Curr_Count);
+	hash.AddArray(Curr_delay, Curr_Count);
+	return hash.Hex();
+}
+
+std::string Operator_Ext_Excitation::FingerprintNote() const
+{
+	return std::to_string(Volt_Count) + " volt, " + std::to_string(Curr_Count) + " curr";
 }
 
 void Operator_Ext_Excitation::ShowStat(std::ostream &ostr)  const

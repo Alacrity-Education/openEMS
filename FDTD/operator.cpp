@@ -18,12 +18,14 @@
 #include <fstream>
 #include <algorithm>
 #include <stdexcept>
+#include <chrono>
 #include "operator.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
 #include "Common/processfields.h"
 #include "tools/vtk_file_writer.h"
+#include "tools/fingerprint.h"
 #include "fparser.hh"
 #include "extensions/operator_ext_excitation.h"
 
@@ -985,13 +987,90 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 	}
 }
 
+namespace
+{
+//! Wall clock timer for the phases of CalcECOperator, active with OPENEMS_SETUP_TIMES=1 or verbose level 2
+class SetupTimer
+{
+public:
+	SetupTimer()
+	{
+		m_on = EnvOn() || (g_settings.GetVerboseLevel()>1);
+		if (m_on)
+			m_total = m_lap = std::chrono::steady_clock::now();
+	}
+
+	//! Print the time since the last lap (or the start) as the phase \a name
+	void Lap(const std::string& name, unsigned int threads=1)
+	{
+		if (!m_on)
+			return;
+		std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+		cout << "Setup time: " << name << " " << Format(now - m_lap) << " s (" << threads << (threads==1 ? " thread)" : " threads)") << endl;
+		m_lap = std::chrono::steady_clock::now();
+	}
+
+	void Total()
+	{
+		if (!m_on)
+			return;
+		cout << "Setup time: CalcECOperator total " << Format(std::chrono::steady_clock::now() - m_total) << " s" << endl;
+	}
+
+private:
+	static bool EnvOn()
+	{
+		static const bool on = FNVHash::EnvOn("OPENEMS_SETUP_TIMES");
+		return on;
+	}
+
+	static std::string Format(std::chrono::steady_clock::duration d)
+	{
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.3f", std::chrono::duration<double>(d).count());
+		return std::string(buf);
+	}
+
+	bool m_on;
+	std::chrono::steady_clock::time_point m_total, m_lap;
+};
+}
+
+//! Hash of one whole operator array in the stored order of ArrayNIJK (n, i, j, k), OPENEMS_OPERATOR_FINGERPRINT=1
+/*!
+	The raw bytes of the array if the operator holds it as an ArrayNIJK; the operators with a packed layout
+	(Operator_sse and derived) are read through the virtual accessor in the same order, which gives the same hash.
+*/
+static std::string HashOperatorArray(const Operator* op, const ArrayLib::ArrayNIJK<FDTD_FLOAT>* arr,
+	FDTD_FLOAT (Operator::*get)(unsigned int, unsigned int, unsigned int, unsigned int) const, const unsigned int numLines[3])
+{
+	FNVHash hash;
+	if (arr!=NULL)
+		hash.AddBytes(arr->data(), arr->size()*sizeof(FDTD_FLOAT));
+	else
+		for (unsigned int n=0; n<3; ++n)
+			for (unsigned int i=0; i<numLines[0]; ++i)
+				for (unsigned int j=0; j<numLines[1]; ++j)
+					for (unsigned int k=0; k<numLines[2]; ++k)
+					{
+						FDTD_FLOAT val = (op->*get)(n, i, j, k);
+						hash.AddBytes(&val, sizeof(val));
+					}
+	return hash.Hex();
+}
+
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	SetupTimer timer;
+
 	Init_EC();
+	timer.Lap("Init_EC");
 	InitDataStorage();
+	timer.Lap("InitDataStorage");
 
 	if (Calc_EC()==0)
 		return -1;
+	timer.Lap("Calc_EC", SetupThreads());
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -1010,6 +1089,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 	else
 		CalcTimestep();
+	timer.Lap("CalcTimestep");
 
 	dT*=m_TimeStepFactor;
 
@@ -1024,6 +1104,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	m_Exc->Reset(dT);
 
 	InitOperator();
+	timer.Lap("InitOperator");
 
 	unsigned int pos[3];
 
@@ -1041,6 +1122,8 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		}
 	}
 
+	timer.Lap("coefficients");
+
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
 	//make an exception for BC == -1
@@ -1048,20 +1131,27 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		if (m_BC[n]==-1)
 			PEC[n] = false;
 	ApplyElectricBC(PEC);
+	timer.Lap("ApplyElectricBC");
 
 	CalcPEC();
+	timer.Lap("CalcPEC", SetupThreads());
 
 	Calc_LumpedElements();
+	timer.Lap("Calc_LumpedElements");
 
 	bool PMC[6];
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
 	ApplyMagneticBC(PMC);
+	timer.Lap("ApplyMagneticBC");
 
 	//all information available for extension... create now...
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
+	{
 		if (m_Op_exts.at(n)->BuildExtension()==false)
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
+		timer.Lap("ext '" + m_Op_exts.at(n)->GetExtensionName() + "'");
+	}
 
 	//remove inactive extensions
 	std::vector<Operator_Extension*>::iterator it = m_Op_exts.begin();
@@ -1074,6 +1164,25 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		}
 		else
 			++it;
+	}
+
+	if (FNVHash::Enabled())
+	{
+		FNVHash hash_dT;
+		hash_dT.AddValue(dT);
+		cout << "Operator fingerprint: cells " << ((unsigned long long)numLines[0]*numLines[1]*numLines[2])
+			<< " dT " << hash_dT.Hex() << " vv " << HashOperatorArray(this, vv_ptr, &Operator::GetVV, numLines) << " vi " << HashOperatorArray(this, vi_ptr, &Operator::GetVI, numLines)
+			<< " ii " << HashOperatorArray(this, ii_ptr, &Operator::GetII, numLines) << " iv " << HashOperatorArray(this, iv_ptr, &Operator::GetIV, numLines)
+			<< " PEC " << m_Nr_PEC[0] << "/" << m_Nr_PEC[1] << "/" << m_Nr_PEC[2] << endl;
+		for (size_t n=0; n<m_Op_exts.size(); ++n)
+		{
+			std::string fp = m_Op_exts.at(n)->Fingerprint();
+			std::string note = m_Op_exts.at(n)->FingerprintNote();
+			cout << "Operator fingerprint: ext '" << m_Op_exts.at(n)->GetExtensionName() << "' " << fp;
+			if (note.empty()==false)
+				cout << " (" << note << ")";
+			cout << endl;
+		}
 	}
 
 	if (debugFlags & debugMaterial)
@@ -1096,6 +1205,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		EC_R[n]=NULL;
 	}
 
+	timer.Total();
 	return 0;
 }
 
