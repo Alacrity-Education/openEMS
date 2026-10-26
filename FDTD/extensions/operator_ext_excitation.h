@@ -52,6 +52,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 	virtual void Init();
 	virtual void Reset();
 

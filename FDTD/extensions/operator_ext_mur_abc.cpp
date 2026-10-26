@@ -19,6 +19,7 @@
 #include "engine_ext_mur_abc.h"
 
 #include "CSPropMaterial.h"
+#include "tools/fingerprint.h"
 
 using std::cerr;
 using std::endl;
@@ -189,6 +190,26 @@ Engine_Extension* Operator_Ext_Mur_ABC::CreateEngineExtention()
 	return eng_ext;
 }
 
+
+std::string Operator_Ext_Mur_ABC::Fingerprint() const
+{
+	FNVHash hash;
+	hash.AddValue((int32_t)m_ny);
+	hash.AddValue((int32_t)m_nyP);
+	hash.AddValue((int32_t)m_nyPP);
+	hash.AddValue((uint32_t)m_LineNr);
+	hash.AddValue((int32_t)m_LineNr_Shift);
+	hash.AddValue((uint32_t)m_numLines[0]);
+	hash.AddValue((uint32_t)m_numLines[1]);
+	hash.AddArray(m_Mur_Coeff_nyP.data(), m_Mur_Coeff_nyP.size());
+	hash.AddArray(m_Mur_Coeff_nyPP.data(), m_Mur_Coeff_nyPP.size());
+	return hash.Hex();
+}
+
+std::string Operator_Ext_Mur_ABC::FingerprintNote() const
+{
+	return "ny " + std::to_string(m_ny) + " line " + std::to_string(m_LineNr) + ", " + std::to_string(m_numLines[0]) + "x" + std::to_string(m_numLines[1]) + " cells";
+}
 
 void Operator_Ext_Mur_ABC::ShowStat(std::ostream &ostr)  const
 {

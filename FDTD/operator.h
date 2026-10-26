@@ -345,6 +345,8 @@ protected:
 	//EC elements, internal only!
 	virtual void Init_EC();
 	virtual bool Calc_EC();
+	//! Number of threads the (threaded) Calc_EC and CalcPEC use, reported in the OPENEMS_SETUP_TIMES lines
+	virtual unsigned int SetupThreads() const {return 1;}
 	virtual void Calc_EC_Range(unsigned int xStart, unsigned int xStop);
 	FDTD_FLOAT* EC_C[3];
 	FDTD_FLOAT* EC_G[3];

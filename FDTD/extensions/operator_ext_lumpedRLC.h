@@ -57,6 +57,9 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual std::string Fingerprint() const;
+	virtual std::string FingerprintNote() const;
+
 	virtual bool IsLElumpedRLC(const CSPropLumpedElement* const p_prop);
 
 protected:

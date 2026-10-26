@@ -50,6 +50,7 @@ protected:
 	  */
 	virtual bool Calc_EC();
 	virtual bool CalcPEC();
+	virtual unsigned int SetupThreads() const;
 
 	//! x line ranges of the threads, at most one per available CPU, bounds inclusive
 	void ThreadRanges(std::vector<unsigned int>& start, std::vector<unsigned int>& stop) const;

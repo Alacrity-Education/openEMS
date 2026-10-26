@@ -19,6 +19,7 @@
 #include "FDTD/operator_cylindermultigrid.h"
 #include "engine_ext_upml.h"
 #include "fparser.hh"
+#include "tools/fingerprint.h"
 
 using namespace std;
 
@@ -448,6 +449,29 @@ Engine_Extension* Operator_Ext_UPML::CreateEngineExtention()
 {
 	Engine_Ext_UPML* eng_ext = new Engine_Ext_UPML(this);
 	return eng_ext;
+}
+
+std::string Operator_Ext_UPML::Fingerprint() const
+{
+	FNVHash hash;
+	for (int n=0; n<3; ++n)
+	{
+		hash.AddValue((uint32_t)m_StartPos[n]);
+		hash.AddValue((uint32_t)m_numLines[n]);
+	}
+	hash.AddArray(vv.data(), vv.size());
+	hash.AddArray(vvfo.data(), vvfo.size());
+	hash.AddArray(vvfn.data(), vvfn.size());
+	hash.AddArray(ii.data(), ii.size());
+	hash.AddArray(iifo.data(), iifo.size());
+	hash.AddArray(iifn.data(), iifn.size());
+	return hash.Hex();
+}
+
+std::string Operator_Ext_UPML::FingerprintNote() const
+{
+	return "range [" + std::to_string(m_StartPos[0]) + "," + std::to_string(m_StartPos[1]) + "," + std::to_string(m_StartPos[2]) + "] size "
+		+ std::to_string(m_numLines[0]) + "x" + std::to_string(m_numLines[1]) + "x" + std::to_string(m_numLines[2]);
 }
 
 void Operator_Ext_UPML::ShowStat(ostream &ostr)  const

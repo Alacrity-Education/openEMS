@@ -22,6 +22,8 @@
 #include "operator_extension.h"
 #include "vector"
 
+class FNVHash;
+
 //! Abstract base class for all dispersive material models, based on an ADE (additional differential equation)
 class Operator_Ext_Dispersive : public Operator_Extension
 {
@@ -57,6 +59,9 @@ protected:
 
 	bool *m_curr_ADE_On;
 	bool *m_volt_ADE_On;
+
+	//! Add the state of this base class to a fingerprint: the order, the counts, the ADE flags and the position lists
+	void FingerprintBase(FNVHash& hash) const;
 };
 
 #endif // OPERATOR_EXT_DISPERSIVE_H

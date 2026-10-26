@@ -16,6 +16,7 @@
 */
 
 #include "operator_ext_debyematerial.h"
+#include "tools/fingerprint.h"
 #include "engine_ext_debyematerial.h"
 #include "operator_ext_cylinder.h"
 #include "../operator_cylinder.h"
@@ -276,6 +277,29 @@ bool Operator_Ext_DebyeMaterial::BuildExtension()
 Engine_Extension* Operator_Ext_DebyeMaterial::CreateEngineExtention()
 {
 	return new Engine_Ext_DebyeMaterial(this);
+}
+
+std::string Operator_Ext_DebyeMaterial::Fingerprint() const
+{
+	FNVHash hash;
+	FingerprintBase(hash);
+	hash.AddValue((int32_t)m_PoleCount);
+	size_t count = m_LM_Count.empty() ? 0 : m_LM_Count[0];
+	for (int n=0; n<3; ++n)
+		hash.AddArray(v_solve_ADE ? v_solve_ADE[n] : NULL, count);
+	for (int o=0; o<m_PoleCount; ++o)
+		for (int n=0; n<3; ++n)
+		{
+			hash.AddArray(v_relax_ADE ? v_relax_ADE[o][n] : NULL, count);
+			hash.AddArray(v_drive_ADE ? v_drive_ADE[o][n] : NULL, count);
+		}
+	return hash.Hex();
+}
+
+std::string Operator_Ext_DebyeMaterial::FingerprintNote() const
+{
+	size_t count = m_LM_Count.empty() ? 0 : m_LM_Count[0];
+	return std::to_string(m_PoleCount) + " poles, " + std::to_string(count) + " positions";
 }
 
 void Operator_Ext_DebyeMaterial::ShowStat(std::ostream &ostr)  const

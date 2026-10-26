@@ -27,6 +27,7 @@
 #include "CSPrimBox.h"
 #include "CSProperties.h"
 #include "CSPropLumpedElement.h"
+#include "tools/fingerprint.h"
 
 #define COPY_V2A(V,A) std::copy(V.begin(),V.end(),A)
 
@@ -503,6 +504,31 @@ Engine_Extension* Operator_Ext_LumpedRLC::CreateEngineExtention()
 {
 	Engine_Ext_LumpedRLC* eng_ext_RLC = new Engine_Ext_LumpedRLC(this);
 	return eng_ext_RLC;
+}
+
+std::string Operator_Ext_LumpedRLC::Fingerprint() const
+{
+	FNVHash hash;
+	hash.AddValue((uint64_t)RLC_count);
+	size_t count = RLC_count;
+	hash.AddArray(v_RLC_ilv, count);
+	hash.AddArray(v_RLC_i2v, count);
+	hash.AddArray(v_RLC_vv2, count);
+	hash.AddArray(v_RLC_vj1, count);
+	hash.AddArray(v_RLC_vj2, count);
+	hash.AddArray(v_RLC_vvd, count);
+	hash.AddArray(v_RLC_ib0, count);
+	hash.AddArray(v_RLC_b1, count);
+	hash.AddArray(v_RLC_b2, count);
+	hash.AddArray(v_RLC_dir, count);
+	for (int n=0; n<3; ++n)
+		hash.AddArray(v_RLC_pos ? v_RLC_pos[n] : NULL, count);
+	return hash.Hex();
+}
+
+std::string Operator_Ext_LumpedRLC::FingerprintNote() const
+{
+	return std::to_string(RLC_count) + " positions";
 }
 
 void Operator_Ext_LumpedRLC::ShowStat(std::ostream &ostr)  const
