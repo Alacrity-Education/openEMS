@@ -215,17 +215,19 @@ bool GPU_Backend_Reference::SetupOperator(const GPU_SetupModel& model, GPU_Setup
 	for (pos[0]=0; pos[0]<v.numLines[0]; ++pos[0])
 		for (pos[1]=0; pos[1]<v.numLines[1]; ++pos[1])
 		{
-			// the column lists: the filter of Operator::GetPrimitivesBoundBox (operator.cpp 2123) on the lists of the pass, order preserved
-			double boundBox[6];
+			// the column lists: the filter of Operator::GetPrimitivesBoundBox (operator.cpp 2083) on the lists of the pass and its
+			// prefilter on the query box, order preserved
+			double boundBox[6], queryBox[6];
 			GPU_Setup::ColumnBox(v, pos[0], pos[1], boundBox);
+			GPU_Setup::QueryBox(v, pos[0], pos[1], queryBox);
 			matCol.clear();
 			for (int j=0; j<v.matCount; ++j)
-				if (GPU_Setup::InsideBox(v.primitives[v.matList[j]], boundBox)>=0)
+				if ((GPU_Setup::InsideBox(v.primitives[v.matList[j]], boundBox)>=0) && GPU_Setup::MayContain(v.primitives[v.matList[j]], queryBox, v.tol))
 					matCol.push_back(v.matList[j]);
 			edgeCol.clear();
 			edgeIdx.clear();
 			for (int j=0; j<v.edgeCount; ++j)
-				if (GPU_Setup::InsideBox(v.primitives[v.edgeList[j]], boundBox)>=0)
+				if ((GPU_Setup::InsideBox(v.primitives[v.edgeList[j]], boundBox)>=0) && GPU_Setup::MayContain(v.primitives[v.edgeList[j]], queryBox, v.tol))
 				{
 					edgeCol.push_back(v.edgeList[j]);
 					edgeIdx.push_back(j);

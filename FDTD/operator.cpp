@@ -34,6 +34,8 @@
 #include "extensions/operator_ext_excitation.h"
 
 #include "CSPrimBox.h"
+#include "CSPrimPolygon.h"
+#include "CSPrimLinPoly.h"
 #include "CSPrimCurve.h"
 
 #include "CSPropMaterial.h"
@@ -2090,10 +2092,13 @@ Operator::GetPrimitivesBoundBox(
 
 	if (m_PassPrims_On && (m_PassPrims_Type==type))
 	{
-		// the list of the pass is what GetPrimitivesByBoundBox sorts on every call, filtered by the same rule
+		// the list of the pass is what GetPrimitivesByBoundBox sorts on every call, filtered by the same rule, then
+		// without the primitives that no point the pass queries in this column can be inside (the first hit is the same)
+		double queryBox[6];
+		PassQueryBox(posX, posY, posZ, queryBox);
 		std::vector<CSPrimitives*> vPrim;
 		for (size_t j=0;j<m_PassPrims.size();++j)
-			if (m_PassPrims.at(j)->IsInsideBox(boundBox)>=0)
+			if ((m_PassPrims.at(j)->IsInsideBox(boundBox)>=0) && (PassPrimOutside(j, queryBox)==false))
 				vPrim.push_back(m_PassPrims.at(j));
 		return vPrim;
 	}
@@ -2120,15 +2125,39 @@ void Operator::PrimitivesBoundBox(int posX, int posY, int posZ, double boundBox[
 	}
 }
 
+void Operator::PassQueryBox(int posX, int posY, int posZ, double queryBox[6]) const
+{
+	// every point the passes query in the column lies in PrimitivesBoundBox() except the dual line of the last line
+	// (GetYeeCoords and the cell centre average at pos numLines-1): there the box ends at that dual line
+	PrimitivesBoundBox(posX, posY, posZ, queryBox);
+	int BBpos[3] = {posX, posY, posZ};
+	for (int n=0;n<3;++n)
+		if ((BBpos[n]<0) || (BBpos[n]+1>=int(numLines[n])-1))
+			queryBox[2*n+1] = this->GetDiscLine(n, numLines[n]-1, true);
+}
+
+bool Operator::PassPrimOutside(size_t j, const double queryBox[6]) const
+{
+	if ((j>=m_PassPrimsCut.size()) || (m_PassPrimsCut[j]==0))
+		return false;
+	const double* reach = &m_PassPrimsReach[6*j];
+	for (int n=0;n<3;++n)
+		if ((queryBox[2*n+1]<reach[2*n]) || (queryBox[2*n]>reach[2*n+1]))
+			return true;
+	return false;
+}
+
 std::vector<CSPrimitives*> Operator::GetFirstHitBoundBox(int posX, int posY, int posZ, std::vector<int32_t>& index) const
 {
 	// the filter of GetPrimitivesBoundBox() on the pass list, keeping the index of every entry into the full list
 	double boundBox[6];
 	PrimitivesBoundBox(posX, posY, posZ, boundBox);
+	double queryBox[6];
+	PassQueryBox(posX, posY, posZ, queryBox);
 	std::vector<CSPrimitives*> vPrim;
 	index.clear();
 	for (size_t j=0;j<m_FirstHitPrims.size();++j)
-		if (m_FirstHitPrims.at(j)->IsInsideBox(boundBox)>=0)
+		if ((m_FirstHitPrims.at(j)->IsInsideBox(boundBox)>=0) && (PassPrimOutside(j, queryBox)==false))
 		{
 			vPrim.push_back(m_FirstHitPrims.at(j));
 			index.push_back((int32_t)j);
@@ -2167,6 +2196,55 @@ void Operator::BeginPassPrimitives(CSProperties::PropertyType type)
 	m_PassPrims = CSX->GetAllPrimitives(true, type);
 	m_PassPrims_Type = type;
 	m_PassPrims_On = true;
+
+	// the prefilter: per primitive the range outside which its own IsInside(p, tol) is false, read here on the main thread
+	m_PassPrimsCut.assign(m_PassPrims.size(), 0);
+	m_PassPrimsReach.assign(6*m_PassPrims.size(), 0.0);
+	if ((m_MeshType!=CARTESIAN) || (numLines[0]<2) || (numLines[1]<2) || (numLines[2]<2))
+		return;
+	double tol = CSX->GetDrawingTolerance();
+	for (size_t j=0;j<m_PassPrims.size();++j)
+	{
+		CSPrimitives* prim = m_PassPrims.at(j);
+		if (prim->HasTransform() || (prim->GetCoordInputType()!=CARTESIAN))
+			continue;
+		if ((prim->GetCoordinateSystem()!=CARTESIAN) && (prim->GetCoordinateSystem()!=UNDEFINED_CS))
+			continue;
+		double* reach = &m_PassPrimsReach[6*j];
+		CSPrimBox* box = (prim->GetType()==CSPrimitives::BOX) ? dynamic_cast<CSPrimBox*>(prim) : NULL;
+		CSPrimPolygon* poly = NULL;
+		if (prim->GetType()==CSPrimitives::POLYGON)
+			poly = dynamic_cast<CSPrimPolygon*>(prim);
+		else if (prim->GetType()==CSPrimitives::LINPOLY)
+			poly = dynamic_cast<CSPrimLinPoly*>(prim);
+		if (box)
+		{
+			// CSPrimBox::IsInside -> CoordInRange: false if p[n]<std::min(start[n],stop[n])-tol or p[n]>std::max(start[n],stop[n])+tol
+			const double* start = box->GetStartCoord()->GetCoords(prim->GetCoordinateSystem());
+			const double* stop = box->GetStopCoord()->GetCoords(prim->GetCoordinateSystem());
+			for (int n=0;n<3;++n)
+			{
+				reach[2*n] = std::min(start[n],stop[n])-tol;
+				reach[2*n+1] = std::max(start[n],stop[n])+tol;
+			}
+			m_PassPrimsCut[j] = 1;
+		}
+		else if (poly)
+		{
+			// CSPrimPolygon::IsInside (also for CSPrimLinPoly): false if m_BoundBox[2n]-tol>p[n] or m_BoundBox[2n+1]+tol<p[n],
+			// m_BoundBox as Update() stored it from GetBoundBox() (GetDimension() runs the lazy Update() of IsInside); with
+			// fewer than two coordinates IsInside is always false and the values do not matter
+			prim->GetDimension();
+			double bb[6];
+			prim->GetBoundBox(bb);
+			for (int n=0;n<3;++n)
+			{
+				reach[2*n] = bb[2*n]-tol;
+				reach[2*n+1] = bb[2*n+1]+tol;
+			}
+			m_PassPrimsCut[j] = 1;
+		}
+	}
 }
 
 void Operator::EndPassPrimitives()
@@ -2174,6 +2252,10 @@ void Operator::EndPassPrimitives()
 	m_PassPrims_On = false;
 	m_PassPrims.clear();
 	m_PassPrims.shrink_to_fit();
+	m_PassPrimsCut.clear();
+	m_PassPrimsCut.shrink_to_fit();
+	m_PassPrimsReach.clear();
+	m_PassPrimsReach.shrink_to_fit();
 }
 
 void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
