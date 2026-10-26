@@ -217,7 +217,7 @@ bool Operator_GPU::Calc_EC_Device(bool verify, std::string& reason)
 	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 	if (m_Backend->SetupOperator(*model, result)==false)
 	{
-		reason = "backend " + m_Backend->GetName() + " has no setup entry";
+		reason = "backend " + m_Backend->GetName() + " declined the setup pass (no entry, or the model or the device memory does not fit)";
 		delete model;
 		return false;
 	}
