@@ -38,12 +38,30 @@ __global__ void ssd_record(const float* volt, float* records, const size_t* inde
 		records[n*P.length + P.rel_pos] = volt[index[n]];
 }
 
+// Windowed blocks (see GPU_Extension::LaunchInWindow()): rel_pos from the step *step_base + step_in_block,
+// the probes outside the window [x0,x1) x [y0,y1) skipped
+struct SSDWindow { const int* step_base; unsigned int step_in_block; unsigned int x0, x1, y0, y1; const unsigned int* x; const unsigned int* y; };
+
+__global__ void ssd_record_window(const float* volt, float* records, const size_t* index, SSDParam P, SSDWindow Win)
+{
+	const unsigned int n = blockIdx.x*blockDim.x + threadIdx.x;
+	if ((n>=P.count) || (Win.x[n]<Win.x0) || (Win.x[n]>=Win.x1) || (Win.y[n]<Win.y0) || (Win.y[n]>=Win.y1))
+		return;
+	const unsigned int TS = (unsigned int)(*Win.step_base) + Win.step_in_block;
+	records[n*P.length + TS%P.length] = volt[index[n]];
+}
+
 class HIP_Ext_SteadyState : public GPU_Extension
 {
 public:
 	HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_Ext_SteadyState* op_ext, Engine_Ext_SteadyState* eng_ext, Engine_GPU* eng);
 
 	virtual void Apply2Voltages();
+
+	virtual bool WindowCapable() const {return true;}
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
+	//! The check of Apply2Voltages() for timestep \a ts, which the windowed blocks cannot do per timestep (see EndOfBlock())
+	virtual void EndOfBlock(unsigned int ts);
 
 protected:
 	void CheckPeriod(unsigned int rel_pos);
@@ -55,6 +73,8 @@ protected:
 	unsigned int m_Count;        //!< number of probes
 	size_t* m_Index;             //!< flat NIJK index of the probed voltages
 	float* m_Records;            //!< [probe][2*period]: the two periods CheckPeriod() compares
+	unsigned int* m_X;           //!< x and y line of the probes, for the windows (OPENEMS_HIP_WINDOW only)
+	unsigned int* m_Y;
 	std::vector<float> m_HostRecords;
 };
 
@@ -73,6 +93,38 @@ HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_E
 	m_Index = d->Alloc<size_t>(index.size(), index.data());
 	m_HostRecords.resize(std::max(m_Count, 1u)*2*(size_t)m_Period);
 	m_Records = d->Alloc<float>(m_HostRecords.size());
+	m_X = m_Y = NULL;
+	if (d->window.on)
+	{
+		std::vector<unsigned int> x(std::max(m_Count, 1u), 0), y(std::max(m_Count, 1u), 0);
+		for (unsigned int n=0; n<m_Count; ++n)
+		{
+			x[n] = op_ext->m_E_probe_pos[0].at(n);
+			y[n] = op_ext->m_E_probe_pos[1].at(n);
+		}
+		m_X = d->Alloc<unsigned int>(x.size(), x.data());
+		m_Y = d->Alloc<unsigned int>(y.size(), y.data());
+	}
+}
+
+void HIP_Ext_SteadyState::LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	if ((phase!=GPU_WindowApplyVoltage) || (m_Count==0))
+		return;
+	const unsigned int p = m_Period;
+	const SSDParam param = {m_Count, 2*p, 0};
+	const SSDWindow win = {(const int*)d->step_base, step_in_block, x0, x1, y0, y1, (const unsigned int*)m_X, (const unsigned int*)m_Y};
+	HIP_Launch(d, "ssd_record_window", ssd_record_window, m_Count, 1, 1, (const float*)d->volt, m_Records, (const size_t*)m_Index, param, win);
+}
+
+// The check needs the records up to a period boundary and the energy, on the host: after the block. With blocks
+// of one timestep this is after the current update of the timestep, where Apply2Voltages() checks before it: the
+// records are the same, the energy has the currents of the next half-step.
+void HIP_Ext_SteadyState::EndOfBlock(unsigned int ts)
+{
+	const unsigned int p = m_Period;
+	if ((ts%p==0) && (ts>=2*p))
+		CheckPeriod(ts%(2*p));
 }
 
 void HIP_Ext_SteadyState::Apply2Voltages()
