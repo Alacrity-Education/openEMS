@@ -176,18 +176,26 @@ struct GPU_Backend_SYCL::Impl
 	SYCL_ZSlabs zslabs;
 	bool zslab_lo, zslab_hi;
 
-	//! Fused step (see update_fused, ported in task T20): voltages and currents of the main nodes in one pass, from the
+	//! Fused step (see update_fused): voltages and currents of the main nodes in one pass, from the
 	//! current fields (volt, curr) into the next buffers (volt_next, curr_next), swapped afterwards.
 	int fused_step;                          //!< -1: not decided yet, 0: off, 1: on
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
 	SYCL_FusedRegions fregions;              //!< the UPML regions in the kernel (see SYCL_Ext_UPML::CanFuse())
+	//! Device copies of fregions read by update_fused, two as the UPML hooks alternate the voltage flux buffers
+	//! (see FusedRegionsOnDevice()); fregions_up[k] is what fregions_dev[k] holds, if fregions_up_valid[k]
+	SYCL_FusedRegions* fregions_dev;
+	SYCL_FusedRegions fregions_up[2];
+	bool fregions_up_valid[2];
+	unsigned int fregions_up_next;           //!< the copy replaced next
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
 	bool index32;                            //!< the kernels index with 32 bit (see Init())
 	//! Decide once whether the fused step is used, and prepare it
 	bool DecideFusedStep();
+	//! The device copy of fregions (uploaded if it changed)
+	const SYCL_FusedRegions* FusedRegionsOnDevice();
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer
