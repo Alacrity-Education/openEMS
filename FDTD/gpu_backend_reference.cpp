@@ -19,6 +19,7 @@
 #include <stdexcept>
 
 #include "gpu_backend_reference.h"
+#include "gpu_setup_kernels.h"
 #include "operator.h"
 
 GPU_Backend_Reference::GPU_Backend_Reference()
@@ -176,4 +177,100 @@ void GPU_Backend_Reference::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>
 void GPU_Backend_Reference::UploadCurrents(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
 	CopyField(curr, m_curr);
+}
+
+bool GPU_Backend_Reference::SetupOperator(const GPU_SetupModel& model, GPU_SetupResult& result)
+{
+	// the model as the raw pointers a kernel gets
+	GPU_SetupView v;
+	for (int n=0; n<3; ++n)
+	{
+		v.numLines[n] = model.numLines[n];
+		v.lines[n] = model.lines[n].data();
+	}
+	v.gridDelta = model.gridDelta;
+	v.tol = model.tol;
+	for (int k=0; k<4; ++k)
+		v.bg[k] = model.bg[k];
+	v.properties = model.properties.data();
+	v.primitives = model.primitives.data();
+	v.vertices = model.vertices.data();
+	v.matList = model.matList.data();
+	v.matCount = (int)model.matList.size();
+	v.edgeList = model.edgeList.data();
+	v.edgeCount = (int)model.edgeList.size();
+
+	const size_t nx = v.numLines[0], ny = v.numLines[1], nz = v.numLines[2];
+	const size_t cells = nx*ny*nz;
+
+	for (size_t i=0; i<model.primitives.size(); ++i)
+		result.used[i] = 0;
+	result.nanCount = 0;
+	result.nanN = result.nanK = 0;
+	result.nanPos[0] = result.nanPos[1] = result.nanPos[2] = 0;
+
+	// one work-item per column (x, y), the loop order (x, y, z, n): the column lists, the samples and edge values, the first hits
+	std::vector<int> matCol, edgeCol, edgeIdx;
+	unsigned int pos[3];
+	for (pos[0]=0; pos[0]<v.numLines[0]; ++pos[0])
+		for (pos[1]=0; pos[1]<v.numLines[1]; ++pos[1])
+		{
+			// the column lists: the filter of Operator::GetPrimitivesBoundBox (operator.cpp 2123) on the lists of the pass, order preserved
+			double boundBox[6];
+			GPU_Setup::ColumnBox(v, pos[0], pos[1], boundBox);
+			matCol.clear();
+			for (int j=0; j<v.matCount; ++j)
+				if (GPU_Setup::InsideBox(v.primitives[v.matList[j]], boundBox)>=0)
+					matCol.push_back(v.matList[j]);
+			edgeCol.clear();
+			edgeIdx.clear();
+			for (int j=0; j<v.edgeCount; ++j)
+				if (GPU_Setup::InsideBox(v.primitives[v.edgeList[j]], boundBox)>=0)
+				{
+					edgeCol.push_back(v.edgeList[j]);
+					edgeIdx.push_back(j);
+				}
+
+			for (pos[2]=0; pos[2]<v.numLines[2]; ++pos[2])
+			{
+				const size_t c = pos[0] + nx*(pos[1] + ny*(size_t)pos[2]);
+				for (int n=0; n<3; ++n)
+				{
+					// Operator::Calc_ECPos (operator.cpp 1408)
+					double EffMat[4];
+					int badK = 0;
+					if (GPU_Setup::QuarterCell(v, n, pos, EffMat, matCol.data(), (int)matCol.size(), result.used, &badK)==false)
+					{
+						result.nanCount = 1;
+						result.nanN = n;
+						result.nanK = badK;
+						for (int k=0; k<3; ++k)
+							result.nanPos[k] = pos[k];
+						return true;
+					}
+					for (int k=0; k<4; ++k)
+						if (result.storage[k])
+							result.storage[k][n*cells + c] = EffMat[k];
+					double EC[4];
+					GPU_Setup::EdgeValues(v, n, pos, EffMat, EC);
+					for (int k=0; k<4; ++k)
+						result.EC[k][n*cells + c] = EC[k];
+				}
+				for (int n=0; n<3; ++n)
+				{
+					// Operator::CalcPEC_Range (operator.cpp 2441): the midpoint of the primal edge and the first primitive of the column list
+					double coord[3];
+					GPU_Setup::YeeCoords(v, n, pos, coord, false);
+					int i = GPU_Setup::FirstHit(v, coord, edgeCol.data(), (int)edgeCol.size());
+					int32_t hit = -1;
+					if (i>=0)
+					{
+						hit = edgeIdx[i];
+						result.used[edgeCol[i]] = 1;
+					}
+					result.firstHit[((n*nx + pos[0])*ny + pos[1])*nz + pos[2]] = hit;
+				}
+			}
+		}
+	return true;
 }
