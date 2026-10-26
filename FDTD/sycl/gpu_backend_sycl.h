@@ -61,8 +61,13 @@ public:
 
 	virtual bool DownloadRange(bool currents, size_t offset, size_t count, FDTD_FLOAT* dst);
 	virtual void Synchronize();
-	// SnapshotFields, WaitSnapshot, CanSnapshotGather, SetSnapshotGather, AddFieldDFT,
-	// AccumulateFieldDFT, ReadFieldDFT: the defaults of GPU_Backend for now (ported in task T18)
+	virtual bool SnapshotFields(const FDTD_FLOAT* &volt, const FDTD_FLOAT* &curr);
+	virtual void WaitSnapshot();
+	virtual bool CanSnapshotGather() const {return true;}
+	virtual bool SetSnapshotGather(const std::vector<Engine_GatherRegion>& volt_regions, const std::vector<Engine_GatherRegion>& curr_regions);
+	virtual int AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count);
+	virtual void AccumulateFieldDFT(int id, const std::vector<std::complex<float>>& weights);
+	virtual bool ReadFieldDFT(int id, unsigned int k, std::vector<std::complex<float>>& sums);
 	virtual bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy);
 
 	virtual GPU_Backend* NewSubGridBackend();
