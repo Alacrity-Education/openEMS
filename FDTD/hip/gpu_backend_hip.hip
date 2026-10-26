@@ -845,6 +845,14 @@ GPU_Backend_HIP::Impl::Impl()
 	window = HIP_ParseWindowKnob(NULL, 0);
 	window_used = false;
 	step_base = NULL;
+	window_ready = -1;
+	win_T = win_W = win_B = 0;
+	l2_bytes = 0;
+	coeff_table_bytes = 0;
+	launches = 0;
+	window_graphs_on = false;
+	window_logged = false;
+	window_steps = window_blocks = window_chunks = window_block_launches = 0;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -856,6 +864,11 @@ GPU_Backend_HIP::Impl::~Impl()
 		(void)hipStreamSynchronize(ctx->stream);
 		(void)hipStreamSynchronize(ctx->copy_stream);
 	}
+	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); ++it)
+		(void)hipGraphExecDestroy(it->second.exec);
+	if (window_steps && (g_settings.GetVerboseLevel()>1))
+		std::cout << "GPU_Backend_HIP: window: " << window_steps << " timesteps in " << window_chunks << " chunks, " << window_blocks
+		          << " blocks, " << window_graphs.size() << " graphs" << std::endl;
 	FreeSnapshots();
 	(void)hipEventDestroy(snap_evaluated);
 	(void)hipEventDestroy(snap_done);
@@ -1596,6 +1609,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	if (g_settings.GetVerboseLevel()>1)
 		std::cout << "GPU_Backend_HIP: " << prop.name << ": " << prop.multiProcessorCount << " multiprocessors, L2 cache "
 		          << prop.l2CacheSize/(1024*1024) << " MiB, warp size " << d->ctx->warp_size << std::endl;
+	d->l2_bytes = prop.l2CacheSize>0 ? (size_t)prop.l2CacheSize : 0;
 	int max_grid_z = prop.maxGridSize[2];
 	if ((max_grid_z>0) && (d->dim.nx>(unsigned int)max_grid_z))
 	{
@@ -1627,14 +1641,17 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 		d->step_base = d->Alloc<int>(1);
 
 	// upload the final operator coefficients, including all changes by operator extensions.
-	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
-	// every distinct set of the 12 coefficients of a node once and a set index per node
+	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store every distinct set of
+	// the 12 coefficients of a node once and a 16 or 32 bit set index per node. Where the sets do not pay
+	// (GPU_FindSets() refuses: too many distinct sets, e.g. a graded mesh with many spacings), the four full
+	// arrays below (48 bytes per node); the kernels read either form (coeff_mode, logged at verbose level 2)
 	GPU_CoeffSets sets;
 	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets, d->dim.nzd!=d->dim.nz);   // per node of the device layout
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		d->coeff_table_bytes = sets.table.size()*sizeof(float);
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
@@ -1752,7 +1769,8 @@ void GPU_Backend_HIP::UpdateCurrents()
 /************************** windowed blocks (OPENEMS_HIP_WINDOW) **************************/
 
 // The timestep of the block about to run, for the window-capable extensions (see GPU_Extension::LaunchInWindow()):
-// written on the work stream, so a captured block reads the value of its launch
+// written on the work stream before the block (outside a captured graph, whose arguments are frozen), so the
+// launches of the block read the value of its launch
 __global__ void set_step(int* step_base, int step)
 {
 	if (blockIdx.x*blockDim.x + threadIdx.x == 0)
@@ -1762,33 +1780,81 @@ __global__ void set_step(int* step_base, int step)
 GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx)
 {
 	GPU_Backend_HIP::Impl::WindowKnob k;
-	k.on = k.supported = false;
-	k.T = k.W = 0;
+	k.on = k.valid = k.automatic = false;
+	k.T = k.W = k.B = 0;
 	k.text = text ? text : "";
 	if (k.text.empty() || (k.text=="0"))
 		return k;
 	k.on = true;
-	// T,W[,B]: this build runs T = 1 with one window of the whole grid only
-	const size_t comma = k.text.find(',');
-	if ((comma==std::string::npos) || (k.text.find(',', comma+1)!=std::string::npos))
+	if (k.text=="auto")
+	{
+		k.valid = k.automatic = true;
+		k.T = 8;
 		return k;
-	const std::string t = k.text.substr(0, comma), w = k.text.substr(comma+1);
-	if (t!="1")
+	}
+	// T,W[,B]
+	std::vector<std::string> f;
+	std::string::size_type a = 0;
+	while (true)
+	{
+		const std::string::size_type b = k.text.find(',', a);
+		f.push_back(k.text.substr(a, b==std::string::npos ? std::string::npos : b-a));
+		if (b==std::string::npos)
+			break;
+		a = b+1;
+	}
+	auto number = [](const std::string& v, unsigned int& out)
+	{
+		if (v.empty() || (v.size()>9) || (v.find_first_not_of("0123456789")!=std::string::npos))
+			return false;
+		out = (unsigned int)atoi(v.c_str());
+		return true;
+	};
+	if ((f.size()<2) || (f.size()>3) || !number(f[0], k.T))
 		return k;
-	k.T = 1;
-	if (w=="NX")
+	if (f[1]=="NX")
 		k.W = nx;
-	else if (!w.empty() && (w.find_first_not_of("0123456789")==std::string::npos) && (w.size()<10))
-		k.W = (unsigned int)atoi(w.c_str());
-	k.supported = (k.W>0) && (k.W==nx);
+	else if (!number(f[1], k.W))
+		return k;
+	if ((f.size()==3) && !number(f[2], k.B))
+		return k;
+	k.valid = (k.T>0) && (k.T<=256) && (k.W>0);
 	return k;
 }
 
-void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes)
+{
+	if ((plane_bytes==0) || (nx==0))
+		return std::max(nx, 1u);
+	double budget = 0.65*(double)l2_bytes;
+	if ((double)table_bytes<budget/3)
+		budget -= (double)table_bytes;
+	const double w = std::floor(budget/(double)plane_bytes) - (2.0*T + 1);
+	const unsigned int W = (w<1) ? 1u : (unsigned int)std::min(w, (double)nx);
+	return std::max(1u, std::min(W, nx));
+}
+
+unsigned int GPU_Backend_HIP::Impl::MurActive(unsigned int ts) const
+{
+	unsigned int active = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (ts>=mur_planes[k].start_ts)
+			active |= 1u<<(2*mur_planes[k].ny + (mur_planes[k].line>0 ? 1 : 0));
+	return active;
+}
+
+unsigned int GPU_Backend_HIP::Impl::MurNextChange(unsigned int ts) const
+{
+	unsigned int next = UINT_MAX;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].start_ts>ts)
+			next = std::min(next, mur_planes[k].start_ts);
+	return next;
+}
+
+void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int mur_active)
 {
 	const bool c = coeff_mode>0;
-	DecideShape();      // as UpdateVoltages(): once, before DecideMurFused()
-	DecideMurFused();   // as UpdateVoltages(): once, after the pre hooks of the first timestep
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	MainRange(B, E, threads_z);
@@ -1796,6 +1862,38 @@ void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, uns
 	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
 	if ((E.nx<=B.nx) || (E.ny<=B.ny))
 		return;
+	if ((mur_mode==1) && mur_active)
+	{
+		// the launches of UpdateVoltages() on the window: update_voltages_inner on the main range cut to the window,
+		// which skips the nodes outside the box [S.L, S.H) as before, then mur_shell on the shell nodes inside the
+		// window: the box [S.B, S.E) and the inner box cut to the window (the same shell, intersected)
+		mur.active = mur_active;
+		HIP_MurShell S = mur_shell;
+		HIP_MurZFaces M = mur_zf;
+		if (mur_zf_on)
+		{
+			S.L.nz = main_start.nz;
+			S.H.nz = main_stop.nz;
+			M.active = (mur_active>>4) & 3u;
+			HIP_LaunchMain(this, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs, S, M);
+		}
+		else
+			HIP_LaunchMain(this, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs, S, M);
+		HIP_MurShell W = S;
+		W.B.nx = std::max(S.B.nx, x0); W.E.nx = std::min(S.E.nx, x1);
+		W.B.ny = std::max(S.B.ny, y0); W.E.ny = std::min(S.E.ny, y1);
+		if ((W.E.nx<=W.B.nx) || (W.E.ny<=W.B.ny))
+			return;
+		W.L.nx = std::min(std::max(S.L.nx, W.B.nx), W.E.nx); W.H.nx = std::min(std::max(S.H.nx, W.L.nx), W.E.nx);
+		W.L.ny = std::min(std::max(S.L.ny, W.B.ny), W.E.ny); W.H.ny = std::min(std::max(S.H.ny, W.L.ny), W.E.ny);
+		const size_t count = (size_t)(W.E.nx-W.B.nx)*(W.E.ny-W.B.ny)*(W.E.nz-W.B.nz) - (size_t)(W.H.nx-W.L.nx)*(W.H.ny-W.L.ny)*(W.H.nz-W.L.nz);
+		HIP_Launch(this, "mur_shell", ::mur_shell, count, 1, 1,
+		            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim,
+		            W, (const HIP_MurFace*)mur_dev, mur_active);
+		return;
+	}
 	HIP_LaunchMain(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs);
 }
@@ -1812,6 +1910,283 @@ void GPU_Backend_HIP::Impl::WindowCurrents(unsigned int x0, unsigned int x1, uns
 		return;
 	HIP_LaunchMain(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            curr, (const float*)volt, (const void*)index, (const float*)(c ? coeff : ii), (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, zslabs);
+}
+
+bool GPU_Backend_HIP::Impl::WindowPrepare()
+{
+	if (window_ready>=0)
+		return window_ready>0;
+	window_ready = 0;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// the decisions the single step makes in the hooks and the first voltage update, before anything is captured
+	for (size_t k=0; k<window_exts.size(); ++k)
+		if (HIP_WindowHooks* h = dynamic_cast<HIP_WindowHooks*>(window_exts[k]))
+			h->WindowPrepare();
+	DecideShape();
+	DecideMurFused();
+	if (!mur_planes.empty() && (mur_mode!=1))
+	{
+		// the three launches per plane of mode 0 work on whole planes: not in the windows
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: refused: the Mur planes are not in the voltage update (Mur fused: 0)" << std::endl;
+		window_used = false;
+		return false;
+	}
+	// plane bytes: the fields and the coefficient index (or the full coefficient arrays) of one x plane
+	const size_t plane_bytes = (size_t)dim.ny*dim.nzd*(24 + CoeffBytesPerNode());
+	if (window.automatic)
+	{
+		win_T = window.T;
+		win_W = HIP_WindowRule(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+	}
+	else
+	{
+		win_T = window.T;
+		win_W = std::min(window.W, dim.nx);
+	}
+	win_B = window.B;
+	// a V frontier must not fall between the line and the shift line of a Mur plane on an x face (the thread of the
+	// shift line writes the line, mur_volt_component): snapped down below both (see WindowFrontiers())
+	win_forbidden.clear();
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].ny==0)
+			for (unsigned int e=std::min(mur_planes[k].line, mur_planes[k].shift)+1; e<=std::max(mur_planes[k].line, mur_planes[k].shift); ++e)
+				win_forbidden.push_back(e);
+	window_graphs_on = !HIP_KernelTimes::Enabled();
+	if (verbose && (win_B>0))
+	{
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: B=" << win_B << " unused: the windows span all y lines (a slab of "
+		     << (4*win_T+1) << " planes is " << std::fixed << std::setprecision(1) << (4.0*win_T+1)*plane_bytes/1e6
+		     << " MB, L2 " << l2_bytes/(1024*1024) << " MiB)";
+		std::cout << line.str() << std::endl;
+	}
+	window_ready = 1;
+	return true;
+}
+
+void GPU_Backend_HIP::Impl::WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const
+{
+	// Frontiers along x of a window: after its launches of step b the voltages of the planes below eV[b] and the
+	// currents of the planes below eI[b] are at step b of the block. The voltage update of plane x reads the currents
+	// of x-1 and x, the current update of x the voltages of x and x+1 (none on the last plane): so eI[b] = eV[b] - 1
+	// (all planes once eV[b] = nx), and eV[b+1] = eI[b] (the voltages of b+1 need the currents of b of x-1 and x; the
+	// currents of b that read a voltage are done before it changes). The window's front F (eV[0]) steps back one plane
+	// per timestep; a frontier that would split a Mur pair (win_forbidden) is snapped down, which keeps both rules.
+	const long long nx = dim.nx;
+	auto snap = [&](long long e)
+	{
+		e = std::max(0LL, std::min(e, nx));
+		while ((e>0) && (std::find(win_forbidden.begin(), win_forbidden.end(), (unsigned int)e)!=win_forbidden.end()))
+			--e;
+		return (unsigned int)e;
+	};
+	eV.assign(L, 0);
+	eI.assign(L, 0);
+	for (unsigned int b=0; b<L; ++b)
+	{
+		const long long cand = (b==0) ? (long long)F : std::min((long long)F - b, (long long)eI[b-1]);
+		eV[b] = snap(cand);
+		eI[b] = (eV[b]>=nx) ? (unsigned int)nx : (eV[b]>0 ? eV[b]-1 : 0);
+	}
+}
+
+void GPU_Backend_HIP::Impl::WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host)
+{
+	// The windows march along x: window k covers the planes up to (k+1)*W at step 0 of the block, the last one all.
+	// Per window and step, the voltage half-step on the planes its V frontier newly covers, then the current half-step on
+	// those of its I frontier; each half-step in the hook order of Engine_GPU::VoltageHalfStep()/CurrentHalfStep() (pre
+	// in reverse, the update, post, apply), every hook restricted to the half-step's planes. A cell sees the operations
+	// of the single step in the same order; only the order across cells changes (see WindowFrontiers()).
+	const std::vector<GPU_Extension*>& X = window_exts;
+	const int count = (int)X.size();
+	const unsigned int nx = dim.nx, ny = dim.ny;
+	const unsigned int mur_active = (mur_mode==1) ? MurActive(ts) : 0;
+	HIP_WindowHooks* host_hooks = host ? dynamic_cast<HIP_WindowHooks*>(host) : NULL;
+	std::vector<unsigned int> pV(L, 0), pI(L, 0), eV, eI;
+	for (unsigned int k=0; ; ++k)
+	{
+		const unsigned long long Fk = (unsigned long long)(k+1)*W;
+		const bool last = Fk>=nx;
+		WindowFrontiers(last ? nx + L : (unsigned int)Fk, L, eV, eI);
+		for (unsigned int b=0; b<L; ++b)
+		{
+			if (eV[b]>pV[b])
+			{
+				const unsigned int x0 = pV[b], x1 = eV[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreVoltage, b, x0, x1, 0, ny);
+				WindowVoltages(x0, x1, 0, ny, mur_active);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostVoltage, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+				{
+					X[n]->LaunchInWindow(GPU_WindowApplyVoltage, b, x0, x1, 0, ny);
+					if (host_hooks && (X[n]==host))
+						host_hooks->HostStep(ts + b);
+				}
+			}
+			if (eI[b]>pI[b])
+			{
+				const unsigned int x0 = pI[b], x1 = eI[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreCurrent, b, x0, x1, 0, ny);
+				WindowCurrents(x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostCurrent, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowApplyCurrent, b, x0, x1, 0, ny);
+			}
+		}
+		pV = eV;
+		pI = eI;
+		if (last)
+			break;
+	}
+}
+
+void GPU_Backend_HIP::Impl::WindowRun(unsigned int start_ts, unsigned int n)
+{
+	if (n==0)
+		return;
+	const std::vector<GPU_Extension*>& X = window_exts;
+	std::vector<HIP_WindowHooks*> hooks(X.size(), NULL);
+	for (size_t k=0; k<X.size(); ++k)
+		hooks[k] = dynamic_cast<HIP_WindowHooks*>(X[k]);
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// capture a block of L timesteps from ts into a graph (its launches are recorded, not run); false if that fails
+	auto capture = [&](unsigned int ts, unsigned int L, WindowGraph& g)
+	{
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		const unsigned long long l0 = launches;
+		std::string what;
+		hipError_t err = hipStreamBeginCapture(Stream(), hipStreamCaptureModeThreadLocal);
+		if (err==hipSuccess)
+		{
+			try
+			{
+				WindowBlock(ts, L, win_W, NULL);
+			}
+			catch (const std::exception& e)
+			{
+				what = e.what();
+			}
+			hipGraph_t graph = NULL;
+			err = hipStreamEndCapture(Stream(), &graph);
+			if (what.empty() && (err!=hipSuccess))
+				what = std::string("hipStreamEndCapture: ") + hipGetErrorString(err);
+			if (what.empty())
+			{
+				err = hipGraphInstantiateWithFlags(&g.exec, graph, 0);
+				if (err!=hipSuccess)
+					what = std::string("hipGraphInstantiate: ") + hipGetErrorString(err);
+			}
+			if (graph)
+				(void)hipGraphDestroy(graph);
+		}
+		else
+			what = std::string("hipStreamBeginCapture: ") + hipGetErrorString(err);
+		(void)hipGetLastError();
+		if (!what.empty())
+		{
+			std::cout << "GPU_Backend_HIP: window: graph capture failed (" << what << "), the same launches without graphs" << std::endl;
+			window_graphs_on = false;
+			return false;
+		}
+		g.launches = launches - l0;
+		g.capture_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if (verbose && window_logged)
+		{
+			std::ostringstream line;
+			line << "GPU_Backend_HIP: window: graph " << window_graphs.size()+1 << " for blocks of " << L << " steps (" << g.launches
+			     << " launches, captured in " << std::fixed << std::setprecision(1) << g.capture_ms << " ms)";
+			std::cout << line.str() << std::endl;
+		}
+		return true;
+	};
+	unsigned int ts = start_ts;
+	const unsigned int end = start_ts + n;
+	while (ts<end)
+	{
+		// the next timestep an extension needs the host in (run alone, over the whole grid)
+		unsigned int host_ts = UINT_MAX;
+		GPU_Extension* host = NULL;
+		for (size_t k=0; k<X.size(); ++k)
+			if (hooks[k])
+			{
+				const unsigned int h = hooks[k]->NextHostStep(ts);
+				if (h<host_ts)
+				{
+					host_ts = h;
+					host = X[k];
+				}
+			}
+		HIP_Launch(this, "set_step", set_step, 1, 1, 1, step_base, (int)ts);
+		unsigned int L = 1;
+		if (host_ts==ts)
+			WindowBlock(ts, 1, dim.nx, host);
+		else
+		{
+			L = std::min(win_T, end - ts);
+			if (host_ts!=UINT_MAX)
+				L = std::min(L, host_ts - ts);
+			if (mur_mode==1)
+			{
+				const unsigned int change = MurNextChange(ts);
+				if (change!=UINT_MAX)
+					L = std::min(L, change - ts);   // the active Mur planes are an argument of the launches
+			}
+			bool done = false;
+			if (window_graphs_on)
+			{
+				std::vector<unsigned int> key(3);
+				key[0] = L;
+				key[1] = win_W;
+				key[2] = (mur_mode==1) ? MurActive(ts) : 0;
+				std::map<std::vector<unsigned int>, WindowGraph>::iterator it = window_graphs.find(key);
+				if ((it==window_graphs.end()) && (window_graphs.size()<32))
+				{
+					WindowGraph g;
+					if (capture(ts, L, g))
+						it = window_graphs.insert(std::make_pair(key, g)).first;
+				}
+				if (it!=window_graphs.end())
+				{
+					HIP_Check(hipGraphLaunch(it->second.exec, Stream()), "hipGraphLaunch");
+					done = true;
+				}
+			}
+			if (!done)
+			{
+				const unsigned long long l0 = launches;
+				WindowBlock(ts, L, win_W, NULL);
+				if (L==win_T)
+					window_block_launches = launches - l0;
+			}
+		}
+		for (size_t k=0; k<X.size(); ++k)
+			X[k]->EndOfBlock(ts + L - 1);
+		ts += L;
+		++window_blocks;
+	}
+	window_steps += n;
+	++window_chunks;
+}
+
+float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int n)
+{
+	hipEvent_t start = NULL, stop = NULL;
+	HIP_Check(hipEventCreate(&start), "hipEventCreate");
+	HIP_Check(hipEventCreate(&stop), "hipEventCreate");
+	HIP_Check(hipEventRecord(start, Stream()), "hipEventRecord");
+	WindowRun(start_ts, n);
+	HIP_Check(hipEventRecord(stop, Stream()), "hipEventRecord");
+	HIP_Check(hipEventSynchronize(stop), "hipEventSynchronize");
+	float ms = 0;
+	HIP_Check(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
+	(void)hipEventDestroy(start);
+	(void)hipEventDestroy(stop);
+	return ms;
 }
 
 bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal)
@@ -1831,10 +2206,10 @@ bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& ext
 			std::cout << "GPU_Backend_HIP: window: refused: " << refusal << std::endl;
 		return false;
 	}
-	if (!d->window.supported || (d->step_base==NULL))
+	if (!d->window.valid || (d->step_base==NULL))
 	{
 		if (verbose)
-			std::cout << "GPU_Backend_HIP: window: unsupported in this build, single-step" << std::endl;
+			std::cout << "GPU_Backend_HIP: window: invalid value " << d->window.text << " (0, auto or T,W[,B]), single-step" << std::endl;
 		return false;
 	}
 	for (size_t n=0; n<exts.size(); ++n)
@@ -1851,13 +2226,8 @@ bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& ext
 	const bool fused = (d->fused_step>0) || ((d->fused_step<0) && (d->fused_blockers==0) && !(fused_env && (atoi(fused_env)==0)));
 	if (d->fused_step<0)
 		d->fused_step = 0;
-	if (verbose)
-	{
-		std::cout << "GPU_Backend_HIP: window: T=" << d->window.T << " W=" << d->window.W << " (degenerate, " << exts.size()
-		          << " window-capable extensions)" << std::endl;
-		if (fused)
-			std::cout << "GPU_Backend_HIP: window: separate updates, the fused step is not used on the windowed path" << std::endl;
-	}
+	if (verbose && fused)
+		std::cout << "GPU_Backend_HIP: window: separate updates, the fused step is not used on the windowed path" << std::endl;
 	return true;
 }
 
@@ -1867,30 +2237,42 @@ bool GPU_Backend_HIP::IterateWindowed(unsigned int start_ts, unsigned int n)
 		return false;
 	if (d->fused_step>0)
 		return false;   // decided before the windowed blocks: the fields are in its double buffers
-	// T = 1, one window [0,nx) x [0,ny): the hooks in the order of Engine_GPU::VoltageHalfStep()/CurrentHalfStep()
-	const std::vector<GPU_Extension*>& X = d->window_exts;
-	const int count = (int)X.size();
-	const unsigned int nx = d->dim.nx, ny = d->dim.ny;
-	for (unsigned int s=0; s<n; ++s)
+	if (!d->WindowPrepare())
+		return false;
+	d->WindowRun(start_ts, n);
+	if (!d->window_logged && (g_settings.GetVerboseLevel()>1))
 	{
-		HIP_Launch(d, "set_step", set_step, 1, 1, 1, d->step_base, (int)(start_ts + s));
-		for (int k=count-1; k>=0; --k)
-			X[k]->LaunchInWindow(GPU_WindowPreVoltage, 0, 0, nx, 0, ny);
-		d->WindowVoltages(0, nx, 0, ny);
-		for (int k=0; k<count; ++k)
-			X[k]->LaunchInWindow(GPU_WindowPostVoltage, 0, 0, nx, 0, ny);
-		for (int k=0; k<count; ++k)
-			X[k]->LaunchInWindow(GPU_WindowApplyVoltage, 0, 0, nx, 0, ny);
-		for (int k=count-1; k>=0; --k)
-			X[k]->LaunchInWindow(GPU_WindowPreCurrent, 0, 0, nx, 0, ny);
-		d->WindowCurrents(0, nx, 0, ny);
-		for (int k=0; k<count; ++k)
-			X[k]->LaunchInWindow(GPU_WindowPostCurrent, 0, 0, nx, 0, ny);
-		for (int k=0; k<count; ++k)
-			X[k]->LaunchInWindow(GPU_WindowApplyCurrent, 0, 0, nx, 0, ny);
-		// the end of a block of one timestep
-		for (int k=0; k<count; ++k)
-			X[k]->EndOfBlock(start_ts + s);
+		// after the first chunk: the launches of a block of T steps (with its set_step), the graphs so far
+		d->window_logged = true;
+		// the launches per step of the longest block (a graph's, or the last block of T steps without one)
+		unsigned long long per_block = d->window_block_launches;
+		unsigned int per_len = d->win_T;
+		double capture_ms = 0;
+		for (std::map<std::vector<unsigned int>, Impl::WindowGraph>::const_iterator it=d->window_graphs.begin(); it!=d->window_graphs.end(); ++it)
+		{
+			if ((per_block==0) || (it->first[0]>per_len) || ((it->first[0]==per_len) && (it->second.launches>0)))
+			{
+				per_block = it->second.launches;
+				per_len = it->first[0];
+			}
+			capture_ms += it->second.capture_ms;
+		}
+		const unsigned int nx = d->dim.nx;
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: T=" << d->win_T << " W=" << d->win_W << " B=" << d->win_B << " planes=" << nx
+		     << " halo=" << d->win_T+1 << " windows=" << (nx + d->win_W - 1)/d->win_W << " launches/step=";
+		if (per_block)
+			line << std::fixed << std::setprecision(1) << (per_block + 1.0)/per_len;
+		else
+			line << "?";
+		line << " graphs=" << d->window_graphs.size();
+		if (!d->window_graphs.empty())
+			line << " (captured in " << std::fixed << std::setprecision(1) << capture_ms << " ms)";
+		else if (HIP_KernelTimes::Enabled())
+			line << " (kernel times: plain launches)";
+		line << " (" << (d->window.automatic ? "auto" : "forced") << ", " << d->dim.ny*(size_t)d->dim.nzd*(24 + d->CoeffBytesPerNode())
+		     << " bytes per plane, coefficient table " << d->coeff_table_bytes << " bytes, L2 " << d->l2_bytes/(1024*1024) << " MiB, " << d->window_exts.size() << " window-capable extensions)";
+		std::cout << line.str() << std::endl;
 	}
 	return true;
 }

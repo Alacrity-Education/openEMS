@@ -112,6 +112,7 @@ protected:
 		float* signal;
 		unsigned int* x;        //!< x and y line of the points, for the windows (OPENEMS_HIP_WINDOW only)
 		unsigned int* y;
+		unsigned int x_min, x_max;   //!< the x lines of the points: windows outside skip the launch
 	};
 
 	void Setup(Sources& s, unsigned int count, unsigned int* const index[3], const unsigned short* dir,
@@ -152,8 +153,15 @@ void HIP_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* con
 	s.count = count;
 	s.serial = false;
 	s.x = s.y = NULL;
+	s.x_min = UINT_MAX;
+	s.x_max = 0;
 	if (count==0)
 		return;
+	for (unsigned int n=0; n<count; ++n)
+	{
+		s.x_min = std::min(s.x_min, index[0][n]);
+		s.x_max = std::max(s.x_max, index[0][n]);
+	}
 
 	std::vector<size_t> flat(count);
 	std::set<size_t> edges;
@@ -210,7 +218,7 @@ ExcitationParam HIP_Ext_Excitation::Param(const Sources& s) const
 
 void HIP_Ext_Excitation::ApplyInWindow(Sources& s, float* field, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
 {
-	if (s.count==0)
+	if ((s.count==0) || (x1<=s.x_min) || (x0>s.x_max))
 		return;
 	const ExcitationParam param = Param(s);
 	const ExcitationWindow win = {(const int*)d->step_base, step_in_block, x0, x1, y0, y1, (const unsigned int*)s.x, (const unsigned int*)s.y};
