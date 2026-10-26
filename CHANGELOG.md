@@ -44,6 +44,14 @@ there are unreleased changes. It becomes the next release entry.
   RTX 5090 a PCB model of 28.7 Mcells with Mur on all six faces settles at
   8929 MC/s instead of 7963 (+12 %), a model of 3.1 Mcells at 10405 instead
   of 9758 (+6.6 %).
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are lanes of one warp and
+  exchange their values through warp shuffles (bit-identical; a grid with
+  fewer than 6 z lines, no Mur plane on a z face, or the two lines in
+  different warps keeps them in the shell launch). On an RTX 5090 the PCB
+  model settles at 12822 MC/s instead of 10602 with the z faces in the kernel
+  (2.24 ms a step instead of 2.71), the model of 3.1 Mcells at 11854 instead
+  of 10394.
 - The HIP backend runs conducting sheets that lie on z planes as dense state
   per sheet plane: one launch per half-step for all planes and both
   dispersion orders, the in-plane components only, instead of two launches
