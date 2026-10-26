@@ -34,6 +34,7 @@ add_library( openEMS_gpu_sycl MODULE
   sycl_ext_steadystate.cpp
   sycl_ext_cylinder.cpp
   sycl_multigrid.cpp
+  sycl_setup.cpp
   sycl_plugin.cpp
 )
 # installed to openEMS/plugins next to libopenEMS, where it is looked for; in the

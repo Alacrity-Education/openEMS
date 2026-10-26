@@ -49,6 +49,8 @@ public:
 	virtual std::string GetName() const;
 
 	virtual bool Init(const Operator* op);
+	//! The material pass on the device (see sycl_setup.cpp)
+	virtual bool SetupOperator(const GPU_SetupModel& model, GPU_SetupResult& result);
 
 	virtual void UpdateVoltages();
 	virtual void UpdateCurrents();
