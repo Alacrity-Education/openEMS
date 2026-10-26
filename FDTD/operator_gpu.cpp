@@ -95,6 +95,20 @@ bool Operator_GPU::Calc_EC()
 	return true;
 }
 
+void Operator_GPU::CalcTimestep_Var3_Search(Timestep_Min& tmin)
+{
+	std::vector<unsigned int> start, stop;
+	ThreadRanges(start, stop);
+	CalcTimestep_Var3_Slabs(start, stop, tmin);
+}
+
+void Operator_GPU::Calc_ECOperator_All()
+{
+	std::vector<unsigned int> start, stop;
+	ThreadRanges(start, stop);
+	Calc_ECOperator_Slabs(start, stop);
+}
+
 bool Operator_GPU::CalcPEC()
 {
 	std::vector<unsigned int> start, stop;

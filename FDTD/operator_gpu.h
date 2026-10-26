@@ -51,6 +51,9 @@ protected:
 	virtual bool Calc_EC();
 	virtual bool CalcPEC();
 	virtual unsigned int SetupThreads() const;
+	//! the timestep search and the coefficient loop over the same x line ranges
+	virtual void CalcTimestep_Var3_Search(Timestep_Min& tmin);
+	virtual void Calc_ECOperator_All();
 
 	//! x line ranges of the threads, at most one per available CPU, bounds inclusive
 	void ThreadRanges(std::vector<unsigned int>& start, std::vector<unsigned int>& stop) const;

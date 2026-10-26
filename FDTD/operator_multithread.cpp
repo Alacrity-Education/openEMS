@@ -164,6 +164,24 @@ bool Operator_Multithread::Calc_EC()
 	return true;
 }
 
+void Operator_Multithread::CalcTimestep_Var3_Search(Timestep_Min& tmin)
+{
+	// all x lines, as the serial search: the ranges of this class, not of an override that leaves lines out
+	unsigned int numThreads = m_numThreads;
+	std::vector<unsigned int> start, stop;
+	Operator_Multithread::CalcStartStopLines(numThreads, start, stop);
+	CalcTimestep_Var3_Slabs(start, stop, tmin);
+}
+
+void Operator_Multithread::Calc_ECOperator_All()
+{
+	// all x lines, as the serial loop: the ranges of this class, not of an override that leaves lines out
+	unsigned int numThreads = m_numThreads;
+	std::vector<unsigned int> start, stop;
+	Operator_Multithread::CalcStartStopLines(numThreads, start, stop);
+	Calc_ECOperator_Slabs(start, stop);
+}
+
 void Operator_Multithread::SkipBuildThreads()
 {
 	// the workers wait for the start of Calc_EC: let them pass, they end without building
