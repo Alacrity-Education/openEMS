@@ -304,7 +304,8 @@ struct GPU_Backend_HIP::Impl
 	{
 		bool on;              //!< set and not 0
 		bool valid;           //!< auto, or T,W[,B] with T, W > 0
-		bool automatic;       //!< auto: T = 8 and W from the L2 rule (see HIP_WindowRule())
+		bool automatic;       //!< auto or rule: T = 8 and W from the L2 rule (see HIP_WindowRule())
+		bool tune;            //!< auto: the tuner times candidates on the first timesteps (see WindowTune()); rule: not
 		unsigned int T, W, B; //!< forced; W: the grid's nx for "NX"; B (y-tile rows) is accepted and unused
 		std::string text;     //!< the value as set
 	};
@@ -334,6 +335,27 @@ struct GPU_Backend_HIP::Impl
 	bool window_logged;             //!< the schedule's line is printed (after the first chunk)
 	unsigned long long window_steps, window_blocks, window_chunks;
 	unsigned long long window_block_launches;   //!< the launches of the last block of T steps launched without a graph
+	//! where win_T, win_W come from, for the schedule's line: forced, rule, tuned, untuned
+	std::string win_source;
+	//! The tuner of auto (G7): candidates (T, W) timed on the live grid, on real timesteps (every candidate is
+	//! bit-identical, so the tune does not change the result); mcs < 0: not measured yet
+	struct WindowCandidate { unsigned int T, W; double mcs; };
+	std::vector<WindowCandidate> tune_cands;
+	int tune_state;                 //!< 0 not tuning (forced, rule or done), 1 the candidate list, 2 the refinement
+	unsigned int tune_chunks;       //!< chunks the tune has run in so far
+	unsigned int tune_rule_W;       //!< W of the rule (T = 8), the schedule while nothing is measured
+	unsigned long long tune_steps;  //!< timesteps the candidates ran (warm-up and timed blocks)
+	double tune_ms;                 //!< device time of the timed blocks
+	size_t tune_plane_bytes;        //!< plane bytes of the window rule (WindowPrepare())
+	//! The tuner's candidate list; in WindowPrepare() for auto
+	void WindowTunePrepare();
+	//! Run the tuner's candidates that fit into the chunk [start_ts, start_ts+n), each one warm-up block and two
+	//! timed blocks of its T; returns the timesteps used, the rest of the chunk runs with the best (T, W) so far
+	unsigned int WindowTune(unsigned int start_ts, unsigned int n);
+	//! The end of the tune: the best measured candidate (or the rule), logged
+	void WindowTuneFinish(bool complete);
+	//! Destroy the graphs of every W but \a keep_W (UINT_MAX: all)
+	void WindowDropGraphs(unsigned int keep_W);
 	//! The main voltage / current update of the nodes [x0,x1) x [y0,y1) (all z) for the windowed blocks:
 	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window, the Mur
 	//! planes of \a mur_active in the voltage update as UpdateVoltages() has them (mode 1 and 2)
@@ -492,13 +514,16 @@ void HIP_Launch(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_
 		HIP_KernelTimes::End(d->Stream(), name);
 }
 
-//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset) for a grid of \a nx x lines: unset or 0 off; auto; T,W[,B] with
-//! T, W > 0 (W may be the string NX: the grid's nx; B, the rows of a y tile, is accepted and not used). Anything
-//! else is on but not valid (the backend then steps one timestep at a time)
+//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset: HIP_WINDOW_DEFAULT) for a grid of \a nx x lines: 0 off; auto (the
+//! rule, then the tuner); rule (the rule alone); T,W[,B] with T, W > 0 (W may be the string NX: the grid's nx; B, the
+//! rows of a y tile, is accepted and not used). Anything else is on but not valid (the backend then steps one timestep
+//! at a time)
 GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx);
-//! The window rule of auto: W = (0.65 * L2 - table) / plane_bytes - (2T + 1), at least 1, at most nx; the coefficient table
-//! (read by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway
-unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes);
+//! The window rule: W = (margin * L2 - table) / plane_bytes - halo, at least 1, at most nx; the coefficient table (read
+//! by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway. auto starts
+//! from margin 0.65 and halo 0, which means 2T + 1 planes; the schedule's true halo is T + 1 planes
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
+                            double margin = 0.65, unsigned int halo = 0);
 
 //! What the windowed schedule needs of a window-capable HIP extension besides GPU_Extension::LaunchInWindow()
 class HIP_WindowHooks

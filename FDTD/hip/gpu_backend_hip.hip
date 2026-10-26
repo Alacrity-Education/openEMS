@@ -15,6 +15,50 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/*
+ * Environment knobs of the HIP backend (read once when a grid is set up; --verbose=2 prints the decisions).
+ * Every knob changes how the backend computes, never what: unless a knob says otherwise its settings are
+ * bit-identical to each other. Speeds are from an RTX 5090: "PCB" is a PCB model of 28.7 Mcells (921 x 708 x
+ * 44, Mur on six faces, four copper sheet planes), "small PCB" a model of 3.06 Mcells (337 x 227 x 40, Mur,
+ * four sheet planes).
+ *
+ * OPENEMS_HIP_WINDOW = auto (default) | 0 | rule | T,W[,B]
+ *     The timesteps as blocks of T steps marched along x in windows of W x planes that stay in the L2 cache, each
+ *     block captured once as a graph and replayed; the voltage and current frontiers step back one plane per step,
+ *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (2T+1)), then the tuner
+ *     times up to 12 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2) and refines the three best with W -/+25 %
+ *     on the first timesteps of the run (real timesteps: every candidate is bit-identical) and keeps the fastest;
+ *     every run tunes. rule: the rule without the tuner.
+ *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
+ *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
+ *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
+ *     covers all of x (bench pml S: 23839 MC/s fused against 19406 windowed). PCB: 22944 MC/s with the rule (T 8, W 34) against 13877 single-step (+65 %); small PCB: 21806
+ *     against 13901 (+57 %), tuned (T 16, W 193) 23906 against the rule's 21870 (+9.3 %).
+ * OPENEMS_HIP_ZPAD = auto (default) | 0
+ *     The z stride of the device layout rounded up to 64, so that every z line starts on the same alignment. auto: on
+ *     grids where the fused step is blocked, unless that more than doubles the z lines or the padded fields and
+ *     coefficients would take more than half of the free device memory; 0: off.
+ * OPENEMS_HIP_SHAPE = auto (default) | 0
+ *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep,
+ *     0 the former block. ZPAD and SHAPE together: small PCB 10226 to 11572 MC/s (+13 %), the PCB
+ *     12822 to 13877 (+8.2 %).
+ * OPENEMS_HIP_INDEX = 32 | 64
+ *     The index width of the fused step; default 32 on NVIDIA where the grid fits (V100: 64 registers against 126,
+ *     half the occupancy with 64), 64 on AMD.
+ * OPENEMS_HIP_FUSED_STEP = unset (default) | 0
+ *     The voltage and current updates fused into one pass, on grids without Mur, sheets and the other extensions
+ *     that block it; 0 never. The windowed blocks always run the separate kernels. V100: pml S/M within 2 to 7 %
+ *     of the two-pass path with the UPML fused into the main kernels.
+ * OPENEMS_HIP_FUSED_TZ, OPENEMS_HIP_FUSED_TY, OPENEMS_HIP_FUSED_XC
+ *     Development: the tile of the fused step (TZ 32 or 64 threads along z, AMD only; TY 4, 8 or 16 rows along y,
+ *     default 8, other values run 8; XC x lines per block, default 4).
+ * OPENEMS_HIP_UPML_FUSION = 1 (default) | 0
+ *     The UPML regions fused with the main updates; 0 the separate pre/post kernels (V100: 27 to 32 % slower).
+ * OPENEMS_HIP_KERNEL_TIMES = 0 (default) | 1
+ *     Development: a block of kernel times at the end of the run, from events around every launch (no graphs);
+ *     inflates the run time (small PCB by about 53 %): kernel shares, never speeds.
+ */
+
 #include "hip/hip_runtime.h"
 #include <algorithm>
 #include <climits>
@@ -853,6 +897,11 @@ GPU_Backend_HIP::Impl::Impl()
 	window_graphs_on = false;
 	window_logged = false;
 	window_steps = window_blocks = window_chunks = window_block_launches = 0;
+	tune_state = 0;
+	tune_chunks = tune_rule_W = 0;
+	tune_steps = 0;
+	tune_ms = 0;
+	tune_plane_bytes = 0;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -866,6 +915,8 @@ GPU_Backend_HIP::Impl::~Impl()
 	}
 	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); ++it)
 		(void)hipGraphExecDestroy(it->second.exec);
+	if (window_steps && (tune_state>0) && (g_settings.GetVerboseLevel()>1))
+		std::cout << "GPU_Backend_HIP: window: not tuned, the run ended during the tune (" << tune_steps << " timesteps of candidates)" << std::endl;
 	if (window_steps && (g_settings.GetVerboseLevel()>1))
 		std::cout << "GPU_Backend_HIP: window: " << window_steps << " timesteps in " << window_chunks << " chunks, " << window_blocks
 		          << " blocks, " << window_graphs.size() << " graphs" << std::endl;
@@ -1777,18 +1828,22 @@ __global__ void set_step(int* step_base, int step)
 		*step_base = step;
 }
 
+// OPENEMS_HIP_WINDOW when it is not set: the windowed blocks with the tuner; "0" keeps the single step
+static const char* const HIP_WINDOW_DEFAULT = "auto";
+
 GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx)
 {
 	GPU_Backend_HIP::Impl::WindowKnob k;
-	k.on = k.valid = k.automatic = false;
+	k.on = k.valid = k.automatic = k.tune = false;
 	k.T = k.W = k.B = 0;
-	k.text = text ? text : "";
+	k.text = text ? text : HIP_WINDOW_DEFAULT;
 	if (k.text.empty() || (k.text=="0"))
 		return k;
 	k.on = true;
-	if (k.text=="auto")
+	if ((k.text=="auto") || (k.text=="rule"))
 	{
 		k.valid = k.automatic = true;
+		k.tune = (k.text=="auto");
 		k.T = 8;
 		return k;
 	}
@@ -1822,14 +1877,15 @@ GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned
 	return k;
 }
 
-unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes)
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
+                            double margin, unsigned int halo)
 {
 	if ((plane_bytes==0) || (nx==0))
 		return std::max(nx, 1u);
-	double budget = 0.65*(double)l2_bytes;
+	double budget = margin*(double)l2_bytes;
 	if ((double)table_bytes<budget/3)
 		budget -= (double)table_bytes;
-	const double w = std::floor(budget/(double)plane_bytes) - (2.0*T + 1);
+	const double w = std::floor(budget/(double)plane_bytes) - (halo ? (double)halo : (2.0*T + 1));
 	const unsigned int W = (w<1) ? 1u : (unsigned int)std::min(w, (double)nx);
 	return std::max(1u, std::min(W, nx));
 }
@@ -1934,15 +1990,21 @@ bool GPU_Backend_HIP::Impl::WindowPrepare()
 	}
 	// plane bytes: the fields and the coefficient index (or the full coefficient arrays) of one x plane
 	const size_t plane_bytes = (size_t)dim.ny*dim.nzd*(24 + CoeffBytesPerNode());
+	tune_plane_bytes = plane_bytes;
 	if (window.automatic)
 	{
 		win_T = window.T;
 		win_W = HIP_WindowRule(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+		tune_rule_W = win_W;
+		win_source = "rule";
+		if (window.tune)
+			WindowTunePrepare();
 	}
 	else
 	{
 		win_T = window.T;
 		win_W = std::min(window.W, dim.nx);
+		win_source = "forced";
 	}
 	win_B = window.B;
 	// a V frontier must not fall between the line and the shift line of a Mur plane on an x face (the thread of the
@@ -2170,7 +2232,6 @@ void GPU_Backend_HIP::Impl::WindowRun(unsigned int start_ts, unsigned int n)
 		++window_blocks;
 	}
 	window_steps += n;
-	++window_chunks;
 }
 
 float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int n)
@@ -2187,6 +2248,203 @@ float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int 
 	(void)hipEventDestroy(start);
 	(void)hipEventDestroy(stop);
 	return ms;
+}
+
+// The tuner of OPENEMS_HIP_WINDOW=auto: a short list of (T, W) candidates, each timed on the live grid with one warm-up
+// block (which captures its graphs) and two timed blocks of its T (WindowTimedRun()), the three best refined once with
+// W -25 % and +25 %, the best measured one runs from then on. The candidates run real timesteps, in the chunks the
+// engine hands over: every schedule is bit-identical to the single step (the frontiers of WindowFrontiers()), so the
+// tune does not change the result and costs only the slower candidates' time; nothing is copied or restored.
+static const unsigned int HIP_TUNE_MAX_CANDIDATES = 12;   // the first list (the refinement adds up to 6)
+static const unsigned int HIP_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
+
+void GPU_Backend_HIP::Impl::WindowTunePrepare()
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	tune_cands.clear();
+	tune_state = 0;
+	// the candidates: the rule as G6 has it (T 8, 0.65 of L2, a halo of 2T+1), then T in {8, 16, 4, 2} with the true
+	// halo of T+1 planes and 0.65, 0.45 and 0.85 of L2; equal pairs once, at most HIP_TUNE_MAX_CANDIDATES
+	auto add = [&](unsigned int T, unsigned int W)
+	{
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if ((tune_cands[k].T==T) && (tune_cands[k].W==W))
+				return;
+		if (tune_cands.size()<HIP_TUNE_MAX_CANDIDATES)
+		{
+			WindowCandidate c = {T, W, -1};
+			tune_cands.push_back(c);
+		}
+	};
+	add(8, tune_rule_W);
+	static const unsigned int Ts[] = {8, 16, 4, 2};
+	static const double margins[] = {0.65, 0.45, 0.85};
+	for (unsigned int t=0; t<4; ++t)
+		for (unsigned int m=0; m<3; ++m)
+			add(Ts[t], HIP_WindowRule(l2_bytes, tune_plane_bytes, Ts[t], dim.nx, coeff_table_bytes, margins[m], Ts[t] + 1));
+	unsigned int steps = 0;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		steps += 3*tune_cands[k].T;
+	tune_state = 1;
+	win_source = "untuned";
+	if (verbose)
+		std::cout << "GPU_Backend_HIP: window: tuning on the first " << steps << " timesteps (" << tune_cands.size()
+		          << " candidates of a warm-up and two timed blocks, then the three best with W -/+25 %; real timesteps, each"
+		          << " candidate bit-identical)" << std::endl;
+}
+
+void GPU_Backend_HIP::Impl::WindowDropGraphs(unsigned int keep_W)
+{
+	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); )
+		if (it->first[1]!=keep_W)
+		{
+			(void)hipGraphExecDestroy(it->second.exec);
+			window_graphs.erase(it++);
+		}
+		else
+			++it;
+}
+
+unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned int n)
+{
+	unsigned int used = 0;
+	++tune_chunks;
+	while (tune_state>0)
+	{
+		// the first candidate not measured yet that fits into the rest of the chunk
+		int next = -1;
+		bool pending = false;
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if (tune_cands[k].mcs<0)
+			{
+				pending = true;
+				if (3*tune_cands[k].T<=n-used)
+				{
+					next = (int)k;
+					break;
+				}
+			}
+		if (!pending)
+		{
+			if (tune_state==2)
+			{
+				WindowTuneFinish(true);
+				break;
+			}
+			// the refinement: the three best measured, each with W -25 % and +25 % (at least one plane apart)
+			std::vector<WindowCandidate> best = tune_cands;
+			std::stable_sort(best.begin(), best.end(), [](const WindowCandidate& a, const WindowCandidate& b) {return a.mcs>b.mcs;});
+			tune_state = 2;
+			for (size_t k=0; (k<3) && (k<best.size()); ++k)
+			{
+				const unsigned int W = best[k].W;
+				const unsigned int lo = std::max(1u, std::min(W - 1, (unsigned int)std::lround(0.75*W)));
+				const unsigned int hi = std::min(dim.nx, std::max(W + 1, (unsigned int)std::lround(1.25*W)));
+				const unsigned int ws[2] = {lo, hi};
+				for (unsigned int j=0; j<2; ++j)
+				{
+					if ((ws[j]<1) || (ws[j]>dim.nx) || (ws[j]==W))
+						continue;
+					bool known = false;
+					for (size_t m=0; m<tune_cands.size(); ++m)
+						known = known || ((tune_cands[m].T==best[k].T) && (tune_cands[m].W==ws[j]));
+					if (!known)
+					{
+						WindowCandidate c = {best[k].T, ws[j], -1};
+						tune_cands.push_back(c);
+					}
+				}
+			}
+			continue;
+		}
+		if (next<0)
+			break;   // the rest of the chunk is too short for the next candidate
+		WindowCandidate& c = tune_cands[next];
+		win_T = c.T;
+		win_W = c.W;
+		WindowRun(start_ts + used, c.T);   // warm-up: captures the graphs of this W
+		const float ms = WindowTimedRun(start_ts + used + c.T, 2*c.T);
+		c.mcs = (ms>0) ? (double)numCells*2.0*c.T/((double)ms*1e3) : 0;
+		tune_ms += ms;
+		tune_steps += 3*c.T;
+		used += 3*c.T;
+		WindowDropGraphs(UINT_MAX);   // at most 32 graphs: the next candidate starts empty
+	}
+	if ((tune_state>0) && (tune_chunks>=HIP_TUNE_MAX_CHUNKS))
+		WindowTuneFinish(false);
+	if (tune_state>0)
+	{
+		// the rest of this chunk: the best so far once the rule (the first candidate) is measured, the rule until then
+		win_T = 8;
+		win_W = tune_rule_W;
+		double best = -1;
+		for (size_t k=0; (k<tune_cands.size()) && (tune_cands[0].mcs>=0); ++k)
+			if (tune_cands[k].mcs>best)
+			{
+				best = tune_cands[k].mcs;
+				win_T = tune_cands[k].T;
+				win_W = tune_cands[k].W;
+			}
+		WindowDropGraphs(win_W);
+	}
+	return used;
+}
+
+void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	tune_state = 0;
+	int best = -1;
+	unsigned int measured = 0;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		if (tune_cands[k].mcs>=0)
+		{
+			++measured;
+			if ((best<0) || (tune_cands[k].mcs>tune_cands[best].mcs))
+				best = (int)k;
+		}
+	// a tune the chunks cut short moves away from the rule only when the rule (the first candidate) was timed too
+	const bool rule_timed = !tune_cands.empty() && (tune_cands[0].mcs>=0);
+	if ((best<0) || (!complete && !rule_timed))
+	{
+		win_T = 8;
+		win_W = tune_rule_W;
+		win_source = "rule";
+		if (verbose)
+		{
+			std::cout << "GPU_Backend_HIP: window: not tuned, the first " << tune_chunks << " chunks were too short for the "
+			          << 3*win_T << " timesteps of the rule's candidate (" << measured << " of " << tune_cands.size()
+			          << " candidates timed): the rule, T=" << win_T << " W=" << win_W << std::endl;
+		}
+		WindowDropGraphs(win_W);
+		return;
+	}
+	win_T = tune_cands[best].T;
+	win_W = tune_cands[best].W;
+	win_source = "tuned";
+	WindowDropGraphs(win_W);
+	if (verbose)
+	{
+		std::ostringstream line;
+		line << std::fixed << std::setprecision(0);
+		line << "GPU_Backend_HIP: window: tuned T=" << win_T << " W=" << win_W << " B=0 shape=" << shape_block.x << "x" << shape_block.y
+		     << " " << tune_cands[best].mcs << " MC/s (candidates:";
+		for (size_t k=0; k<tune_cands.size(); ++k)
+		{
+			line << (k ? "; " : " ") << tune_cands[k].T << "," << tune_cands[k].W << " ";
+			if (tune_cands[k].mcs>=0)
+				line << tune_cands[k].mcs;
+			else
+				line << "-";
+		}
+		line << ")";
+		std::cout << line.str() << std::endl;
+		std::ostringstream cost;
+		cost << "GPU_Backend_HIP: window: the tune ran " << tune_steps << " timesteps in " << tune_chunks << " chunk"
+		     << (tune_chunks>1 ? "s" : "") << " (" << measured << " of " << tune_cands.size() << " candidates, timed blocks "
+		     << std::fixed << std::setprecision(1) << tune_ms << " ms)" << (complete ? "" : ", stopped: the chunks were too short for the rest");
+		std::cout << cost.str() << std::endl;
+	}
 }
 
 bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal)
@@ -2209,7 +2467,7 @@ bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& ext
 	if (!d->window.valid || (d->step_base==NULL))
 	{
 		if (verbose)
-			std::cout << "GPU_Backend_HIP: window: invalid value " << d->window.text << " (0, auto or T,W[,B]), single-step" << std::endl;
+			std::cout << "GPU_Backend_HIP: window: invalid value " << d->window.text << " (0, auto, rule or T,W[,B]), single-step" << std::endl;
 		return false;
 	}
 	for (size_t n=0; n<exts.size(); ++n)
@@ -2219,11 +2477,28 @@ bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& ext
 				std::cout << "GPU_Backend_HIP: window: refused: an extension is not window-capable" << std::endl;
 			return false;
 		}
-	d->window_exts = exts;
-	d->window_used = true;
 	// the windowed blocks run the separate kernels; the fused step would be decided at the first voltage update
 	const char* fused_env = getenv("OPENEMS_HIP_FUSED_STEP");
 	const bool fused = (d->fused_step>0) || ((d->fused_step<0) && (d->fused_blockers==0) && !(fused_env && (atoi(fused_env)==0)));
+	// auto keeps the fused step where it folds the UPML regions into its kernel and the rule's window covers all of x:
+	// one window has no L2 gain, and the windowed blocks run the regions as separate kernels (RTX 5090, bench pml S:
+	// 19406 MC/s windowed against 23839 fused; ideal S, without regions, gains 5 % from the windows' graphs)
+	// (the UPML extensions decide their fusion at their first hook, after this: the regions of the usual layout fuse)
+	const char* upml_env = getenv("OPENEMS_HIP_UPML_FUSION");
+	if (fused && d->window.tune && !d->upml.empty() && !(upml_env && (atoi(upml_env)==0)))
+	{
+		const size_t plane_bytes = (size_t)d->dim.ny*d->dim.nzd*(24 + d->CoeffBytesPerNode());
+		const unsigned int W = HIP_WindowRule(d->l2_bytes, plane_bytes, d->window.T, d->dim.nx, d->coeff_table_bytes);
+		if (W>=d->dim.nx)
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: auto keeps the fused step: one window covers the grid (W=" << W << " of "
+				          << d->dim.nx << " planes) and its " << d->upml.size() << " UPML regions go into the fused kernel" << std::endl;
+			return false;
+		}
+	}
+	d->window_exts = exts;
+	d->window_used = true;
 	if (d->fused_step<0)
 		d->fused_step = 0;
 	if (verbose && fused)
@@ -2239,8 +2514,12 @@ bool GPU_Backend_HIP::IterateWindowed(unsigned int start_ts, unsigned int n)
 		return false;   // decided before the windowed blocks: the fields are in its double buffers
 	if (!d->WindowPrepare())
 		return false;
-	d->WindowRun(start_ts, n);
-	if (!d->window_logged && (g_settings.GetVerboseLevel()>1))
+	++d->window_chunks;
+	unsigned int tuned = 0;
+	if (d->tune_state>0)
+		tuned = d->WindowTune(start_ts, n);   // real timesteps: the candidates' blocks
+	d->WindowRun(start_ts + tuned, n - tuned);
+	if (!d->window_logged && (d->tune_state==0) && (tuned<n) && (g_settings.GetVerboseLevel()>1))
 	{
 		// after the first chunk: the launches of a block of T steps (with its set_step), the graphs so far
 		d->window_logged = true;
@@ -2270,7 +2549,7 @@ bool GPU_Backend_HIP::IterateWindowed(unsigned int start_ts, unsigned int n)
 			line << " (captured in " << std::fixed << std::setprecision(1) << capture_ms << " ms)";
 		else if (HIP_KernelTimes::Enabled())
 			line << " (kernel times: plain launches)";
-		line << " (" << (d->window.automatic ? "auto" : "forced") << ", " << d->dim.ny*(size_t)d->dim.nzd*(24 + d->CoeffBytesPerNode())
+		line << " (" << d->win_source << ", " << d->dim.ny*(size_t)d->dim.nzd*(24 + d->CoeffBytesPerNode())
 		     << " bytes per plane, coefficient table " << d->coeff_table_bytes << " bytes, L2 " << d->l2_bytes/(1024*1024) << " MiB, " << d->window_exts.size() << " window-capable extensions)";
 		std::cout << line.str() << std::endl;
 	}

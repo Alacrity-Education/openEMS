@@ -128,7 +128,7 @@ __global__ void dispersive_apply_window(float* field, const float* ade, const si
 // dispersive_apply: the state of order 0, then of order 1, from the same field value, and
 // V = V - ade0, then V = V - ade1.
 #define SHEET_ORDERS 2
-//! a few layers of a board, not a volume
+//! a few layers of a PCB, not a volume
 #define SHEET_MAX_PLANES 32
 
 struct SheetArgs
