@@ -161,6 +161,20 @@ SYCL_Ext_LorentzMaterial::SYCL_Ext_LorentzMaterial(GPU_Backend_SYCL::Impl* impl,
 			Setup(m_Curr, curr_pos, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
 			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
 	}
+	// fused step (see update_fused): Apply2Voltages() changes the voltages of these nodes after the
+	// voltage update, the currents next to them are recomputed; Apply2Current() changes their
+	// currents after the current update
+	for (size_t g=0; g<m_Volt.size(); ++g)
+		for (unsigned int n=0; n<3; ++n)
+			if ((m_Volt[g].dirs>>n) & 1)
+				for (size_t k=0; k<volt_pos[g].size(); ++k)
+					d->volt_modified.push_back(n*d->numCells + volt_pos[g][k]);
+	for (size_t g=0; g<m_Curr.size(); ++g)
+		if (m_Curr[g].dirs)
+			for (unsigned int n=0; n<3; ++n)
+				if ((m_Curr[g].dirs>>n) & 1)
+					for (size_t k=0; k<curr_pos[g].size(); ++k)
+						d->curr_modified.push_back(n*d->numCells + curr_pos[g][k]);
 }
 
 float* SYCL_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)

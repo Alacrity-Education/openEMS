@@ -158,6 +158,20 @@ void SYCL_Ext_TFSF::SetupPlanes(std::vector<Plane>& planes, bool currents, Opera
 			pl.delta = d->Alloc<float>(delta.size(), delta.data());
 			pl.amp = d->Alloc<float>(amp.size(), amp.data());
 			planes.push_back(pl);
+
+			// fused step (see update_fused): the currents next to the voltages of the plane are
+			// recomputed; the currents of the plane change after the current update
+			std::vector<size_t>& modified = currents ? d->curr_modified : d->volt_modified;
+			for (unsigned int i=0; i<pl.param.ni; ++i)
+				for (unsigned int j=0; j<pl.param.nj; ++j)
+				{
+					unsigned int pos[3];
+					pos[n] = pl.param.line;
+					pos[nP] = pl.param.startP + i;
+					pos[nPP] = pl.param.startPP + j;
+					modified.push_back(nijk(d->dim, nP, pos[0], pos[1], pos[2]));
+					modified.push_back(nijk(d->dim, nPP, pos[0], pos[1], pos[2]));
+				}
 		}
 	}
 }

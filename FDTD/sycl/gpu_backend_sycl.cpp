@@ -23,8 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <map>
-#include <set>
 #include <sstream>
 #include <iostream>
 #include <limits>
@@ -39,6 +39,12 @@
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
+#include "FDTD/extensions/engine_ext_mur_abc.h"
+#include "FDTD/extensions/engine_ext_absorbing_bc.h"
+#include "FDTD/extensions/engine_ext_tfsf.h"
+#include "FDTD/extensions/engine_ext_lorentzmaterial.h"
+#include "FDTD/extensions/engine_ext_debyematerial.h"
+#include "FDTD/operator_cylinder.h"
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One work-item per mesh node: z along dimension 2 (contiguous), y along
@@ -758,6 +764,7 @@ GPU_Backend_SYCL::Impl::Impl()
 	memset(&zslabs, 0, sizeof(zslabs));
 	fused_step = -1;
 	fused_blockers = 0;
+	fused_optin = 0;
 	volt_next = curr_next = NULL;
 	fixup = NULL;
 	index32 = false;
@@ -813,6 +820,19 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 			          << " blocking extension(s) or grid(s))" << std::endl;
 		return false;
 	}
+	// The fused step does not write the currents on the last mesh lines (never updated), so a
+	// current an extension changes there after the current update would keep its change in one of
+	// the two buffers only
+	for (size_t k=0; k<curr_modified.size(); ++k)
+	{
+		const size_t node = curr_modified[k] % numCells;
+		if ((node/((size_t)dim.ny*dim.nz)+1>=dim.nx) || ((node/dim.nz)%dim.ny+1>=dim.ny) || (node%dim.nz+1>=dim.nz))
+		{
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (an extension changes currents on the last mesh lines)" << std::endl;
+			return false;
+		}
+	}
 	// Default policy: no fused step on a grid with UPML regions. On the B580 the fused step (the
 	// UPML z slabs in its kernel, the regions along x and y in one region kernel per half-step) is
 	// faster on a uniform grid, but not on a graded one with many coefficient sets, where its border
@@ -824,6 +844,20 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	{
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (UPML regions; OPENEMS_SYCL_FUSED_STEP=1 fuses them)" << std::endl;
+		return false;
+	}
+	// Nor with the extensions whose voltage changes need a large fix-up (the planes of the Mur ABC,
+	// absorbing sheets and TF/SF, the cells of the dispersive materials): the fix-up recomputes the
+	// currents next to them in a second pass, scattered for planes normal to z, and costs more than
+	// the fused step saves (MC/s, separate / fused, fixed number of timesteps): bench dispersive
+	// S 4465 / 3819, M 5451 / 4305; bench ideal with Mur on all faces S 7939 / 7105, M 9899 / 8848;
+	// a 921x708x44 model with Mur and four conducting sheets 6546 / 5732; the PCB feed line model
+	// of 921x708x44 nodes (Mur, conducting sheets, lumped ports) 1957 / 1541 at timestep 8000.
+	if ((fused_optin>0) && !(env && (atoi(env)==1)))
+	{
+		if (g_settings.GetVerboseLevel()>1)
+			std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (" << fused_optin
+			          << " Mur, absorbing, TF/SF or dispersive extension(s); OPENEMS_SYCL_FUSED_STEP=1 fuses them)" << std::endl;
 		return false;
 	}
 
@@ -859,10 +893,17 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	// again, on main nodes. The regions along x and y are updated by the region kernels after the
 	// voltage extensions; a UPML z slab in the kernel cannot be (its current flux is updated in
 	// place): then its region kernels update it too.
-	std::set<size_t> nodes;
+	// (the nodes of the changed voltages first: a dispersive material registers three per node)
+	std::vector<size_t> changed(volt_modified.size());
 	for (size_t k=0; k<volt_modified.size(); ++k)
+		changed[k] = volt_modified[k] % numCells;
+	std::sort(changed.begin(), changed.end());
+	changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+	std::vector<size_t> list;
+	list.reserve(2*changed.size());
+	for (size_t k=0; k<changed.size(); ++k)
 	{
-		const size_t node = volt_modified[k] % numCells;
+		const size_t node = changed[k];
 		const unsigned int p[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
 		const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
 		const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
@@ -888,10 +929,11 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 			else if (c[2]>=stop[2])
 				zslab_hi = false;
 			else
-				nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
+				list.push_back(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
 		}
 	}
-	std::vector<size_t> list(nodes.begin(), nodes.end());
+	std::sort(list.begin(), list.end());
+	list.erase(std::unique(list.begin(), list.end()), list.end());
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
@@ -901,6 +943,14 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 		Free(curr_next);
 		volt_next = curr_next = NULL;
 		std::cout << "GPU_Backend_SYCL: not enough device memory for the fused step, using separate updates" << std::endl;
+		return false;
+	}
+	if (list.size()>UINT_MAX)
+	{
+		Free(volt_next);
+		Free(curr_next);
+		volt_next = curr_next = NULL;
+		std::cout << "GPU_Backend_SYCL: too many nodes changed by the extensions for the fused step, using separate updates" << std::endl;
 		return false;
 	}
 	fixup_count = list.size();
@@ -916,6 +966,12 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 		std::cout << "GPU_Backend_SYCL: fused voltage and current updates" << (index32 ? ", 32 bit indices" : "");
 		if (zslab_lo || zslab_hi)
 			std::cout << " (" << zslab_lo+zslab_hi << " UPML regions along z in the kernel)";
+		if (fixup_count)
+		{
+			std::ostringstream pct;
+			pct << std::fixed << std::setprecision(2) << 100.0*fixup_count/numCells;
+			std::cout << ", fix-up of " << fixup_count << " node(s) (" << pct.str() << "% of the nodes)";
+		}
 		std::cout << std::endl;
 	}
 	return true;
@@ -1530,6 +1586,9 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
 	d->ResetZSlabs();
+	// no fused step on a cylindrical mesh
+	if (dynamic_cast<const Operator_Cylinder*>(op))
+		d->fused_blockers++;
 
 	// SYCL has no limit on the number of work-groups along x (the grid z of HIP), but a field
 	// buffer must fit one allocation of the device
@@ -1660,7 +1719,23 @@ void GPU_Backend_SYCL::UpdateVoltages()
 		                           (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv),
 		                           d->coeff_mode, d->dim, B, E, xc, d->zslabs.z_lo, d->zslabs.z_hi, 0, 0, 0,
 		                           0, 0, 0, 0, 0, 0, 0, 0 };
-		const SYCL_ZSlabs* Z = (d->zslab_lo || d->zslab_hi) ? &d->zslabs : NULL;
+		// a slab missing in the kernel gets the arguments of the other one: the kernel picks them
+		// (upml_pick) and the device faults on pointers of a slab that is not there (e.g. a UPML on
+		// the upper z end only)
+		SYCL_ZSlabs slabs = d->zslabs;
+		if (!d->zslab_lo)
+		{
+			slabs.R_lo = slabs.R_hi;
+			slabs.volt_lo = slabs.volt_hi;
+			slabs.curr_lo = slabs.curr_hi;
+		}
+		else if (!d->zslab_hi)
+		{
+			slabs.R_hi = slabs.R_lo;
+			slabs.volt_hi = slabs.volt_lo;
+			slabs.curr_hi = slabs.curr_lo;
+		}
+		const SYCL_ZSlabs* Z = (d->zslab_lo || d->zslab_hi) ? &slabs : NULL;
 		if (tz==16)
 			launch_fused_tz<16>(d, a, Z, aligned, ty, d->index32);
 		else
@@ -1972,9 +2047,17 @@ static const SYCL_ExtensionFactory SYCL_EXTENSIONS[] = {
 
 GPU_Extension* GPU_Backend_SYCL::CreateExtension(Engine_Extension* eng_ext, Engine* eng)
 {
-	// the fused step (see update_fused) knows the UPML, the excitation, lumped RLC elements and the steady-state detection
-	if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
-	    && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
+	// The fused step (see update_fused) knows the UPML, the excitation, lumped RLC elements, the
+	// steady-state detection, and, fused only on request (see fused_optin), the Mur ABC, absorbing
+	// sheets, TF/SF, Lorentz/Drude materials and conducting sheets and Debye materials: these run on
+	// the fields in place as without it, the currents next to the voltages they change are
+	// recomputed (volt_modified, see DecideFusedStep()). The others (the cylinder and multi-grid
+	// extensions) block it.
+	if (dynamic_cast<Engine_Ext_Mur_ABC*>(eng_ext) || dynamic_cast<Engine_Ext_Absorbing_BC*>(eng_ext) || dynamic_cast<Engine_Ext_TFSF*>(eng_ext)
+	    || dynamic_cast<Engine_Ext_LorentzMaterial*>(eng_ext) || dynamic_cast<Engine_Ext_DebyeMaterial*>(eng_ext))
+		d->fused_optin++;
+	else if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
+	         && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
 		d->fused_blockers++;
 	for (size_t n=0; n<sizeof(SYCL_EXTENSIONS)/sizeof(SYCL_EXTENSIONS[0]); ++n)
 	{
