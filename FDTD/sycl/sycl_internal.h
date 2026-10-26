@@ -172,7 +172,8 @@ struct GPU_Backend_SYCL::Impl
 	//! UPML extensions of this grid and whether they run fused with the main updates (-1: not decided yet), see sycl_ext_upml.cpp
 	std::vector<GPU_Extension*> upml;
 	int upml_fused;
-	//! UPML regions along z updated by the main kernels (nodes below main_start.nz / above main_stop.nz)
+	//! UPML regions along z updated by the main kernels (nodes below main_start.nz / above main_stop.nz):
+	//! the separate updates or the fused step (see update_fused)
 	SYCL_ZSlabs zslabs;
 	bool zslab_lo, zslab_hi;
 
@@ -182,20 +183,12 @@ struct GPU_Backend_SYCL::Impl
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
-	SYCL_FusedRegions fregions;              //!< the UPML regions in the kernel (see SYCL_Ext_UPML::CanFuse())
-	//! Device copies of fregions read by update_fused, two as the UPML hooks alternate the voltage flux buffers
-	//! (see FusedRegionsOnDevice()); fregions_up[k] is what fregions_dev[k] holds, if fregions_up_valid[k]
-	SYCL_FusedRegions* fregions_dev;
-	SYCL_FusedRegions fregions_up[2];
-	bool fregions_up_valid[2];
-	unsigned int fregions_up_next;           //!< the copy replaced next
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
 	bool index32;                            //!< the kernels index with 32 bit (see Init())
-	//! Decide once whether the fused step is used, and prepare it
+	//! Decide once whether the fused step is used, and prepare it; it keeps the UPML z slabs
+	//! (zslab_lo, zslab_hi) in its kernel or leaves them to the region kernels (clears the flags)
 	bool DecideFusedStep();
-	//! The device copy of fregions (uploaded if it changed)
-	const SYCL_FusedRegions* FusedRegionsOnDevice();
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer
