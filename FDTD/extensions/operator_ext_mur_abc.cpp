@@ -20,6 +20,9 @@
 
 #include "CSPropMaterial.h"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
+
+#include <cstdio>
 
 using std::cerr;
 using std::endl;
@@ -218,4 +221,34 @@ void Operator_Ext_Mur_ABC::ShowStat(std::ostream &ostr)  const
 	ostr << " Active direction\t: " << XYZ[m_ny] << " at line: " << m_LineNr << endl;
 	if (m_v_phase>0.0)
 		ostr << " Used phase velocity\t: " << m_v_phase << " (" << m_v_phase/C0 << " * c_0)" <<endl;
+}
+
+bool Operator_Ext_Mur_ABC::Serialize(std::ostream& out) const
+{
+	int32_t head[8] = {m_ny, m_nyP, m_nyPP, m_top, (int32_t)m_LineNr, m_LineNr_Shift, (int32_t)m_numLines[0], (int32_t)m_numLines[1]};
+	Operator_Cache::Write(out, head, 8);
+	Operator_Cache::Write(out, m_Mur_Coeff_nyP.data(), m_Mur_Coeff_nyP.size());
+	Operator_Cache::Write(out, m_Mur_Coeff_nyPP.data(), m_Mur_Coeff_nyPP.size());
+	return true;
+}
+
+bool Operator_Ext_Mur_ABC::Deserialize(std::istream& in)
+{
+	// the direction and the plane are set before the build (SetDirection): they must be the ones of the entry
+	int32_t head[8];
+	Operator_Cache::Read(in, head, 8);
+	int32_t own[8] = {m_ny, m_nyP, m_nyPP, m_top, (int32_t)m_LineNr, m_LineNr_Shift, (int32_t)m_numLines[0], (int32_t)m_numLines[1]};
+	for (int i=0; i<8; ++i)
+		if (head[i]!=own[i])
+			return false;
+	Operator_Cache::Read(in, m_Mur_Coeff_nyP.data(), m_Mur_Coeff_nyP.size());
+	Operator_Cache::Read(in, m_Mur_Coeff_nyPP.data(), m_Mur_Coeff_nyPP.size());
+	return true;
+}
+
+std::string Operator_Ext_Mur_ABC::CacheKey() const
+{
+	char buf[96];
+	snprintf(buf, sizeof(buf), "ny %d top %d v_phase %.17g", m_ny, (int)m_top, m_v_phase);
+	return std::string(buf);
 }

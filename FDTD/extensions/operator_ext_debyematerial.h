@@ -89,6 +89,9 @@ public:
 	virtual std::string Fingerprint() const;
 	virtual std::string FingerprintNote() const;
 
+	virtual bool Serialize(std::ostream& out) const;
+	virtual bool Deserialize(std::istream& in);
+
 protected:
 	//! Copy constructor
 	Operator_Ext_DebyeMaterial(Operator* op, Operator_Ext_DebyeMaterial* op_ext);

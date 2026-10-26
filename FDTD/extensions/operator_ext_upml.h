@@ -79,6 +79,10 @@ public:
 	virtual std::string Fingerprint() const;
 	virtual std::string FingerprintNote() const;
 
+	virtual bool Serialize(std::ostream& out) const;
+	virtual bool Deserialize(std::istream& in);
+	virtual std::string CacheKey() const;
+
 	//! Create the UPML
 	static bool Create_UPML(
 		Operator* op,

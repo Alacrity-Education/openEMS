@@ -59,6 +59,9 @@ public:
 	virtual std::string Fingerprint() const;
 	virtual std::string FingerprintNote() const;
 
+	virtual bool Serialize(std::ostream& out) const;
+	virtual bool Deserialize(std::istream& in);
+
 	virtual bool IsLElumpedRLC(const CSPropLumpedElement* const p_prop);
 
 protected:

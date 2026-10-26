@@ -43,6 +43,7 @@ class Operator : public Operator_Base
 	friend class Operator_Ext_Cylinder;
 	friend class Operator_Ext_LumpedRLC;
 	friend class Operator_Ext_Absorbing_BC;
+	friend class Operator_Cache;
 
 public:
 	enum DebugFlags {None=0,debugMaterial=1,debugOperator=2,debugPEC=4};
@@ -348,6 +349,8 @@ protected:
 	//! Number of threads the (threaded) Calc_EC and CalcPEC use, reported in the OPENEMS_SETUP_TIMES lines
 	virtual unsigned int SetupThreads() const {return 1;}
 	virtual void Calc_EC_Range(unsigned int xStart, unsigned int xStop);
+	//! On an operator cache hit Calc_EC and CalcPEC are not called: release any build thread that waits for them
+	virtual void SkipBuildThreads() {}
 	FDTD_FLOAT* EC_C[3];
 	FDTD_FLOAT* EC_G[3];
 	FDTD_FLOAT* EC_L[3];

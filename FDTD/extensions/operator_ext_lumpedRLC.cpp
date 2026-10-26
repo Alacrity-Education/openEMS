@@ -28,6 +28,7 @@
 #include "CSProperties.h"
 #include "CSPropLumpedElement.h"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
 
 #define COPY_V2A(V,A) std::copy(V.begin(),V.end(),A)
 
@@ -550,3 +551,39 @@ bool Operator_Ext_LumpedRLC::IsLElumpedRLC(const CSPropLumpedElement* const p_pr
 	return isParallelRLC || isSeriesRLC;
 }
 
+
+bool Operator_Ext_LumpedRLC::Serialize(std::ostream& out) const
+{
+	Operator_Cache::WriteValue(out, (uint64_t)RLC_count);
+	if (RLC_count==0)
+		return true;
+	const FDTD_FLOAT* coeff[9] = {v_RLC_ilv, v_RLC_i2v, v_RLC_vv2, v_RLC_vj1, v_RLC_vj2, v_RLC_vvd, v_RLC_ib0, v_RLC_b1, v_RLC_b2};
+	for (int c=0; c<9; ++c)
+		Operator_Cache::Write(out, coeff[c], RLC_count);
+	Operator_Cache::Write(out, v_RLC_dir, RLC_count);
+	for (int n=0; n<3; ++n)
+		Operator_Cache::Write(out, v_RLC_pos[n], RLC_count);
+	return true;
+}
+
+bool Operator_Ext_LumpedRLC::Deserialize(std::istream& in)
+{
+	RLC_count = (size_t)Operator_Cache::ReadValue<uint64_t>(in);
+	if (RLC_count==0)
+		return true;
+	FDTD_FLOAT** coeff[9] = {&v_RLC_ilv, &v_RLC_i2v, &v_RLC_vv2, &v_RLC_vj1, &v_RLC_vj2, &v_RLC_vvd, &v_RLC_ib0, &v_RLC_b1, &v_RLC_b2};
+	for (int c=0; c<9; ++c)
+	{
+		*coeff[c] = new FDTD_FLOAT[RLC_count];
+		Operator_Cache::Read(in, *coeff[c], RLC_count);
+	}
+	v_RLC_dir = new int[RLC_count];
+	Operator_Cache::Read(in, v_RLC_dir, RLC_count);
+	v_RLC_pos = new unsigned int*[3];
+	for (int n=0; n<3; ++n)
+	{
+		v_RLC_pos[n] = new unsigned int[RLC_count];
+		Operator_Cache::Read(in, v_RLC_pos[n], RLC_count);
+	}
+	return true;
+}

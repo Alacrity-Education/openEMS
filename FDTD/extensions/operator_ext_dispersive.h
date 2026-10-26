@@ -61,6 +61,10 @@ protected:
 
 	//! Add the state of this base class to a fingerprint: the order, the counts, the ADE flags and the position lists
 	void FingerprintBase(FNVHash& hash) const;
+
+	//! Operator cache: write (read) the state of this base class, in the order of FingerprintBase
+	void SerializeBase(std::ostream& out) const;
+	void DeserializeBase(std::istream& in);
 };
 
 #endif // OPERATOR_EXT_DISPERSIVE_H

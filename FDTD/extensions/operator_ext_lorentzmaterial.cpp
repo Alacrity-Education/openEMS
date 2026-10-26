@@ -17,6 +17,7 @@
 
 #include "operator_ext_lorentzmaterial.h"
 #include "tools/fingerprint.h"
+#include "FDTD/operator_cache.h"
 #include "engine_ext_lorentzmaterial.h"
 #include "operator_ext_cylinder.h"
 #include "../operator_cylinder.h"
@@ -556,6 +557,72 @@ std::string Operator_Ext_LorentzMaterial::FingerprintNote() const
 	for (size_t o=0; o<m_LM_Count.size(); ++o)
 		positions += (o ? "/" : "") + std::to_string(m_LM_Count[o]);
 	return std::to_string(m_Order) + " orders, positions " + positions;
+}
+
+bool Operator_Ext_LorentzMaterial::Serialize(std::ostream& out) const
+{
+	SerializeBase(out);
+	FDTD_FLOAT*** arrays[6] = {v_int_ADE, v_ext_ADE, i_int_ADE, i_ext_ADE, v_Lor_ADE, i_Lor_ADE};
+	uint8_t has[8] = {m_volt_Lor_ADE_On!=NULL, m_curr_Lor_ADE_On!=NULL};
+	for (int a=0; a<6; ++a)
+		has[2+a] = arrays[a]!=NULL;
+	Operator_Cache::Write(out, has, 8);
+	for (int o=0; o<m_Order; ++o)
+	{
+		if (has[0])
+			Operator_Cache::WriteValue(out, (uint8_t)m_volt_Lor_ADE_On[o]);
+		if (has[1])
+			Operator_Cache::WriteValue(out, (uint8_t)m_curr_Lor_ADE_On[o]);
+		size_t count = ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0;
+		for (int a=0; a<6; ++a)
+		{
+			// an array of an order exists if its ADE is on
+			uint8_t inner = (arrays[a]!=NULL) && (arrays[a][o]!=NULL);
+			Operator_Cache::WriteValue(out, inner);
+			for (int n=0; inner && (n<3); ++n)
+				Operator_Cache::Write(out, arrays[a][o][n], count);
+		}
+	}
+	return true;
+}
+
+bool Operator_Ext_LorentzMaterial::Deserialize(std::istream& in)
+{
+	DeserializeBase(in);
+	FDTD_FLOAT**** arrays[6] = {&v_int_ADE, &v_ext_ADE, &i_int_ADE, &i_ext_ADE, &v_Lor_ADE, &i_Lor_ADE};
+	uint8_t has[8];
+	Operator_Cache::Read(in, has, 8);
+	if (has[0])
+		m_volt_Lor_ADE_On = new bool[m_Order];
+	if (has[1])
+		m_curr_Lor_ADE_On = new bool[m_Order];
+	for (int a=0; a<6; ++a)
+		*arrays[a] = has[2+a] ? new FDTD_FLOAT**[m_Order] : NULL;
+	for (int o=0; o<m_Order; ++o)
+	{
+		if (has[0])
+			m_volt_Lor_ADE_On[o] = Operator_Cache::ReadValue<uint8_t>(in)!=0;
+		if (has[1])
+			m_curr_Lor_ADE_On[o] = Operator_Cache::ReadValue<uint8_t>(in)!=0;
+		size_t count = ((size_t)o<m_LM_Count.size()) ? m_LM_Count[o] : 0;
+		for (int a=0; a<6; ++a)
+		{
+			uint8_t inner = Operator_Cache::ReadValue<uint8_t>(in);
+			if (*arrays[a]==NULL)
+			{
+				if (inner)
+					return false;
+				continue;
+			}
+			(*arrays[a])[o] = inner ? new FDTD_FLOAT*[3] : NULL;
+			for (int n=0; inner && (n<3); ++n)
+			{
+				(*arrays[a])[o][n] = new FDTD_FLOAT[count];
+				Operator_Cache::Read(in, (*arrays[a])[o][n], count);
+			}
+		}
+	}
+	return true;
 }
 
 void Operator_Ext_LorentzMaterial::ShowStat(std::ostream &ostr)  const
