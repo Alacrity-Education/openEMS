@@ -185,6 +185,17 @@ inline void ColumnBox(const GPU_SetupView& v, int posX, int posY, double boundBo
 	}
 }
 
+// Operator::PassQueryBox (operator.cpp 2128): the column box with its upper end at the last line moved to the dual line of
+// the last line, the box that holds every point the passes query in the column
+inline void QueryBox(const GPU_SetupView& v, int posX, int posY, double queryBox[6])
+{
+	ColumnBox(v,posX,posY,queryBox);
+	int BBpos[3] = {posX, posY, -1};
+	for (int n=0;n<3;++n)
+		if ((BBpos[n]<0) || (BBpos[n]+1>=int(v.numLines[n])-1))
+			queryBox[2*n+1] = DiscLine(v,n,v.numLines[n]-1,true);
+}
+
 /***************************** the inside tests *****************************/
 
 // CoordInRange (CSPrimitives.cpp 54), the cartesian branch: dist = tol in all three axes
@@ -307,6 +318,30 @@ inline int InsideBox(const GPU_SetupPrimitive& p, const double* boundbox)
 			return -1;
 	}
 	return 1;
+}
+
+// Operator::PassPrimOutside (operator.cpp 2139), negated, with the reach of Operator::BeginPassPrimitives (operator.cpp 2190):
+// false when no point of queryBox can be inside the primitive by the first range test of its own inside test
+// (box: CoordInRange's min/max -+ tol; polygon and extruded polygon: the bounding box -+ tol of PolygonInside)
+inline bool MayContain(const GPU_SetupPrimitive& p, const double* queryBox, double tol)
+{
+	for (int n=0;n<3;++n)
+	{
+		double reachLo, reachHi;
+		if (p.type==0)
+		{
+			reachLo = std::min(p.start[n],p.stop[n])-tol;
+			reachHi = std::max(p.start[n],p.stop[n])+tol;
+		}
+		else
+		{
+			reachLo = p.bbox[2*n]-tol;
+			reachHi = p.bbox[2*n+1]+tol;
+		}
+		if ((queryBox[2*n+1]<reachLo) || (queryBox[2*n]>reachHi))
+			return false;
+	}
+	return true;
 }
 
 // Operator::FirstPrimitiveIndex (operator.cpp 1503), the loop of ContinuousStructure::GetPropertyByCoordPriority:

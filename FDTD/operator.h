@@ -424,9 +424,17 @@ protected:
 	bool m_PassPrims_On;
 	CSProperties::PropertyType m_PassPrims_Type;
 	std::vector<CSPrimitives*> m_PassPrims; //!< CSX->GetAllPrimitives(true, m_PassPrims_Type), read-only during the pass
+	//! Per entry of m_PassPrims: 1 when the prefilter of the pass applies (a box, polygon or extruded polygon without a transformation, cartesian)
+	std::vector<char> m_PassPrimsCut;
+	//! Per entry of m_PassPrims, six doubles: lo and hi of each axis such that the primitive's IsInside(p, tol) is false when p[n]<lo or p[n]>hi
+	std::vector<double> m_PassPrimsReach;
 
 	//! The box GetPrimitivesBoundBox() filters with: the lines pos-1 to pos+1 of each axis, the full range for a negative pos
 	void PrimitivesBoundBox(int posX, int posY, int posZ, double boundBox[6]) const;
+	//! The box that holds every point the passes query in the column of PrimitivesBoundBox(): its upper end at the last line is the dual line of the last line
+	void PassQueryBox(int posX, int posY, int posZ, double queryBox[6]) const;
+	//! True when no point of \a queryBox is inside entry \a j of m_PassPrims (the prefilter of the pass lists)
+	bool PassPrimOutside(size_t j, const double queryBox[6]) const;
 	//! Allocate the first-hit table for the PEC pass (after BeginPassPrimitives(MATERIAL | METAL)), see HasFirstHit()
 	void InitFirstHit();
 	void FreeFirstHit();
