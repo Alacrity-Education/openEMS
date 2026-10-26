@@ -93,16 +93,16 @@ unsigned int Operator_GPU::SetupThreads() const
 
 namespace
 {
-//! OPENEMS_SETUP_DEVICE: 0 for "0" or "off" (the default), 1 for "auto", 2 for "1" or "on" (read once)
+//! OPENEMS_SETUP_DEVICE: 0 for "0" or "off", 1 for "auto" (the default), 2 for "1" or "on" (read once)
 int SetupDeviceMode()
 {
 	static const int mode = []()
 	{
 		const char* val = getenv("OPENEMS_SETUP_DEVICE");
-		if ((val==NULL) || (val[0]=='\0') || (strcmp(val,"0")==0) || (strcmp(val,"off")==0))
-			return 0;
-		if (strcmp(val,"auto")==0)
+		if ((val==NULL) || (val[0]=='\0') || (strcmp(val,"auto")==0))
 			return 1;
+		if ((strcmp(val,"0")==0) || (strcmp(val,"off")==0))
+			return 0;
 		if ((strcmp(val,"1")==0) || (strcmp(val,"on")==0))
 			return 2;
 		throw std::runtime_error(std::string("OPENEMS_SETUP_DEVICE: unknown value '") + val + "', use 0, auto or 1");
