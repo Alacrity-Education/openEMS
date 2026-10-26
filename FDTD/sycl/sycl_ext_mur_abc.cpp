@@ -16,13 +16,145 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Mur absorbing boundary condition, see Engine_Ext_Mur_ABC.
-// Stub: the device implementation is ported in task T9 (from FDTD/hip/hip_ext_mur_abc.hip).
-
 #include "sycl_internal.h"
+#include "FDTD/engine.h"
+#include "FDTD/extensions/operator_ext_mur_abc.h"
+#include "FDTD/extensions/engine_ext_mur_abc.h"
+
+// First order Mur ABC on one boundary plane, see Engine_Ext_Mur_ABC.
+// One thread per (i,j) of the plane, i along m_nyP, j along m_nyPP.
+struct MurParam { int ny, nyP, nyPP; unsigned int line, line_shift; unsigned int ni, nj; };
+
+inline size_t mur_index(const SYCL_GridDim& N, const MurParam& P, unsigned int n, unsigned int line, unsigned int i, unsigned int j)
+{
+	unsigned int pos[3];
+	pos[P.ny] = line;
+	pos[P.nyP] = i;
+	pos[P.nyPP] = j;
+	return nijk(N, n, pos[0], pos[1], pos[2]);
+}
+
+// thread index: j along x-threads, i along y-threads
+#define MUR_THREAD \
+	const unsigned int j = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
+	const unsigned int i = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1); \
+	if (i>=P.ni || j>=P.nj) \
+		return; \
+	const unsigned int ij = i*P.nj + j;
+
+static inline void mur_pre(const sycl::nd_item<3>& it, const float* volt, float* v_nyP, float* v_nyPP, const float* c_nyP, const float* c_nyPP, SYCL_GridDim N, MurParam P)
+{
+	MUR_THREAD
+	v_nyP[ij]  = volt[mur_index(N, P, P.nyP,  P.line_shift, i, j)] - c_nyP[ij]  * volt[mur_index(N, P, P.nyP,  P.line, i, j)];
+	v_nyPP[ij] = volt[mur_index(N, P, P.nyPP, P.line_shift, i, j)] - c_nyPP[ij] * volt[mur_index(N, P, P.nyPP, P.line, i, j)];
+}
+
+static inline void mur_post(const sycl::nd_item<3>& it, const float* volt, float* v_nyP, float* v_nyPP, const float* c_nyP, const float* c_nyPP, SYCL_GridDim N, MurParam P)
+{
+	MUR_THREAD
+	v_nyP[ij]  = v_nyP[ij]  + c_nyP[ij]  * volt[mur_index(N, P, P.nyP,  P.line_shift, i, j)];
+	v_nyPP[ij] = v_nyPP[ij] + c_nyPP[ij] * volt[mur_index(N, P, P.nyPP, P.line_shift, i, j)];
+}
+
+static inline void mur_apply(const sycl::nd_item<3>& it, float* volt, const float* v_nyP, const float* v_nyPP, SYCL_GridDim N, MurParam P)
+{
+	MUR_THREAD
+	volt[mur_index(N, P, P.nyP,  P.line, i, j)] = v_nyP[ij];
+	volt[mur_index(N, P, P.nyPP, P.line, i, j)] = v_nyPP[ij];
+}
+
+class SYCL_Ext_Mur_ABC : public GPU_Extension
+{
+public:
+	SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mur_ABC* op_ext, Engine_Ext_Mur_ABC* eng_ext, Engine* eng);
+
+	virtual void DoPreVoltageUpdates()
+	{
+		if (!IsActive())
+			return;
+		const float* volt = d->volt;
+		float* v_nyP = m_Volt_nyP;
+		float* v_nyPP = m_Volt_nyPP;
+		const float* c_nyP = m_Coeff_nyP;
+		const float* c_nyPP = m_Coeff_nyPP;
+		const SYCL_GridDim dim = d->dim;
+		const MurParam param = m_Param;
+		SYCL_Launch(d, "mur_pre", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		{
+			mur_pre(it, volt, v_nyP, v_nyPP, c_nyP, c_nyPP, dim, param);
+		});
+	}
+	virtual void DoPostVoltageUpdates()
+	{
+		if (!IsActive())
+			return;
+		const float* volt = d->volt;
+		float* v_nyP = m_Volt_nyP;
+		float* v_nyPP = m_Volt_nyPP;
+		const float* c_nyP = m_Coeff_nyP;
+		const float* c_nyPP = m_Coeff_nyPP;
+		const SYCL_GridDim dim = d->dim;
+		const MurParam param = m_Param;
+		SYCL_Launch(d, "mur_post", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		{
+			mur_post(it, volt, v_nyP, v_nyPP, c_nyP, c_nyPP, dim, param);
+		});
+	}
+	virtual void Apply2Voltages()
+	{
+		if (!IsActive())
+			return;
+		float* volt = d->volt;
+		const float* v_nyP = m_Volt_nyP;
+		const float* v_nyPP = m_Volt_nyPP;
+		const SYCL_GridDim dim = d->dim;
+		const MurParam param = m_Param;
+		SYCL_Launch(d, "mur_apply", m_Param.nj, m_Param.ni, 1, [=](sycl::nd_item<3> it)
+		{
+			mur_apply(it, volt, v_nyP, v_nyPP, dim, param);
+		});
+	}
+
+protected:
+	//! the ABC is off until an excitation on its plane is done
+	bool IsActive() {return m_Eng->GetNumberOfTimesteps()>=m_StartTS;}
+
+	GPU_Backend_SYCL::Impl* d;
+	Engine* m_Eng;
+	unsigned int m_StartTS;
+	MurParam m_Param;
+
+	float *m_Volt_nyP, *m_Volt_nyPP;
+	float *m_Coeff_nyP, *m_Coeff_nyPP;
+};
+
+SYCL_Ext_Mur_ABC::SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mur_ABC* op_ext, Engine_Ext_Mur_ABC* eng_ext, Engine* eng)
+{
+	d = impl;
+	m_Eng = eng;
+	m_StartTS = eng_ext->GetStartTimestep();
+	m_Param.ny = op_ext->m_ny;
+	m_Param.nyP = op_ext->m_nyP;
+	m_Param.nyPP = op_ext->m_nyPP;
+	m_Param.line = op_ext->m_LineNr;
+	m_Param.line_shift = op_ext->m_LineNr_Shift;
+	m_Param.ni = op_ext->m_numLines[0];
+	m_Param.nj = op_ext->m_numLines[1];
+
+	const size_t count = (size_t)m_Param.ni*m_Param.nj;
+	m_Volt_nyP  = d->Alloc<float>(count);
+	m_Volt_nyPP = d->Alloc<float>(count);
+	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
+	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data());
+}
 
 GPU_Extension* SYCL_CreateExt_Mur_ABC(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)
 {
-	(void)d; (void)eng_ext; (void)eng;
-	return NULL;   // ported in task T9: until then the engine runs this extension on the host
+	Engine_Ext_Mur_ABC* mur_ext = dynamic_cast<Engine_Ext_Mur_ABC*>(eng_ext);
+	if (!mur_ext)
+		return NULL;
+	Operator_Ext_Mur_ABC* op_ext = dynamic_cast<Operator_Ext_Mur_ABC*>(eng_ext->GetOperatorExtension());
+	if (!op_ext)
+		return NULL;
+	return new SYCL_Ext_Mur_ABC(d, op_ext, mur_ext, eng);
 }
