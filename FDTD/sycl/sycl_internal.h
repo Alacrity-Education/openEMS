@@ -74,25 +74,89 @@ inline size_t region_field_index(const SYCL_GatherRegion& R, const SYCL_GridDim&
 	return nijk(N, n, R.lines[n][0][a], R.lines[n][1][b], R.lines[n][2][c]);
 }
 
-//! Main update coefficients of node i, see GPU_Backend_SYCL::Impl::coeff_mode:
-//! a[n*s] and b[n*s] are vv/vi (voltages, set_offset 0) or ii/iv (currents, set_offset 6)
-//! of direction n. Mode 0: ca/cb are the full arrays, else ca is the table of sets.
-template<typename I> struct SYCL_MainCoeffT { const float* a; const float* b; I s; };
+//! Main update coefficients of node i = (x,y,z), see GPU_Backend_SYCL::Impl::coeff_mode:
+//! a[n] and b[n] are vv/vi (voltages, set_offset 0) or ii/iv (currents, set_offset 6) of
+//! direction n, loaded (or reconstructed) by main_coeff(). s is 1, so that a[n*s] still reads them.
+template<typename I> struct SYCL_MainCoeffT { float a[3]; float b[3]; static constexpr I s = 1; };
 typedef SYCL_MainCoeffT<size_t> SYCL_MainCoeff;
 
+//! Factorized coefficients (coeff_mode 3/4, OPENEMS_SYCL_COEFF=factor): the buffer ca (= cb) holds
+//!   [0]                            the first exact set (uint32 bits), then padding up to SYCL_FACTOR_HDR,
+//!   [SYCL_FACTOR_HDR + 2*t*L + o]  four geometry tables t of L = nx+ny+nz values, o = x, nx+y, nx+ny+z,
+//!                                  each as a high float and (at + L) the low float of the double value:
+//!                                  t=0 primal edge length, 1 inverse dual edge length (voltages),
+//!                                  t=2 dual edge length, 3 inverse primal edge length (currents),
+//!   [SYCL_FactorSets(N)]           the sets of 12, normalized (set < exact_start) or exact.
+//! A normalized set holds vv, ii as they are and vi, iv divided by the geometry of the edge,
+//! len_n * inv_p * inv_q (p<q the other two directions). SYCL_FactorMul() multiplies it back,
+//! in the same operations on the host (GPU_Backend_SYCL::Init checks every node) and the device.
+#define SYCL_FACTOR_HDR 4
+inline size_t SYCL_FactorSets(const SYCL_GridDim& N)
+{
+	return SYCL_FACTOR_HDR + 8*((size_t)N.nx+N.ny+N.nz);
+}
+
+//! r*(a*b*c) for the double values a, b, c given as high and low floats: the products in
+//! double-float (Dekker with fma), so that the result is r times the double geometry, rounded
+//! once or nearly (not the three roundings of a float product of the rounded factors)
+inline float SYCL_FactorMul(float r, float ah, float al, float bh, float bl, float ch, float cl)
+{
+	const float p  = ah*bh;
+	const float pe = sycl::fma(ah, bh, -p) + (ah*bl + al*bh);
+	const float q  = p*ch;
+	const float qe = sycl::fma(p, ch, -q) + (p*cl + pe*ch);
+	const float t  = r*q;
+	const float te = sycl::fma(r, q, -t) + r*qe;
+	return t + te;
+}
+
+//! Mode 0: ca/cb are the full arrays (vv, vi or ii, iv); 1/2: ca is the table of sets and index a
+//! 16/32 bit set index per node; 3/4: the same index, ca the factorized buffer (see SYCL_FACTOR_HDR).
 template<typename I = size_t>
 inline SYCL_MainCoeffT<I> main_coeff(const void* index, const float* ca, const float* cb, unsigned int mode,
                                      typename SYCL_NoDeduce<I>::type sn, typename SYCL_NoDeduce<I>::type i,
-                                     unsigned int set_offset)
+                                     unsigned int set_offset, const SYCL_GridDim& N,
+                                     unsigned int x, unsigned int y, unsigned int z)
 {
 	SYCL_MainCoeffT<I> c;
 	if (mode==0)
 	{
-		c.a = ca + i; c.b = cb + i; c.s = sn;
+		for (unsigned int n=0; n<3; ++n)
+		{
+			c.a[n] = ca[n*sn + i];
+			c.b[n] = cb[n*sn + i];
+		}
 		return c;
 	}
-	const unsigned int set = (mode==1) ? (unsigned int)((const unsigned short*)index)[i] : ((const unsigned int*)index)[i];
-	c.a = ca + (size_t)12*set + set_offset; c.b = c.a + 3; c.s = 1;   // 64 bit: more than 358M sets wrap in 32
+	const unsigned int set = (mode&1) ? (unsigned int)((const unsigned short*)index)[i] : ((const unsigned int*)index)[i];
+	if (mode<3)
+	{
+		const float* T = ca + (size_t)12*set + set_offset;   // 64 bit: more than 358M sets wrap in 32
+		for (unsigned int n=0; n<3; ++n)
+		{
+			c.a[n] = T[n];
+			c.b[n] = T[3+n];
+		}
+		return c;
+	}
+	const float* T = ca + SYCL_FactorSets(N) + (size_t)12*set + set_offset;
+	for (unsigned int n=0; n<3; ++n)
+	{
+		c.a[n] = T[n];
+		c.b[n] = T[3+n];
+	}
+	if (set < ((const unsigned int*)ca)[0])
+	{
+		const unsigned int L = N.nx+N.ny+N.nz;
+		const float* len = ca + SYCL_FACTOR_HDR + (set_offset ? 4 : 0)*(size_t)L;   // high, low
+		const float* inv = len + 2*L;
+		const unsigned int ox = x, oy = N.nx+y, oz = N.nx+N.ny+z;
+		const float lxh = len[ox], lxl = len[L+ox], lyh = len[oy], lyl = len[L+oy], lzh = len[oz], lzl = len[L+oz];
+		const float wxh = inv[ox], wxl = inv[L+ox], wyh = inv[oy], wyl = inv[L+oy], wzh = inv[oz], wzl = inv[L+oz];
+		c.b[0] = SYCL_FactorMul(c.b[0], lxh, lxl, wyh, wyl, wzh, wzl);
+		c.b[1] = SYCL_FactorMul(c.b[1], lyh, lyl, wxh, wxl, wzh, wzl);
+		c.b[2] = SYCL_FactorMul(c.b[2], lzh, lzl, wxh, wxl, wyh, wyl);
+	}
 	return c;
 }
 
@@ -161,7 +225,8 @@ struct GPU_Backend_SYCL::Impl
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_SYCL::CalcFastEnergy()
 	size_t energy_count;
 	std::vector<float2> energy_host;
-	//! Main update coefficients: 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index per node and the sets (see main_coeff())
+	//! Main update coefficients: 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index per node and the sets;
+	//! 3/4: a 16/32 bit set index and the factorized sets and geometry tables in coeff (see main_coeff())
 	unsigned int coeff_mode;
 	float *vv, *vi, *ii, *iv;
 	void* index;

@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,10 +29,12 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "sycl_internal.h"
 #include "gpu_build_id.h"
 #include "FDTD/operator.h"
+#include "FDTD/operator_cylinder.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
@@ -85,7 +88,7 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 	const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
 	const I ym = (y>0) ? N.nz : 0;
 	const I zm = (z>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 0);
+	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	const float* vv = C.a;
 	const float* vi = C.b;
 	const I s = C.s;
@@ -152,7 +155,7 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 	const I i  = nijk<I>(N, 0, x, y, z);
 	const I xp = (I)N.ny*N.nz;
 	const I yp = N.nz;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 6);
+	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, ca, cb, mode, sn, i, 6, N, x, y, z);
 	const float* ii = C.a;
 	const float* iv = C.b;
 	const I s = C.s;
@@ -187,7 +190,7 @@ inline void fused_volt(const float* __restrict__ volt, const float* __restrict__
 	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
 	const I ym = (y>0) ? N.nz : 0;
 	const I zm = (z>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0);
+	const SYCL_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0, N, x, y, z);
 	float t;
 	t  = volt[i] * C.a[0];
 	t += C.b[0] * (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
@@ -383,7 +386,7 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 			else if (update)
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
-				const SYCL_MainCoeffT<I> C = main_coeff<I>(a.index, a.ia, a.ib, a.mode, sn, i, 6);
+				const SYCL_MainCoeffT<I> C = main_coeff<I>(a.index, a.ia, a.ib, a.mode, sn, i, 6, N, x, y, z);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -522,7 +525,8 @@ inline void update_currents_nodes(const sycl::nd_item<3>& it, const float* __res
 	const size_t i  = nodes[k];
 	const size_t xp = (size_t)N.ny*N.nz;
 	const size_t yp = N.nz;
-	const SYCL_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
+	const unsigned int x = i/xp, y = (i/yp)%N.ny, z = i%N.nz;
+	const SYCL_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6, N, x, y, z);
 	float c;
 	c  = curr_in[i] * C.a[0];
 	c += C.b[0] * (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
@@ -1197,6 +1201,322 @@ static std::string CoefficientStatistics(size_t nodes, int mode, size_t sets, si
 	return o.str();
 }
 
+namespace
+{
+//! Result of FactorizeCoefficients()
+struct SYCL_FactorResult
+{
+	std::vector<float> buffer;    //!< the device buffer, see SYCL_FACTOR_HDR
+	GPU_CoeffSets index;          //!< the set index per node (mode 1/2: 16/32 bit), table empty
+	size_t normalized, exact;     //!< number of normalized and of exact sets
+	size_t exceptions;            //!< nodes with an exact set
+	size_t exact_nodes;           //!< nodes with a normalized set that reproduces all coefficients bit for bit
+};
+
+//! distance in units in the last place of two finite floats of the same sign (else large)
+inline uint32_t UlpDistance(float a, float b)
+{
+	if (a==b)
+		return 0;
+	uint32_t ua, ub;
+	std::memcpy(&ua, &a, 4);
+	std::memcpy(&ub, &b, 4);
+	if ((ua ^ ub) & 0x80000000u)
+		return UINT32_MAX;
+	return (ua>ub) ? ua-ub : ub-ua;
+}
+}
+
+// Factorized coefficients (OPENEMS_SYCL_COEFF=factor, Cartesian meshes): on a graded mesh the
+// exact sets of a node's 12 coefficients are nearly as many as the nodes, since vi and iv carry
+// the mesh spacing: vi(n) = M_v(material) * len_n / (dual_p * dual_q) (Operator::Calc_ECPos,
+// Calc_ECOperatorPos), iv(n) the same with primal and dual swapped, while vv and ii depend on the
+// material only. So the sets hold vv, ii and vi, iv divided by that geometry (in double), and the
+// kernels multiply it back from 1-D tables (main_coeff(), SYCL_FactorMul()). The normalized values
+// of one material differ only by the rounding of the stored floats: they are grouped by their value
+// rounded to 20 mantissa bits (relative 1e-6) and replaced by the middle of the group, plus values
+// that reproduce sampled members exactly. Every node is checked by reconstructing its coefficients
+// as the kernel does; a node with a coefficient more than max_ulp (OPENEMS_SYCL_COEFF_ULP, default 2)
+// units in the last place off keeps its exact 12 floats as an exact set (appended to the table, not
+// multiplied). Returns false if the sets do not pay (as GPU_FindSets).
+static bool FactorizeCoefficients(const Operator* op, const unsigned int numLines[3], uint32_t max_ulp, SYCL_FactorResult& R)
+{
+	const size_t L = (size_t)numLines[0]+numLines[1]+numLines[2];
+	const size_t nodes = (size_t)numLines[0]*numLines[1]*numLines[2];
+	// the geometry tables in double, and as the kernel reads them (high and low floats)
+	std::vector<double> geo_d(4*L, 0.0);
+	std::vector<float> geo(8*L, 0.0f);
+	const size_t off[3] = {0, numLines[0], (size_t)numLines[0]+numLines[1]};
+	for (int a=0; a<3; ++a)
+		for (unsigned int p=0; p<numLines[a]; ++p)
+		{
+			unsigned int pos[3] = {0, 0, 0};
+			pos[a] = p;
+			const double primal = op->GetEdgeLength(a, pos, false);
+			const double dual = op->GetEdgeLength(a, pos, true);
+			const double v[4] = {primal, dual ? 1.0/dual : 0.0, dual, primal ? 1.0/primal : 0.0};
+			for (int t=0; t<4; ++t)
+			{
+				const float hi = (float)v[t];
+				geo_d[t*L + off[a] + p] = v[t];
+				geo[2*t*L + off[a] + p] = hi;
+				geo[(2*t+1)*L + off[a] + p] = (float)(v[t] - (double)hi);
+			}
+		}
+	// the geometry of the edge: f = the high and low floats of length, inverse p, inverse q; g in double
+	struct Geometry
+	{
+		float f[6];
+		double g;
+		bool operator==(const Geometry& o) const {return std::equal(f, f+6, o.f);}
+	};
+	// of component c (0: vi, 1: iv) of direction n at xyz
+	auto geometry = [&](int c, int n, const unsigned int xyz[3], Geometry& G)
+	{
+		const int ax[3] = {n, (n==0) ? 1 : 0, (n==2) ? 1 : 2};
+		G.g = 1.0;
+		for (int k=0; k<3; ++k)
+		{
+			const int t = 2*c + (k ? 1 : 0);
+			const size_t o = off[ax[k]] + xyz[ax[k]];
+			G.f[2*k] = geo[2*t*L + o];
+			G.f[2*k+1] = geo[(2*t+1)*L + o];
+			G.g *= geo_d[t*L + o];
+		}
+	};
+	// the operations of main_coeff()
+	auto reconstruct = [](float r, const Geometry& G) -> float
+	{
+		return SYCL_FactorMul(r, G.f[0], G.f[1], G.f[2], G.f[3], G.f[4], G.f[5]);
+	};
+	auto key_of = [](double v) -> uint64_t
+	{
+		uint64_t u;
+		std::memcpy(&u, &v, 8);
+		return (u + (1ull<<31)) & ~((1ull<<32)-1);   // 20 of the 52 mantissa bits, rounded
+	};
+	// the coefficients of a node, the geometry and normalized values of vi, iv (index 3*c+n; NaN:
+	// cannot be normalized)
+	struct Node
+	{
+		float raw[12];
+		Geometry G[6];
+		double norm[6];
+	};
+	auto load = [&](size_t i, Node& N)
+	{
+		GPU_NodeCoefficients(op, numLines, i, N.raw);
+		const unsigned int xyz[3] = {(unsigned int)(i/((size_t)numLines[1]*numLines[2])),
+		                             (unsigned int)((i/numLines[2]) % numLines[1]), (unsigned int)(i % numLines[2])};
+		for (int k=0; k<6; ++k)
+		{
+			geometry(k/3, k%3, xyz, N.G[k]);
+			const float b = N.raw[(k<3 ? 3 : 9) + k%3];
+			const double g = N.G[k].g;
+			N.norm[k] = (b==0) ? 0.0 : ((g>0 && std::isfinite(g)) ? (double)b/g : std::numeric_limits<double>::quiet_NaN());
+		}
+	};
+
+	// pass 1: the groups of normalized values: their range, and their distinct members (the
+	// stored coefficient and its geometry) with their counts, up to MAX_MEMBERS per group and
+	// MAX_TRACKED in all (host memory)
+	const unsigned int MAX_MEMBERS = 256, MAX_EXTRA = 32;
+	const size_t MAX_TRACKED = 4000000;
+	struct MemberKey
+	{
+		uint64_t key;
+		uint32_t b;
+		uint32_t f[6];
+		bool operator==(const MemberKey& o) const {return (key==o.key) && (b==o.b) && std::equal(f, f+6, o.f);}
+	};
+	struct MemberHash
+	{
+		size_t operator()(const MemberKey& m) const
+		{
+			uint64_t h = (1469598103934665603ULL ^ m.key) * 1099511628211ULL;   // FNV-1a
+			h = (h ^ m.b) * 1099511628211ULL;
+			for (int k=0; k<6; ++k)
+				h = (h ^ m.f[k]) * 1099511628211ULL;
+			return h;
+		}
+	};
+	struct MemberInfo { size_t count; double v; };
+	struct Group { double lo, hi; unsigned int n; };
+	std::unordered_map<uint64_t, Group> groups;
+	std::unordered_map<MemberKey, MemberInfo, MemberHash> members;
+	{
+		Node N;
+		for (size_t i=0; i<nodes; ++i)
+		{
+			load(i, N);
+			for (int k=0; k<6; ++k)
+			{
+				const double v = N.norm[k];
+				if (std::isnan(v) || (v==0))
+					continue;
+				const float b = N.raw[(k<3 ? 3 : 9) + k%3];
+				MemberKey mk;
+				mk.key = key_of(v);
+				std::memcpy(&mk.b, &b, 4);
+				std::memcpy(mk.f, N.G[k].f, sizeof(mk.f));
+				auto gi = groups.find(mk.key);
+				if (gi==groups.end())
+					gi = groups.emplace(mk.key, Group{v, v, 0}).first;
+				Group& g = gi->second;
+				g.lo = std::min(g.lo, v);
+				g.hi = std::max(g.hi, v);
+				auto mi = members.find(mk);
+				if (mi!=members.end())
+					mi->second.count++;
+				else if ((g.n<MAX_MEMBERS) && (members.size()<MAX_TRACKED))
+				{
+					members.emplace(mk, MemberInfo{1, v});
+					g.n++;
+				}
+			}
+		}
+	}
+	// the members of each group, the most frequent first
+	std::unordered_map<uint64_t, std::vector<std::pair<size_t, const MemberKey*>>> by_group;
+	for (const auto& m : members)
+		by_group[m.first.key].push_back(std::make_pair(m.second.count, &m.first));
+	// the normalized values of a group: first the middle of its range, then, for the most frequent
+	// members it does not reproduce exactly, values that do (within 2 ulp of the member's own
+	// value; at most MAX_EXTRA), so that a mesh with few distinct spacings is reproduced bit for bit
+	std::unordered_map<uint64_t, std::vector<float>> rep;
+	rep.reserve(groups.size());
+	for (const auto& kv : groups)
+	{
+		const Group& g = kv.second;
+		std::vector<float>& reps = rep[kv.first];
+		reps.push_back((float)(0.5*(g.lo + g.hi)));
+		auto bg = by_group.find(kv.first);
+		if (bg==by_group.end())
+			continue;
+		std::vector<std::pair<size_t, const MemberKey*>>& list = bg->second;
+		std::sort(list.begin(), list.end(), [](const std::pair<size_t, const MemberKey*>& x, const std::pair<size_t, const MemberKey*>& y)
+		          {return x.first>y.first;});
+		for (const auto& e : list)
+		{
+			if (reps.size()>MAX_EXTRA)
+				break;
+			const MemberKey& m = *e.second;
+			Geometry G;
+			std::memcpy(G.f, m.f, sizeof(G.f));
+			float b;
+			std::memcpy(&b, &m.b, 4);
+			bool hit = false;
+			for (float r : reps)
+				hit = hit || (reconstruct(r, G)==b);
+			if (hit)
+				continue;
+			float c = (float)members[m].v;
+			c = std::nextafter(std::nextafter(c, -INFINITY), -INFINITY);
+			for (int t=0; t<5; ++t, c = std::nextafter(c, INFINITY))
+				if (reconstruct(c, G)==b)
+				{
+					reps.push_back(c);
+					break;
+				}
+		}
+	}
+	by_group.clear();
+	members.clear();
+	groups.clear();
+
+	// pass 2: the normalized sets; nodes that do not reconstruct get a placeholder set (all NaN)
+	std::vector<size_t> exc;
+	size_t exact_nodes = 0;   // nodes whose coefficients are all reproduced bit for bit
+	Node N;
+	const bool ok = GPU_FindSets(nodes, 12, [&](size_t i, float* values)
+	{
+		load(i, N);
+		bool good = true, exact = true;
+		for (int k=0; k<6 && good; ++k)
+		{
+			const int c = (k<3 ? 3 : 9) + k%3;
+			const float b = N.raw[c];
+			if (std::isnan(N.norm[k]))
+			{
+				good = false;
+				break;
+			}
+			// the normalized value of the group that reconstructs b exactly, else the nearest
+			float r = 0.0f;
+			uint32_t dist = 0;
+			if (N.norm[k]!=0)
+			{
+				dist = UINT32_MAX;
+				for (float cand : rep[key_of(N.norm[k])])
+				{
+					const uint32_t d = UlpDistance(reconstruct(cand, N.G[k]), b);
+					if (d<dist)
+					{
+						dist = d;
+						r = cand;
+					}
+					if (d==0)
+						break;
+				}
+			}
+			good = dist<=max_ulp;
+			exact = exact && (dist==0);
+			values[c] = r;
+		}
+		if (!good)
+		{
+			exc.push_back(i);
+			std::fill(values, values+12, std::numeric_limits<float>::quiet_NaN());
+			return;
+		}
+		exact_nodes += exact;
+		for (int n=0; n<3; ++n)
+		{
+			values[n] = N.raw[n];
+			values[6+n] = N.raw[6+n];
+		}
+	}, R.index);
+	if (!ok)
+		return false;
+	R.normalized = R.index.count;
+	R.exceptions = exc.size();
+	R.exact_nodes = exact_nodes;
+	std::vector<float> table;
+	table.swap(R.index.table);
+
+	// the exact sets of the exceptions, deduplicated (else one per node)
+	GPU_CoeffSets ex;
+	if (!exc.empty() && !GPU_FindSets(exc.size(), 12, [&](size_t k, float* values) {GPU_NodeCoefficients(op, numLines, exc[k], values);}, ex))
+	{
+		ex.count = exc.size();
+		ex.index.resize(exc.size());
+		ex.table.resize(12*exc.size());
+		for (size_t k=0; k<exc.size(); ++k)
+		{
+			ex.index[k] = k;
+			GPU_NodeCoefficients(op, numLines, exc[k], &ex.table[12*k]);
+		}
+	}
+	R.exact = exc.empty() ? 0 : ex.count;
+	for (size_t k=0; k<exc.size(); ++k)
+		R.index.index[exc[k]] = (uint32_t)(R.normalized + ex.index[k]);
+	const size_t total = R.normalized + R.exact;
+	if (total > std::numeric_limits<uint32_t>::max())
+		return false;
+	R.index.count = total;
+	R.index.mode = (total <= (size_t)std::numeric_limits<uint16_t>::max()+1) ? 1 : 2;
+
+	// the buffer: header, geometry, normalized sets, exact sets
+	R.buffer.assign(SYCL_FACTOR_HDR, 0.0f);
+	const uint32_t exact_start = (uint32_t)R.normalized;
+	std::memcpy(&R.buffer[0], &exact_start, 4);
+	R.buffer.insert(R.buffer.end(), geo.begin(), geo.end());
+	R.buffer.insert(R.buffer.end(), table.begin(), table.end());
+	if (R.exact)
+		R.buffer.insert(R.buffer.end(), ex.table.begin(), ex.table.end());
+	return true;
+}
+
 bool GPU_Backend_SYCL::Init(const Operator* op)
 {
 	unsigned int numLines[3];
@@ -1240,10 +1560,55 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	const char* index_bits = d->index32 ? ", 32 bit indices" : ", 64 bit indices";
 
 	// upload the final operator coefficients, including all changes by operator extensions.
-	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
-	// every distinct set of the 12 coefficients of a node once and a set index per node
+	// OPENEMS_SYCL_COEFF selects the storage (the statistics line of verbose level 2 names it):
+	//   sets (default): every distinct set of the 12 coefficients of a node once and a 16/32 bit
+	//     set index per node (most nodes share one of a few sets: same material and mesh spacing),
+	//     the full arrays if the sets do not pay (a graded mesh with many distinct spacings);
+	//   factor: sets of the coefficients divided by the mesh geometry, which the kernels multiply
+	//     back from 1-D tables (see FactorizeCoefficients()): few sets on graded meshes too.
+	//     Cartesian meshes only (else sets); the reconstruction may differ from the stored
+	//     coefficients by up to OPENEMS_SYCL_COEFF_ULP (default 2) units in the last place;
+	//   full: the full arrays (48 bytes per node).
+	const char* coeff_env = getenv("OPENEMS_SYCL_COEFF");
+	const std::string coeff_req = coeff_env ? coeff_env : "sets";
+	if (coeff_req=="factor")
+	{
+		if (dynamic_cast<const Operator_Cylinder*>(op))
+		{
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_SYCL: factorized coefficients need a Cartesian mesh, using sets" << std::endl;
+		}
+		else
+		{
+			const uint32_t max_ulp = getenv("OPENEMS_SYCL_COEFF_ULP") ? (uint32_t)std::max(0, atoi(getenv("OPENEMS_SYCL_COEFF_ULP"))) : 2;
+			SYCL_FactorResult F;
+			const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+			if (FactorizeCoefficients(op, numLines, max_ulp, F))
+			{
+				d->coeff_mode = 2 + F.index.mode;
+				d->index = d->AllocIndex(F.index);
+				d->coeff = d->Alloc<float>(F.buffer.size(), F.buffer.data());
+				if (g_settings.GetVerboseLevel()>1)
+				{
+					const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+					std::cout << "GPU_Backend_SYCL: coefficients: " << d->numCells << " nodes, factorized ("
+					          << (F.index.mode==1 ? 16 : 32) << " bit index), " << F.normalized << " normalized sets + "
+					          << F.exact << " exact sets (" << F.exceptions << " exception nodes, max " << max_ulp << " ulp; "
+					          << F.exact_nodes << " nodes reproduced bit for bit), "
+					          << (F.index.mode==1 ? 2 : 4) << " bytes per node of coefficient traffic + table "
+					          << F.buffer.size()*sizeof(float) << " bytes (geometry " << 32*((size_t)numLines[0]+numLines[1]+numLines[2])
+					          << " bytes)" << index_bits << ", " << sec << " s" << std::endl;
+				}
+				return true;
+			}
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_SYCL: factorized coefficients do not pay, using sets" << std::endl;
+		}
+	}
+	else if ((coeff_req!="sets") && (coeff_req!="full"))
+		std::cerr << "GPU_Backend_SYCL: unknown OPENEMS_SYCL_COEFF=" << coeff_req << " (sets, factor or full), using sets" << std::endl;
 	GPU_CoeffSets sets;
-	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
+	if ((coeff_req!="full") && GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
