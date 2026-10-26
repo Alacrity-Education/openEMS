@@ -92,7 +92,7 @@ double Operator_Cylinder::GetMaterial(
 	int ny,
 	const double* coords,
 	int MatType,
-	std::vector<CSPrimitives*> vPrims,
+	const std::vector<CSPrimitives*>& vPrims,
 	bool markAsUsed
 ) const
 {
@@ -102,6 +102,23 @@ double Operator_Cylinder::GetMaterial(
 	if (CC_closedAlpha && (coords[1]<GetDiscLine(1,0,false)))
 		l_coords[1] += 2*PI;
 	return Operator_Multithread::GetMaterial(ny,l_coords,MatType,vPrims,markAsUsed);
+}
+
+void Operator_Cylinder::GetMaterialPair(
+	int ny,
+	const double* coords,
+	int MatType,
+	const std::vector<CSPrimitives*>& vPrims,
+	double* value,
+	bool markAsUsed
+) const
+{
+	double l_coords[] = {coords[0],coords[1],coords[2]};
+	if (CC_closedAlpha && (coords[1]>GetDiscLine(1,0,false)+2*PI))
+		l_coords[1]-=2*PI;
+	if (CC_closedAlpha && (coords[1]<GetDiscLine(1,0,false)))
+		l_coords[1] += 2*PI;
+	Operator_Multithread::GetMaterialPair(ny,l_coords,MatType,vPrims,value,markAsUsed);
 }
 
 int Operator_Cylinder::CalcECOperator( DebugFlags debugFlags )
