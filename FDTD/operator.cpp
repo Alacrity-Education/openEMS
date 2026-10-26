@@ -55,6 +55,8 @@ Operator::Operator() : Operator_Base()
 	m_Exc = 0;
 	m_InvaildTimestep = false;
 	m_TimeStepVar = 3;
+	m_PassPrims_On = false;
+	m_PassPrims_Type = CSProperties::ANY;
 }
 
 Operator::~Operator()
@@ -1124,7 +1126,11 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	InitDataStorage();
 	timer.Lap("InitDataStorage");
 
-	if (Calc_EC()==0)
+	// the sorted primitive lists are built here on the main thread, before any worker of Calc_EC or CalcPEC starts
+	BeginPassPrimitives(CSProperties::MATERIAL);
+	bool ec_ok = Calc_EC();
+	EndPassPrimitives();
+	if (ec_ok==false)
 		return -1;
 	timer.Lap("Calc_EC", SetupThreads());
 
@@ -1189,7 +1195,9 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	ApplyElectricBC(PEC);
 	timer.Lap("ApplyElectricBC");
 
+	BeginPassPrimitives((CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL));
 	CalcPEC();
+	EndPassPrimitives();
 	timer.Lap("CalcPEC", SetupThreads());
 
 	Calc_LumpedElements();
@@ -2034,8 +2042,36 @@ Operator::GetPrimitivesBoundBox(
 		}
 	}
 
+	if (m_PassPrims_On && (m_PassPrims_Type==type))
+	{
+		// the list of the pass is what GetPrimitivesByBoundBox sorts on every call, filtered by the same rule
+		std::vector<CSPrimitives*> vPrim;
+		for (size_t j=0;j<m_PassPrims.size();++j)
+			if (m_PassPrims.at(j)->IsInsideBox(boundBox)>=0)
+				vPrim.push_back(m_PassPrims.at(j));
+		return vPrim;
+	}
+
 	std::vector<CSPrimitives*> vPrim = this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
 	return vPrim;
+}
+
+void Operator::BeginPassPrimitives(CSProperties::PropertyType type)
+{
+	m_PassPrims_On = false;
+	m_PassPrims.clear();
+	if (CSX==NULL)
+		return;
+	m_PassPrims = CSX->GetAllPrimitives(true, type);
+	m_PassPrims_Type = type;
+	m_PassPrims_On = true;
+}
+
+void Operator::EndPassPrimitives()
+{
+	m_PassPrims_On = false;
+	m_PassPrims.clear();
+	m_PassPrims.shrink_to_fit();
 }
 
 void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
