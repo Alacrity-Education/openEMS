@@ -24,6 +24,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -730,7 +731,11 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	// OPENEMS_SYCL_FUSED_STEP: unset: the default policy below, 0: never, 1: whenever the extensions allow it
 	const char* env = getenv("OPENEMS_SYCL_FUSED_STEP");
 	if (env && (atoi(env)==0))
+	{
+		if (g_settings.GetVerboseLevel()>1)
+			std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (OPENEMS_SYCL_FUSED_STEP=0)" << std::endl;
 		return false;
+	}
 	if (fused_blockers>0)
 	{
 		if (g_settings.GetVerboseLevel()>1)
@@ -1133,6 +1138,21 @@ std::string GPU_Backend_SYCL::GetName() const
 	return "SYCL (" + d->ctx->name + ")";
 }
 
+// The coefficient statistics line of the verbose output (one per grid): the nodes, the storage
+// mode, the number of sets and the bytes of coefficient traffic per node (the set index, 2 or 4
+// bytes, plus the small cached table; the 12 floats of the full arrays, 48 bytes).
+static std::string CoefficientStatistics(size_t nodes, int mode, size_t sets, size_t table_bytes)
+{
+	std::ostringstream o;
+	o << "GPU_Backend_SYCL: coefficients: " << nodes << " nodes, ";
+	if (mode==0)
+		o << "full arrays, " << sets << " sets, " << 12*sizeof(float) << " bytes per node of coefficient traffic";
+	else
+		o << "sets (" << (mode==1 ? 16 : 32) << " bit index), " << sets << " sets, " << (mode==1 ? 2 : 4)
+		  << " bytes per node of coefficient traffic + table " << table_bytes << " bytes";
+	return o.str();
+}
+
 bool GPU_Backend_SYCL::Init(const Operator* op)
 {
 	unsigned int numLines[3];
@@ -1187,6 +1207,8 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_SYCL: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << index_bits << std::endl;
+		if (g_settings.GetVerboseLevel()>1)
+			std::cout << CoefficientStatistics(d->numCells, sets.mode, sets.count, sets.table.size()*sizeof(float)) << std::endl;
 		return true;
 	}
 
@@ -1199,7 +1221,10 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->ii = upload(2);
 	d->iv = upload(3);
 	if (g_settings.GetVerboseLevel()>1)
+	{
 		std::cout << "GPU_Backend_SYCL: full coefficient arrays" << index_bits << std::endl;
+		std::cout << CoefficientStatistics(d->numCells, 0, 0, 0) << std::endl;
+	}
 	return true;
 }
 
