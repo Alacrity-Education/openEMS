@@ -29,6 +29,7 @@ class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
 class TiXmlElement;
+class CSPropMaterial;
 
 //! Basic FDTD-operator
 class Operator : public Operator_Base
@@ -281,7 +282,7 @@ protected:
 	virtual bool Calc_ECPos(
 		int ny,
 		const unsigned int* pos,
-		double* EC, std::vector<CSPrimitives *> vPrims
+		double* EC, const std::vector<CSPrimitives *>& vPrims
 	) const;
 
 	//! Get the FDTD raw disc delta, needed by Calc_EffMatPos() \sa Calc_EffMatPos
@@ -297,9 +298,28 @@ protected:
 		int ny,
 		const double coords[3],
 		int MatType,
-		std::vector<CSPrimitives*> vPrims,
+		const std::vector<CSPrimitives*>& vPrims,
 		bool markAsUsed=true
 	) const;
+
+	//! The two values of one sample point of the averaging from one search: the types \a MatType and \a MatType+1 (0: permittivity and conductivity, 2: permeability and magnetic loss), as two GetMaterial() calls return them
+	virtual void GetMaterialPair(
+		int ny,
+		const double coords[3],
+		int MatType,
+		const std::vector<CSPrimitives*>& vPrims,
+		double* value,
+		bool markAsUsed=true
+	) const;
+
+	//! The first primitive of \a vPrims (priority sorted) that contains \a coords within the drawing tolerance, NULL for none: the loop of ContinuousStructure::GetPropertyByCoordPriority
+	CSPrimitives* FirstPrimitive(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const;
+
+	//! The material of the first primitive at \a coords, NULL for none or a non-material property (the background)
+	CSPropMaterial* FindMaterial(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const;
+
+	//! The value of type \a MatType of the material \a mat at \a coords, the background value for NULL
+	double MaterialValue(CSPropMaterial* mat, int ny, const double* coords, int MatType) const;
 
 	MatAverageMethods m_MatAverageMethod;
 
@@ -308,21 +328,21 @@ protected:
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatCellCenter(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatQuarterCell(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	//! Calc operator at certain \a pos

@@ -119,7 +119,16 @@ protected:
 		int ny,
 		const double coords[3],
 		int MatType,
-		std::vector<CSPrimitives*> vPrims,
+		const std::vector<CSPrimitives*>& vPrims,
+		bool markAsUsed=true
+	) const;
+
+	virtual void GetMaterialPair(
+		int ny,
+		const double coords[3],
+		int MatType,
+		const std::vector<CSPrimitives*>& vPrims,
+		double* value,
 		bool markAsUsed=true
 	) const;
 
