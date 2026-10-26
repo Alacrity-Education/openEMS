@@ -124,7 +124,7 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	const size_t count = op_ext->m_LM_Count.at(0);
 	m_Param.count = count;
 	m_Param.poles = op_ext->m_PoleCount;
-	m_Param.sn = d->numCells;
+	m_Param.sn = d->numCellsD;
 	if (count==0)
 		return;
 
@@ -132,8 +132,10 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	std::vector<size_t> flat(count);
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	m_Pos = d->Alloc<size_t>(count, flat.data());
 	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_HIP::Impl::MurRefusal()
+	for (size_t i=0; i<count; ++i)
+		flat[i] = d->Dev(flat[i]);   // the device layout (OPENEMS_HIP_ZPAD)
+	m_Pos = d->Alloc<size_t>(count, flat.data());
 
 	m_Pole  = d->Alloc<float>((size_t)m_Param.poles*3*count);
 	m_Pre   = d->Alloc<float>(3*(size_t)count);

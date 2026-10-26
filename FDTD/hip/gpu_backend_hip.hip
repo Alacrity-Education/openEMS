@@ -23,6 +23,8 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -30,12 +32,17 @@
 #include "hip_internal.h"
 #include "gpu_build_id.h"
 #include "FDTD/operator.h"
+#include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/extensions/engine_ext_mur_abc.h"
 #include "FDTD/extensions/engine_ext_dispersive.h"
+#include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/operator_ext_excitation.h"
+#include "FDTD/extensions/operator_ext_lumpedRLC.h"
+#include "FDTD/extensions/operator_ext_steadystate.h"
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
@@ -78,10 +85,10 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
 	const float* vv = C.a;
@@ -213,10 +220,10 @@ __device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, co
                                               unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
                                               unsigned int x, unsigned int y, unsigned int z)
 {
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;
-	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;
+	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
 	mur_volt_component<0>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
@@ -315,10 +322,10 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
 	}
 	if ((x<S.L.nx) || (x>=S.H.nx) || (y<S.L.ny) || (y>=S.H.ny) || (z<S.L.nz) || (z>=S.H.nz))
 		return;   // a node of mur_shell
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
 	if (!ZF)
@@ -424,10 +431,10 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 	}
 	if (z+1>=N.nz || y+1>=N.ny || x+1>=N.nx)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xp = (size_t)N.ny*N.nz;
-	const size_t yp = N.nz;
+	const size_t xp = (size_t)N.ny*N.nzd;
+	const size_t yp = N.nzd;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 6);
 	const float* ii = C.a;
 	const float* iv = C.b;
@@ -458,10 +465,10 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
                                            const void* index, const float* va, const float* vb, unsigned int mode,
                                            const HIP_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0);
 	float t;
@@ -513,7 +520,7 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const bool main_yz = (z<E.nz) && (y<E.ny);                          // a main node line
 	const bool owner = main_yz && (tz<TZ-1) && (ty<TY-1);  // written by this block
 	const bool in_grid = (z<N.nz) && (y<N.ny);
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 
 	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
@@ -674,10 +681,10 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nodes[k];
-	const size_t xp = (size_t)N.ny*N.nz;
-	const size_t yp = N.nz;
+	const size_t xp = (size_t)N.ny*N.nzd;
+	const size_t yp = N.nzd;
 	const HIP_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
 	c  = curr_in[i] * C.a[0];
@@ -700,7 +707,7 @@ __global__ void energy_lines(const float* __restrict__ volt, const float* __rest
 	const unsigned int y = blockIdx.y*blockDim.y + threadIdx.y;
 	if (z>=L.nz || y>=L.ny)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	float E = 0, H = 0;
 	for (unsigned int x=0; x<L.nx; ++x)
 	{
@@ -804,8 +811,12 @@ HIP_Context::~HIP_Context()
 
 GPU_Backend_HIP::Impl::Impl()
 {
-	dim.nx = dim.ny = dim.nz = 0;
-	numCells = 0;
+	dim.nx = dim.ny = dim.nz = dim.nzd = 0;
+	numCells = numCellsD = 0;
+	shape_mode = 0;
+	shape_tz = shape_ty = 0;
+	shape_decided = false;
+	shape_block = dim3(0, 0, 0);
 	volt = curr = vv = vi = ii = iv = NULL;
 	coeff_mode = 0;
 	index = NULL;
@@ -904,8 +915,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 			list.push_back(*it);
 	}
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
-	volt_next = TryAlloc<float>(3*numCells);
-	curr_next = TryAlloc<float>(3*numCells);
+	volt_next = TryAlloc<float>(3*numCellsD);
+	curr_next = TryAlloc<float>(3*numCellsD);
 	if ((volt_next==NULL) || (curr_next==NULL))
 	{
 		Free(volt_next);
@@ -915,11 +926,13 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		return false;
 	}
 	fixup_count = list.size();
+	for (size_t k=0; k<list.size(); ++k)
+		list[k] = Dev(list[k]);   // host flat indices above, see numCellsD
 	fixup = Alloc<size_t>(fixup_count, list.data());
 
 	// both buffers start with the current fields
-	HIP_Check(hipMemcpyAsync(volt_next, volt, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
-	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
+	HIP_Check(hipMemcpyAsync(volt_next, volt, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
+	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	Flush();
 	fused_step = 1;
 	if (g_settings.GetVerboseLevel()>1)
@@ -1049,7 +1062,8 @@ std::string GPU_Backend_HIP::Impl::MurZFaceRefusal()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	MainRange(B, E, threads_z);
-	const dim3 block = Block(threads_z, E.ny-B.ny);
+	// the block of the launch: DecideShape() ran before this decision (the fused step leaves it unset, then Block())
+	const dim3 block = (shape_block.x>0) ? shape_block : Block(threads_z, E.ny-B.ny);
 	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
 	for (unsigned int f=0; f<2; ++f)
 		if ((mur_zf.c_x[f]!=NULL) && !HIP_SameWarpZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, ctx->warp_size))
@@ -1178,6 +1192,105 @@ void GPU_Backend_HIP::Impl::MainRange(HIP_GridDim& B, HIP_GridDim& E, unsigned i
 		zslabs.t_int = warps(zslabs.z_hi - zslabs.z_lo);
 		threads_z = zslabs.t_lo + zslabs.t_int + warps(E.nz - zslabs.z_hi);
 	}
+}
+
+void GPU_Backend_HIP::Impl::DecideShape()
+{
+	if (shape_decided)
+		return;
+	shape_decided = true;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (fused_step>0)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: shape: unused (fused step)" << std::endl;
+		return;
+	}
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	std::ostringstream reason;
+	if (shape_mode==0)
+		reason << "default";
+	else
+	{
+		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
+		// shape, after a warm-up, rounds of update_voltages + update_currents pairs, the best round counts. The UPML
+		// regions along z in the main kernels (HIP_ZSlabs) update their flux in place: the timed launches take every
+		// node of the range as a main node instead (the same lines and reads, without the flux)
+		static const unsigned int candidates[][2] = {{16, 16}, {32, 8}, {32, 4}, {64, 4}, {128, 2}};
+		const unsigned int n_cand = sizeof(candidates)/sizeof(candidates[0]);
+		const unsigned int pairs = 20, rounds = 2;
+		const bool c = coeff_mode>0;
+		const unsigned int nt = E.nz - B.nz, nj = E.ny - B.ny, nk = E.nx - B.nx;
+		float* v = (nt && nj && nk) ? TryAlloc<float>(3*numCellsD) : NULL;
+		float* i = v ? TryAlloc<float>(3*numCellsD) : NULL;
+		hipEvent_t start = NULL, stop = NULL;
+		const bool ok = (i!=NULL) && (hipEventCreate(&start)==hipSuccess) && (hipEventCreate(&stop)==hipSuccess);
+		if (ok)
+		{
+			HIP_Check(hipMemcpyAsync(v, volt, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "shape tuning buffers");
+			HIP_Check(hipMemcpyAsync(i, curr, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "shape tuning buffers");
+			HIP_ZSlabs Z = zslabs;
+			Z.t_lo = Z.t_int = 0;
+			Z.z_lo = B.nz;
+			Z.z_hi = E.nz;
+			auto run = [&](unsigned int k, unsigned int n)
+			{
+				const dim3 block(candidates[k][0], candidates[k][1], 1);
+				const dim3 grid = Grid(block, nt, nj, nk);
+				for (unsigned int p=0; p<n; ++p)
+				{
+					update_voltages<<<grid, block, 0, Stream()>>>(v, (const float*)i, (const void*)index, (const float*)(c ? coeff : vv),
+					                                               (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, Z);
+					update_currents<<<grid, block, 0, Stream()>>>(i, (const float*)v, (const void*)index, (const float*)(c ? coeff : ii),
+					                                               (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, Z);
+				}
+				CheckLaunch("shape tuning");
+			};
+			std::vector<float> best(n_cand, std::numeric_limits<float>::max());
+			for (unsigned int k=0; k<n_cand; ++k)
+				run(k, 2);
+			for (unsigned int r=0; r<rounds; ++r)
+				for (unsigned int k=0; k<n_cand; ++k)
+				{
+					HIP_Check(hipEventRecord(start, Stream()), "hipEventRecord");
+					run(k, pairs);
+					HIP_Check(hipEventRecord(stop, Stream()), "hipEventRecord");
+					HIP_Check(hipEventSynchronize(stop), "hipEventSynchronize");
+					float ms = 0;
+					HIP_Check(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
+					best[k] = std::min(best[k], 1000*ms/pairs);
+				}
+			unsigned int b = 0;
+			for (unsigned int k=1; k<n_cand; ++k)
+				if (best[k]<best[b])
+					b = k;
+			shape_mode = 1;
+			shape_tz = candidates[b][0];
+			shape_ty = candidates[b][1];
+			reason << "timed:";
+			for (unsigned int k=0; k<n_cand; ++k)
+				reason << " " << candidates[k][0] << "x" << candidates[k][1] << " " << std::fixed << std::setprecision(1) << best[k] << " us";
+			reason << " per voltage and current update, best " << shape_tz << "x" << shape_ty;
+		}
+		else
+		{
+			(void)hipGetLastError();
+			shape_mode = 0;
+			reason << "default, no nodes or not enough device memory to time the shapes";
+		}
+		if (start)
+			(void)hipEventDestroy(start);
+		if (stop)
+			(void)hipEventDestroy(stop);
+		Flush();
+		Free(v);
+		Free(i);
+	}
+	shape_block = MainBlock(threads_z, E.ny-B.ny);
+	if (verbose)
+		std::cout << "GPU_Backend_HIP: shape: " << shape_block.x << "x" << shape_block.y << " (" << reason.str() << ")" << std::endl;
 }
 
 void GPU_Backend_HIP::Impl::FreeSnapshots()
@@ -1390,7 +1503,85 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->dim.nx = numLines[0];
 	d->dim.ny = numLines[1];
 	d->dim.nz = numLines[2];
+	d->dim.nzd = numLines[2];
 	d->numCells = (size_t)numLines[0]*numLines[1]*numLines[2];
+	// OPENEMS_HIP_ZPAD: the z lines of the device layout are stored with a stride rounded up to a multiple of 64, so that
+	// every line starts on the same alignment (see nijk()). auto (default): padded if the fused step will be blocked (the
+	// separate main kernels gain from it; the fused step does not), unless the padding would more than double the z
+	// lines or the padded fields and full coefficient arrays (24 + 48 bytes a node, the most the main update allocates)
+	// would take more than half of the free device memory; 0: off. The prediction of the fused step is the test of
+	// CreateExtension() on the operator extensions (each becomes one engine extension), the sub-grids and
+	// OPENEMS_HIP_FUSED_STEP=0; the other reasons are only known later (UPML that cannot fuse, an excited current on a
+	// last line, memory): those grids keep the unpadded layout with the separate kernels.
+	const unsigned int zpad = 64;
+	const char* zpad_env = getenv("OPENEMS_HIP_ZPAD");
+	const bool zpad_auto = !(zpad_env && (std::string(zpad_env)=="0"));
+	if (zpad_env && zpad_auto && (std::string(zpad_env)!="auto"))
+		std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_ZPAD=" << zpad_env << " is not auto or 0, using auto" << std::endl;
+	std::string zpad_reason;   // what blocks the fused step (auto pads), empty: nothing
+	std::string zpad_skip;     // why auto does not pad although the fused step is blocked
+	if (zpad_auto)
+	{
+		const char* fused_env = getenv("OPENEMS_HIP_FUSED_STEP");
+		if (fused_env && (atoi(fused_env)==0))
+			zpad_reason = "OPENEMS_HIP_FUSED_STEP=0";
+		else if ((d->fused_blockers>0) || dynamic_cast<const Operator_CylinderMultiGrid*>(op))
+			zpad_reason = "a sub-grid";   // a sub-grid (see NewSubGridBackend()), or the grid of a multi-grid operator, which gets one
+		for (size_t n=0; (n<op->GetNumberOfExtentions()) && zpad_reason.empty(); ++n)
+		{
+			Operator_Extension* op_ext = op->GetExtension(n);
+			if (!dynamic_cast<Operator_Ext_UPML*>(op_ext) && !dynamic_cast<Operator_Ext_Excitation*>(op_ext)
+			    && !dynamic_cast<Operator_Ext_LumpedRLC*>(op_ext) && !dynamic_cast<Operator_Ext_SteadyState*>(op_ext))
+				zpad_reason = op_ext->GetExtensionName();
+		}
+		if (!zpad_reason.empty())
+		{
+			const unsigned int nzd = (numLines[2] + zpad - 1)/zpad*zpad;
+			const size_t padded_bytes = (size_t)numLines[0]*numLines[1]*nzd*(24 + 48);
+			size_t free_bytes = 0, total_bytes = 0;
+			std::ostringstream skip;
+			if (nzd - numLines[2] > numLines[2])
+				skip << "the padding would more than double the " << numLines[2] << " z lines";
+			else if (hipMemGetInfo(&free_bytes, &total_bytes)!=hipSuccess)
+			{
+				(void)hipGetLastError();
+				skip << "the free device memory is unknown";
+			}
+			else if (padded_bytes > free_bytes/2)
+				skip << "the padded fields and coefficients (" << (padded_bytes>>20) << " MiB) would take more than half of the free device memory ("
+				     << (free_bytes>>20) << " MiB)";
+			zpad_skip = skip.str();
+			if (zpad_skip.empty())
+				d->dim.nzd = nzd;
+		}
+	}
+	d->numCellsD = (size_t)numLines[0]*numLines[1]*d->dim.nzd;
+	if (g_settings.GetVerboseLevel()>1)
+	{
+		if (d->dim.nzd!=d->dim.nz)
+		{
+			std::ostringstream pct;
+			pct << std::fixed << std::setprecision(1) << 100.0*(d->dim.nzd - d->dim.nz)/d->dim.nz;
+			std::cout << "GPU_Backend_HIP: z padding: " << d->dim.nz << " lines stored as " << d->dim.nzd << " (auto: the fused step is blocked by "
+			          << zpad_reason << ", " << pct.str() << " % more field memory)" << std::endl;
+		}
+		else if (!zpad_auto)
+			std::cout << "GPU_Backend_HIP: z padding: off" << std::endl;
+		else if (zpad_reason.empty())
+			std::cout << "GPU_Backend_HIP: z padding: off (auto: fused step)" << std::endl;
+		else
+			std::cout << "GPU_Backend_HIP: z padding: off (auto: the fused step is blocked by " << zpad_reason << ", but " << zpad_skip << ")" << std::endl;
+	}
+	// OPENEMS_HIP_SHAPE: auto (default: timed, see DecideShape()) or 0 Block()
+	d->shape_mode = 2;
+	if (const char* env = getenv("OPENEMS_HIP_SHAPE"))
+	{
+		const std::string shape = env;
+		if (shape=="0")
+			d->shape_mode = 0;
+		else if (shape!="auto")
+			std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_SHAPE=" << shape << " is not 0 or auto, using auto" << std::endl;
+	}
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
@@ -1415,7 +1606,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 
 	// The fused step indexes with 32 bit on NVIDIA while the fields fit (faster there), with
 	// 64 bit on AMD; OPENEMS_HIP_INDEX=32 or 64 overrides.
-	const bool fits32 = 3*d->numCells <= UINT_MAX;
+	const bool fits32 = 3*d->numCellsD <= UINT_MAX;
 #ifdef __HIP_PLATFORM_AMD__
 	d->index32 = false;
 #else
@@ -1429,7 +1620,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 		d->index32 = false;
 	}
 
-	const size_t count = 3*d->numCells;
+	const size_t count = 3*d->numCellsD;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
 	if (d->window.on)
@@ -1442,7 +1633,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
-		d->index = d->AllocIndex(sets);
+		d->index = d->AllocIndex(sets, d->dim.nzd!=d->dim.nz);   // per node of the device layout
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
@@ -1453,7 +1644,13 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
 	std::vector<float> values;
-	auto upload = [&](int c) {GPU_CoefficientArray(op, numLines, c, values); return d->Alloc<float>(count, values.data());};
+	auto upload = [&](int c)
+	{
+		GPU_CoefficientArray(op, numLines, c, values);
+		if (d->dim.nzd!=d->dim.nz)
+			values = d->Padded(values.data(), values.size());   // per node of the device layout
+		return d->Alloc<float>(count, values.data());
+	};
 	d->vv = upload(0);
 	d->vi = upload(1);
 	d->ii = upload(2);
@@ -1465,6 +1662,7 @@ void GPU_Backend_HIP::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
 	const bool fused = d->DecideFusedStep();
+	d->DecideShape();       // once, after the fused step and before DecideMurFused() (which may refuse a shape)
 	d->DecideMurFused();   // once, after the pre hooks of the first timestep (the UPML decides its regions there)
 	if (fused)
 	{
@@ -1516,18 +1714,18 @@ void GPU_Backend_HIP::UpdateVoltages()
 			S.H.nz = d->main_stop.nz;
 			HIP_MurZFaces M = d->mur_zf;
 			M.active = (d->mur.active>>4) & 3u;
-			HIP_Launch(d, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
 			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, M);
 		}
 		else
-			HIP_Launch(d, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
 			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, d->mur_zf);
 		HIP_Launch(d, "mur_shell", mur_shell, d->mur_shell_count, 1, 1,
 		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim,
 		            S, (const HIP_MurFace*)d->mur_dev, d->mur.active);
 		return;
 	}
-	HIP_Launch(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
@@ -1547,7 +1745,7 @@ void GPU_Backend_HIP::UpdateCurrents()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	HIP_Launch(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->curr, (const float*)d->volt, (const void*)d->index, (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
@@ -1589,6 +1787,7 @@ GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned
 void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
 {
 	const bool c = coeff_mode>0;
+	DecideShape();      // as UpdateVoltages(): once, before DecideMurFused()
 	DecideMurFused();   // as UpdateVoltages(): once, after the pre hooks of the first timestep
 	HIP_GridDim B, E;
 	unsigned int threads_z;
@@ -1597,7 +1796,7 @@ void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, uns
 	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
 	if ((E.nx<=B.nx) || (E.ny<=B.ny))
 		return;
-	HIP_Launch(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs);
 }
 
@@ -1611,7 +1810,7 @@ void GPU_Backend_HIP::Impl::WindowCurrents(unsigned int x0, unsigned int x1, uns
 	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
 	if ((E.nx<=B.nx) || (E.ny<=B.ny))
 		return;
-	HIP_Launch(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            curr, (const float*)volt, (const void*)index, (const float*)(c ? coeff : ii), (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, zslabs);
 }
 
@@ -1702,11 +1901,22 @@ static void CheckSize(size_t host_count, size_t device_count)
 		throw std::runtime_error("GPU_Backend_HIP: host and device field size mismatch");
 }
 
+// OPENEMS_HIP_ZPAD: \a lines z lines of the host layout (stride nz) from or to the device layout (stride nzd), the padding untouched
+static void CopyLines(GPU_Backend_HIP::Impl* d, void* dst, const void* src, size_t lines, hipMemcpyKind kind, const char* what)
+{
+	const size_t host_pitch = d->dim.nz*sizeof(float), dev_pitch = d->dim.nzd*sizeof(float);
+	const bool to_host = (kind==hipMemcpyDeviceToHost);
+	HIP_Check(hipMemcpy2DAsync(dst, to_host ? host_pitch : dev_pitch, src, to_host ? dev_pitch : host_pitch, host_pitch, lines, kind, d->Stream()), what);
+}
+
 void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, volt.data(), d->volt, volt.size()/d->dim.nz, hipMemcpyDeviceToHost, "download");
+	else
+		HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 }
 
@@ -1714,7 +1924,10 @@ void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, curr.data(), d->curr, curr.size()/d->dim.nz, hipMemcpyDeviceToHost, "download");
+	else
+		HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 }
 
@@ -1722,7 +1935,10 @@ void GPU_Backend_HIP::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(d->volt, volt.data(), volt.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->volt, volt.data(), volt.size()/d->dim.nz, hipMemcpyHostToDevice, "upload");
+	else
+		HIP_Check(hipMemcpyAsync(d->volt, volt.data(), volt.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
 	d->Flush();
 }
 
@@ -1730,7 +1946,10 @@ void GPU_Backend_HIP::UploadCurrents(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(d->curr, curr.data(), curr.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->curr, curr.data(), curr.size()/d->dim.nz, hipMemcpyHostToDevice, "upload");
+	else
+		HIP_Check(hipMemcpyAsync(d->curr, curr.data(), curr.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
 	d->Flush();
 }
 
@@ -1738,6 +1957,21 @@ bool GPU_Backend_HIP::DownloadRange(bool currents, size_t offset, size_t count, 
 {
 	if (offset+count > 3*d->numCells)
 		return false;
+	if (d->dim.nzd!=d->dim.nz)
+	{
+		// OPENEMS_HIP_ZPAD: a part of one z line, or whole z lines (the caller, Engine_GPU, asks for one line);
+		// else the host falls back
+		const size_t nz = d->dim.nz;
+		const float* src = (currents ? d->curr : d->volt) + d->Dev(offset);
+		if (offset%nz + count <= nz)
+			HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
+		else if ((offset%nz==0) && (count%nz==0))
+			CopyLines(d, dst, src, count/nz, hipMemcpyDeviceToHost, "range download");
+		else
+			return false;
+		d->Flush();
+		return true;
+	}
 	const float* src = (currents ? d->curr : d->volt) + offset;
 	HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
 	d->Flush();

@@ -65,6 +65,18 @@ there are unreleased changes. It becomes the next release entry.
   main voltage update loses the cache warming the old kernels gave it. A
   version with the sheet update inside the voltage kernel was bit-identical
   and no faster.
+- The HIP backend stores the z lines of its device layout with a stride
+  rounded up to a multiple of 64 on grids where extensions such as Mur ABC or
+  conducting sheets block the fused step, so that every line starts on the
+  same alignment (`OPENEMS_HIP_ZPAD=auto`, the default; `0` off); it keeps the
+  unpadded layout where the padding would more than double the z lines or the
+  padded grid would take more than half of the free device memory. It also
+  times the block of its separate main kernels on the live grid at the first
+  timestep (`OPENEMS_HIP_SHAPE=auto`, the default; `0` the former block). The
+  results are bit-identical; the fused step keeps the unpadded layout. On an
+  RTX 5090 a model of 3.06 Mcells (40 z lines, Mur and sheets) runs at 11572
+  MC/s instead of 10226 (+13 %), its two main kernels taking 172 us a step
+  instead of 232.
 
 ### Fixed
 
