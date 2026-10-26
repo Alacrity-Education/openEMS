@@ -371,6 +371,13 @@ protected:
 	virtual void Calc_EC_Range(unsigned int xStart, unsigned int xStop);
 	//! On an operator cache hit Calc_EC and CalcPEC are not called: release any build thread that waits for them
 	virtual void SkipBuildThreads() {}
+
+	//! Build the priority-sorted primitive list of \a type once for a pass (Calc_EC, CalcPEC): GetPrimitivesBoundBox() filters it per column until EndPassPrimitives()
+	void BeginPassPrimitives(CSProperties::PropertyType type);
+	void EndPassPrimitives();
+	bool m_PassPrims_On;
+	CSProperties::PropertyType m_PassPrims_Type;
+	std::vector<CSPrimitives*> m_PassPrims; //!< CSX->GetAllPrimitives(true, m_PassPrims_Type), read-only during the pass
 	FDTD_FLOAT* EC_C[3];
 	FDTD_FLOAT* EC_G[3];
 	FDTD_FLOAT* EC_L[3];
