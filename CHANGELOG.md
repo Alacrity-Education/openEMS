@@ -34,6 +34,16 @@ there are unreleased changes. It becomes the next release entry.
   structure closed by PEC. Away from DC the spectrum is the same; below about
   f0-fc it falls to zero at DC. With `f0=0` the pulse is the derivative of the
   Gaussian, with its peak at about 0.47*fc and its -20dB edge at 1.3*fc.
+- The HIP backend runs the Mur ABC inside the voltage update, with
+  bit-identical results: the voltages of the Mur planes (the boundary line and
+  the line next to it) are updated in one launch with their Mur values, beside
+  the main update of the other nodes (two launches per timestep instead of one
+  plus three per plane). A grid where this does not apply (a Mur plane through
+  a UPML region, TF/SF, steady-state detection, or a material or lumped element
+  on a plane) runs the separate launches, which `--verbose=2` prints. On an
+  RTX 5090 a PCB model of 28.7 Mcells with Mur on all six faces settles at
+  8929 MC/s instead of 7963 (+12 %), a model of 3.1 Mcells at 10405 instead
+  of 9758 (+6.6 %).
 
 ### Fixed
 
