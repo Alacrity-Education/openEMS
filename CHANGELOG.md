@@ -61,18 +61,58 @@ there are unreleased changes. It becomes the next release entry.
   `OPENEMS_HIP_MUR_FUSED=0` restores them everywhere. On an RTX 5090 a board
   of 28.7 Mcells with Mur on all six faces settles at 8929 MC/s instead of
   7963 (+12 %), a model of 3.1 Mcells at 10405 instead of 9758 (+6.6 %).
-- `OPENEMS_HIP_SHEET_PLANES=1` runs the conducting sheets of the HIP backend
-  as dense state per sheet plane when the sheets lie on z planes: one launch
-  per half-step for all planes and both dispersion orders, the in-plane
-  components only, instead of two launches per order over a position list
-  with all three components. The results are bit-identical. It is off by
-  default: on an RTX 5090, a board model of 3.06 Mcells with four copper
-  layers (266663 sheet cells) takes 30.3 us a step in the sheet kernels
-  instead of 56.0 us, but the main voltage update loses the head start the
-  old kernels gave it (98.8 to 113.9 us), so the run is 1.3 % faster
-  (9887 MC/s against 9757), within the noise of the comparison. A version
-  with the sheet update inside the voltage kernel was bit-identical and no
-  faster (9758 MC/s) and was not kept.
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are lanes of one warp and
+  exchange their values through warp shuffles (bit-identical; a grid with
+  fewer than 6 z lines, no Mur plane on a z face, or the two lines in
+  different warps keeps them in the shell launch, `OPENEMS_HIP_MUR_FUSED=1`
+  forces that). On an RTX 5090 the board settles at 12822 MC/s instead of
+  10602 with the z faces in the kernel (2.24 ms a step instead of 2.71), the
+  model of 3.1 Mcells at 11854 instead of 10394.
+- The HIP backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, instead of two launches
+  per order over a position list with all three components. The results are
+  bit-identical; `OPENEMS_HIP_SHEET_PLANES=0` restores the position lists.
+  On an RTX 5090 a board of 28.7 Mcells with four copper layers (2.5 million
+  sheet cells) settles at 10602 MC/s instead of 8929 (+19 %, 2.71 ms a step
+  instead of 3.21); a model of 3.06 Mcells gains 1.3 %, where the sheet
+  kernels shrink from 56 to 30 us a step but the main voltage update loses
+  the cache warming the old kernels gave it. A version with the sheet update
+  inside the voltage kernel was bit-identical and no faster.
+- The HIP backend stores the z lines of its device layout with a stride
+  rounded up to a multiple of 64 on grids where extensions such as Mur ABC
+  or conducting sheets block the fused step (`OPENEMS_HIP_ZPAD=auto`, the
+  default; `0` off, `32`, `48`, `64` forced), so that every line starts on the
+  same alignment, and times the block of its separate main kernels on the
+  live grid at the first timestep (`OPENEMS_HIP_SHAPE=auto`, the default;
+  `0` the former block, `TZxTY` forced). The results are bit-identical; the
+  fused step keeps the unpadded layout. On an RTX 5090 a model of 3.06 Mcells
+  (40 z lines, Mur and sheets) runs at 11572 MC/s instead of 10226 (+13 %),
+  its two main kernels taking 172 us a step instead of 232.
+- `OPENEMS_HIP_COEFF=sets|full|factor` selects how the HIP backend stores the
+  update coefficients, as `OPENEMS_SYCL_COEFF` does for the SYCL backend:
+  deduplicated sets (the default, exact, falling back to full arrays), the
+  full arrays, or `factor`, a material factor per edge times the edge geometry
+  rebuilt in the kernel from 1-D tables (a double-float product rounded once;
+  nodes off by more than 2 ulp keep their exact coefficients, Cartesian meshes
+  only). The default kernels are unchanged instruction for instruction (the
+  coefficient form is a compile-time choice). With `factor` the 38 golden cases
+  stay within 7.5e-6 of the peak, the same deviations as the SYCL backend; a
+  model of 3.06 Mcells goes from 605968 exact sets (29 MB, 32 bit index) to
+  14327 normalized sets (0.69 MB, 16 bit index) with no exception node and
+  runs at 15601 MC/s instead of 13912 on an RTX 5090. Opt-in.
+- `OPENEMS_HIP_WINDOW=auto` or `T,W` (development, off by default) runs the
+  HIP backend's timesteps as blocks of T steps marched along x in windows of
+  W planes that stay in the L2 cache, each block captured once as a graph
+  and replayed. The voltage and current frontiers step back one plane per
+  timestep, so every cell is updated once per step from the values the
+  single step would give it: the results are bit-identical, and
+  `OPENEMS_HIP_WINDOW_CHECK=1` checks every launch's half-steps on the
+  device. Grids with TF/SF, Debye materials, absorbing sheets, cylindrical
+  coordinates, multi-grids or Mur planes outside the voltage update keep the
+  single step. On an RTX 5090 a model of 3.06 Mcells (Mur, four sheet
+  planes) runs at 21806 MC/s instead of 13901 (+57 %, auto: T=8, W=143).
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

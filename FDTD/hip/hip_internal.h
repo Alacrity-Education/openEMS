@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <map>
 #include <memory>
 #include <set>
@@ -32,10 +33,12 @@
 #include "gpu_backend_hip.h"
 #include "FDTD/gpu_coeff_sets.h"
 
-//! Grid size (number of mesh lines) as passed to the kernels
+//! Grid size (number of mesh lines) as passed to the kernels. nzd: the values stored per (x, y) line of the
+//! device layout, the z stride (OPENEMS_HIP_ZPAD, see GPU_Backend_HIP::Impl::dim); nz <= nzd, equal without
+//! padding. nx, ny, nz are the extents (bounds, last lines). A range of nodes (B, E, ...) does not use nzd.
 struct HIP_GridDim
 {
-	unsigned int nx, ny, nz;
+	unsigned int nx, ny, nz, nzd;
 };
 
 //! The kernels index the fields with size_t. The fused step (update_fused) is also built with
@@ -43,17 +46,14 @@ struct HIP_GridDim
 //! the index type I as a template parameter, size_t by default.
 template<typename T> struct HIP_NoDeduce { typedef T type; };
 
-//! Fields and coefficients use the ArrayNIJK layout of the host:
-//! index(n,x,y,z) = n*nx*ny*nz + x*ny*nz + y*nz + z
+//! Fields and coefficients use the ArrayNIJK layout of the host with the z stride nzd (OPENEMS_HIP_ZPAD):
+//! index(n,x,y,z) = n*nx*ny*nzd + x*ny*nzd + y*nzd + z; the padded values z >= nz are zero and never read for a result
 template<typename I = size_t>
 __device__ __forceinline__ I nijk(const HIP_GridDim& N, unsigned int n, unsigned int x, unsigned int y, unsigned int z)
 {
-	return (((I)n*N.nx + x)*N.ny + y)*N.nz + z;
+	return (((I)n*N.nx + x)*N.ny + y)*N.nzd + z;
 }
 
-//! Main update coefficients of node i, see GPU_Backend_HIP::Impl::coeff_mode:
-//! a[n*s] and b[n*s] are vv/vi (voltages, set_offset 0) or ii/iv (currents, set_offset 6)
-//! of direction n. Mode 0: ca/cb are the full arrays, else ca is the table of sets.
 //! The raw values of a dump on the device, see Engine_GatherRegion: value e of component n is
 //! the edge (n, lines[n][0][a], lines[n][1][b], lines[n][2][c]) with e = start[n] + (a*size[n][1] + b)*size[n][2] + c
 struct HIP_GatherRegion
@@ -75,7 +75,14 @@ __device__ __forceinline__ size_t region_field_index(const HIP_GatherRegion& R, 
 	return nijk(N, n, R.lines[n][0][a], R.lines[n][1][b], R.lines[n][2][c]);
 }
 
-template<typename I> struct HIP_MainCoeffT { const float* a; const float* b; I s; };
+//! Main update coefficients of node i, see GPU_Backend_HIP::Impl::coeff_mode: a[n*s] and b[n*s] are vv/vi
+//! (voltages, set_offset 0) or ii/iv (currents, set_offset 6) of direction n. FACTOR false (modes 0-2):
+//! pointers, read where the kernel uses them; mode 0: into the full arrays ca/cb, 1/2: into the table of sets.
+//! FACTOR true (modes 3/4, OPENEMS_HIP_COEFF=factor): the values, reconstructed by main_coeff(), s is 1. A
+//! compile time choice, so that the kernels of the default modes contain no factor code: every kernel that
+//! reads main coefficients is built for both, the launches pick it by coeff_mode>=3 (GPU_Backend_HIP::Impl::Factor()).
+template<typename I, bool FACTOR = false> struct HIP_MainCoeffT { const float* a; const float* b; I s; };
+template<typename I> struct HIP_MainCoeffT<I, true> { float a[3]; float b[3]; static constexpr I s = 1; };
 typedef HIP_MainCoeffT<size_t> HIP_MainCoeff;
 
 template<typename I = size_t>
@@ -94,10 +101,101 @@ __device__ __forceinline__ HIP_MainCoeffT<I> main_coeff(const void* index, const
 	return c;
 }
 
+//! The value of a HIP_MainCoeffT that is not read (a node whose update is skipped)
+template<typename I, bool FACTOR>
+__device__ __forceinline__ HIP_MainCoeffT<I, FACTOR> main_coeff_unused(const float* ca, const float* cb)
+{
+	if constexpr (!FACTOR)
+		return HIP_MainCoeffT<I>{ca, cb, 0};
+	else
+	{
+		(void)ca; (void)cb;
+		return HIP_MainCoeffT<I, true>{};
+	}
+}
+
+//! Factorized coefficients (coeff_mode 3/4, OPENEMS_HIP_COEFF=factor): the buffer ca (= cb) holds
+//!   [0]                           the first exact set (uint32 bits), then padding up to HIP_FACTOR_HDR,
+//!   [HIP_FACTOR_HDR + 2*t*L + o]  four geometry tables t of L = nx+ny+nz values, o = x, nx+y, nx+ny+z (mesh
+//!                                 lines, not the padded layout), each as a high float and (at + L) the low
+//!                                 float of the double value: t=0 primal edge length, 1 inverse dual edge
+//!                                 length (voltages), t=2 dual edge length, 3 inverse primal edge length (currents),
+//!   [HIP_FactorSets(N)]           the sets of 12, normalized (set < exact_start) or exact.
+//! A normalized set holds vv, ii as they are and vi, iv divided by the geometry of the edge, len_n * inv_p *
+//! inv_q (p<q the other two directions). HIP_FactorMul() multiplies it back, with the same operations on the
+//! host (FactorizeCoefficients() checks every node) and on the device.
+#define HIP_FACTOR_HDR 4
+__host__ __device__ __forceinline__ size_t HIP_FactorSets(const HIP_GridDim& N)
+{
+	return HIP_FACTOR_HDR + 8*((size_t)N.nx+N.ny+N.nz);
+}
+
+//! r*(a*b*c) for the double values a, b, c given as high and low floats: the products in double-float
+//! (Dekker with fma), so that the result is r times the double geometry, rounded once or nearly (not the
+//! three roundings of a float product of the rounded factors, which reach 4 ulp). One statement per
+//! rounding, with explicit fma: the same on the host and the device (no contraction, --fmad=false)
+__host__ __device__ __forceinline__ float HIP_FactorMul(float r, float ah, float al, float bh, float bl, float ch, float cl)
+{
+	const float p  = ah*bh;
+	const float p1 = ah*bl;
+	const float p2 = al*bh;
+	const float pe = fmaf(ah, bh, -p) + (p1 + p2);
+	const float q  = p*ch;
+	const float q1 = p*cl;
+	const float q2 = pe*ch;
+	const float qe = fmaf(p, ch, -q) + (q1 + q2);
+	const float t  = r*q;
+	const float t1 = r*qe;
+	const float te = fmaf(r, q, -t) + t1;
+	return t + te;
+}
+
+//! main_coeff() of the form FACTOR for node i = (x, y, z) of the grid N: FACTOR false is main_coeff() above
+//! (N, x, y, z unused); FACTOR true: mode 3/4 the 16/32 bit set index, ca the factorized buffer (see HIP_FACTOR_HDR)
+template<typename I, bool FACTOR>
+__device__ __forceinline__ HIP_MainCoeffT<I, FACTOR> main_coeff(const void* index, const float* ca, const float* cb, unsigned int mode,
+                                                                typename HIP_NoDeduce<I>::type sn, typename HIP_NoDeduce<I>::type i,
+                                                                unsigned int set_offset, const HIP_GridDim& N,
+                                                                unsigned int x, unsigned int y, unsigned int z)
+{
+	if constexpr (!FACTOR)
+	{
+		(void)N; (void)x; (void)y; (void)z;
+		return main_coeff<I>(index, ca, cb, mode, sn, i, set_offset);
+	}
+	else
+	{
+		(void)cb; (void)sn;
+		HIP_MainCoeffT<I, true> c;
+		const unsigned int set = (mode&1) ? (unsigned int)((const unsigned short*)index)[i] : ((const unsigned int*)index)[i];
+		const float* T = ca + HIP_FactorSets(N) + (size_t)12*set + set_offset;
+		for (unsigned int n=0; n<3; ++n)
+		{
+			c.a[n] = T[n];
+			c.b[n] = T[3+n];
+		}
+		if (set < ((const unsigned int*)ca)[0])
+		{
+			const unsigned int L = N.nx+N.ny+N.nz;
+			const float* len = ca + HIP_FACTOR_HDR + (set_offset ? 4 : 0)*(size_t)L;   // high, low
+			const float* inv = len + 2*L;
+			const unsigned int ox = x, oy = N.nx+y, oz = N.nx+N.ny+z;
+			const float lxh = len[ox], lxl = len[L+ox], lyh = len[oy], lyl = len[L+oy], lzh = len[oz], lzl = len[L+oz];
+			const float wxh = inv[ox], wxl = inv[L+ox], wyh = inv[oy], wyl = inv[L+oy], wzh = inv[oz], wzl = inv[L+oz];
+			c.b[0] = HIP_FactorMul(c.b[0], lxh, lxl, wyh, wyl, wzh, wzl);
+			c.b[1] = HIP_FactorMul(c.b[1], lyh, lyl, wxh, wxl, wzh, wzl);
+			c.b[2] = HIP_FactorMul(c.b[2], lzh, lzl, wxh, wxl, wyh, wyl);
+		}
+		return c;
+	}
+}
+
 //! The main voltage update of component \a n of node \a i from its old value \a old: the statements of
 //! update_voltages, for the kernels of OPENEMS_HIP_MUR_FUSED (see GPU_Backend_HIP::Impl::mur_mode), which
 //! must reproduce its results bit for bit. xm, ym, zm: the shifts to the previous line (0 on the first).
-__device__ __forceinline__ float volt_update_node(unsigned int n, float old, const float* curr, const HIP_MainCoeff& C,
+//! FACTOR: the coefficient form (see HIP_MainCoeffT)
+template<bool FACTOR = false>
+__device__ __forceinline__ float volt_update_node(unsigned int n, float old, const float* curr, const HIP_MainCoeffT<size_t, FACTOR>& C,
                                                   size_t sn, size_t i, size_t xm, size_t ym, size_t zm)
 {
 	float v;
@@ -120,16 +218,17 @@ __device__ __forceinline__ float volt_update_node(unsigned int n, float old, con
 }
 
 //! volt_update_node() of the node (x, y, z)
+template<bool FACTOR = false>
 __device__ __forceinline__ float volt_update_at(unsigned int n, float old, const float* curr, const void* index, const float* ca,
                                                 const float* cb, unsigned int mode, const HIP_GridDim& N,
                                                 unsigned int x, unsigned int y, unsigned int z)
 {
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;
-	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;
+	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
-	return volt_update_node(n, old, curr, main_coeff(index, ca, cb, mode, sn, i, 0), sn, i, xm, ym, zm);
+	return volt_update_node<FACTOR>(n, old, curr, main_coeff<size_t, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z), sn, i, xm, ym, zm);
 }
 
 //! Mur planes of OPENEMS_HIP_MUR_FUSED=1 (mur_shell), face f = 2*ny + (line>0); the
@@ -153,6 +252,24 @@ struct HIP_MurShell
 	HIP_GridDim B, E, L, H;
 };
 
+//! The z faces of OPENEMS_HIP_MUR_FUSED=2: the interior of each (x and y inside [HIP_MurShell::L, H)) is updated
+//! by update_voltages_inner (mur_zface_lane()), which exchanges the values of the Mur line and the shift line of a
+//! z line through warp shuffles. Index 0 the z-low, 1 the z-high plane
+struct HIP_MurZFaces
+{
+	const float* c_x[2];   //!< coefficients of component x (the plane's nyP), at x*ny + y
+	const float* c_y[2];   //!< coefficients of component y (the plane's nyPP), at x*ny + y
+	unsigned int line[2], shift[2];
+	unsigned int active;   //!< bit f: plane f exists and is active in this timestep
+};
+
+//! Lane mask of the warp shuffles: 64 bit on AMD (the HIP warp sync builtins ask for it), 32 bit on NVIDIA
+#if defined(__HIP_PLATFORM_NVIDIA__)
+typedef unsigned int HIP_LaneMask;
+#else
+typedef unsigned long long HIP_LaneMask;
+#endif
+
 //! A Mur plane of the grid, registered by HIP_Ext_Mur_ABC
 struct HIP_MurPlane
 {
@@ -160,6 +277,7 @@ struct HIP_MurPlane
 	unsigned int line, shift;
 	const float *c_nyP, *c_nyPP;
 	size_t seq;   //!< position of its extension in the extension order (see GPU_Backend_HIP::Impl::ext_log)
+	unsigned int start_ts;   //!< the plane is active from this timestep on (see Engine_Ext_Mur_ABC::GetStartTimestep())
 };
 
 #include "hip_upml.hiph"
@@ -199,20 +317,62 @@ double HIP_UniformLineShare(const void* data, size_t bytes);
 //! true if OPENEMS_HIP_COMPRESSIBLE_STATS is set to a non-zero value (read once)
 bool HIP_CompressibleStats();
 
+//! What the dependency checker of the windowed schedule (OPENEMS_HIP_WINDOW_CHECK=1) checks before a launch, see window_check
+enum HIP_WindowCheckKind {HIP_CheckVolt, HIP_CheckCurr, HIP_CheckPreVolt, HIP_CheckApplyVolt, HIP_CheckPreCurr, HIP_CheckApplyCurr, HIP_CheckEnd};
+//! The first violation the checker found (device memory): node, the half-step of the launch, the stamp expected and found,
+//! and the node whose stamp it was
+struct HIP_WindowCheckRecord
+{
+	int flag, kind;
+	int x, y, z, half_step, expected, found, qx, qy, qz;
+};
+
 //! State of one grid
 struct GPU_Backend_HIP::Impl
 {
 	std::shared_ptr<HIP_Context> ctx;
 
 	HIP_GridDim dim;
-	size_t numCells;    //!< nx*ny*nz, the field buffers hold 3*numCells values
+	size_t numCells;    //!< nx*ny*nz, the host count of cells
+	//! nx*ny*nzd, the cells of the device layout: the field buffers hold 3*numCellsD values, the full coefficient
+	//! arrays and the set index of the main updates too (OPENEMS_HIP_ZPAD, see Init(); numCells without padding)
+	size_t numCellsD;
+	//! the device flat index of host flat index \a h (ArrayNIJK of the host, component included): the z lines
+	//! keep their order, each stored with the stride dim.nzd
+	size_t Dev(size_t h) const {return (h/dim.nz)*dim.nzd + h%dim.nz;}
+	//! \a host (\a count values in the host layout, whole z lines) in the device layout, the padding zero
+	template <typename T>
+	std::vector<T> Padded(const T* host, size_t count) const
+	{
+		std::vector<T> dev(count/dim.nz*dim.nzd, T(0));
+		for (size_t l=0; l<count/dim.nz; ++l)
+			std::copy(host + l*dim.nz, host + (l+1)*dim.nz, dev.begin() + l*dim.nzd);
+		return dev;
+	}
+	//! Block of the main kernels (update_voltages, update_voltages_inner, update_currents), TZ x TY threads:
+	//! OPENEMS_HIP_SHAPE, read in Init(): shape_mode 0 Block(), 1 forced (shape_tz x shape_ty), 2 auto (default: timed
+	//! at the first voltage update, see DecideShape())
+	int shape_mode;
+	unsigned int shape_tz, shape_ty;
+	bool shape_decided;
+	//! the block of the main kernels decided by DecideShape() (before DecideMurFused()): z along threadIdx.x in
+	//! shape_block.x lanes, y along threadIdx.y, x along the grid z-dimension; z = B.nz + blockIdx.x*shape_block.x +
+	//! threadIdx.x, a warp holds the lanes of min(shape_block.x, warp size) consecutive z of one or more y rows.
+	//! (0, 0, 0) until decided or with the fused step
+	dim3 shape_block;
+	dim3 MainBlock(size_t ni, size_t nj) const {return (shape_mode==0) ? Block(ni, nj) : dim3(shape_tz, shape_ty, 1);}
+	//! Decide the block of the main kernels once (log it); auto: time the candidates on copies of the fields
+	void DecideShape();
 
 	float *volt, *curr;
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_HIP::CalcFastEnergy()
 	size_t energy_count;
 	std::vector<float2> energy_host;
-	//! Main update coefficients: 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index per node and the sets (see main_coeff())
+	//! Main update coefficients (OPENEMS_HIP_COEFF, see Init()): 0: full arrays vv, vi, ii, iv; 1/2: a 16/32 bit set index
+	//! per node and the sets; 3/4: a 16/32 bit set index and the factorized sets and geometry tables in coeff (see main_coeff())
 	unsigned int coeff_mode;
+	//! the kernels of the factorized coefficients run (coeff_mode 3/4), see HIP_MainCoeffT
+	bool Factor() const {return coeff_mode>=3;}
 	float *vv, *vi, *ii, *iv;
 	void* index;
 	float* coeff;
@@ -247,8 +407,9 @@ struct GPU_Backend_HIP::Impl
 	//! Flat node indices (x*ny*nz + y*nz + z) an extension reads or writes the voltages of at its hooks, registered
 	//! by its constructor (the dispersive materials and sheets), for the check of MurRefusal()
 	std::vector<size_t> ext_nodes;
-	//! OPENEMS_HIP_MUR_FUSED (read in Init(), default 1): 0 the three launches per Mur plane, 1 the Mur planes in
-	//! the voltage update (update_voltages_inner and mur_shell, see mur_volt_component)
+	//! OPENEMS_HIP_MUR_FUSED (read in Init(), default 2): 0 the three launches per Mur plane, 1 the Mur planes in
+	//! the voltage update (update_voltages_inner and mur_shell, see mur_volt_component), 2 as 1 with the interior
+	//! of the z faces in update_voltages_inner (mur_zface_lane())
 	int mur_knob;
 	//! the mode in use, -1 until DecideMurFused() (the first voltage update); the Mur hooks of a timestep
 	//! that started before the decision finish it as mode 0
@@ -259,10 +420,77 @@ struct GPU_Backend_HIP::Impl
 	HIP_MurShell mur_shell;                   //!< the nodes of the two kernels of mode 1
 	size_t mur_shell_count;                   //!< number of nodes of mur_shell
 	bool mur_released;                        //!< a Mur extension was deleted (host fallback): mode 0
-	//! Decide once whether OPENEMS_HIP_MUR_FUSED=1 is used, log it
+	bool mur_zf_on;                           //!< mode 1 with the z faces of OPENEMS_HIP_MUR_FUSED=2
+	HIP_MurZFaces mur_zf;                     //!< the z planes of mode 2 (active bits set at the launch)
+	//! Decide once whether OPENEMS_HIP_MUR_FUSED=1 (or 2) is used, log it
 	void DecideMurFused();
 	//! Why mode 1 cannot be used on this grid, empty if it can
 	std::string MurRefusal() const;
+	//! Why the z faces of mode 2 cannot run in update_voltages_inner, empty if they can (call after MurRefusal())
+	std::string MurZFaceRefusal();
+
+	//! OPENEMS_HIP_WINDOW (read in Init(), see HIP_ParseWindowKnob()): windowed blocks of T timesteps and windows of W x planes
+	struct WindowKnob
+	{
+		bool on;              //!< set and not 0
+		bool valid;           //!< auto, or T,W[,B] with T, W > 0
+		bool automatic;       //!< auto: T = 8 and W from the L2 rule (see HIP_WindowRule())
+		unsigned int T, W, B; //!< forced; W: the grid's nx for "NX"; B (y-tile rows) is accepted and unused
+		std::string text;     //!< the value as set
+	};
+	WindowKnob window;
+	//! the windowed blocks run (see GPU_Backend_HIP::SetWindowExtensions()), with these extensions in the engine's order
+	bool window_used;
+	std::vector<GPU_Extension*> window_exts;
+	//! the timestep of the windowed block that runs (one int, device memory): the base the window-capable
+	//! extensions read their step from (see GPU_Extension::LaunchInWindow()); allocated in Init()
+	int* step_base;
+	//! WindowPrepare() ran: 1 the schedule runs, 0 refused at the first block (window_refusal), -1 not yet
+	int window_ready;
+	//! the schedule: blocks of at most win_T timesteps, windows of win_W x planes (win_B: unused y tiles)
+	unsigned int win_T, win_W, win_B;
+	//! V frontiers that would split the line and the shift line of a Mur plane on an x face (see WindowFrontiers())
+	std::vector<unsigned int> win_forbidden;
+	size_t l2_bytes;                //!< L2 cache of the device (Init())
+	size_t coeff_table_bytes;       //!< the coefficient table shared by all nodes (the sets of coeff_mode 1/2), 0 with full arrays
+	//! bytes per node of the main update coefficients the kernels read besides the table: the set index, or the
+	//! four full arrays (see coeff_mode); for the window rule
+	size_t CoeffBytesPerNode() const {return (coeff_mode==0) ? 48 : (((coeff_mode==2) || (coeff_mode==4)) ? 4 : 2);}
+	unsigned long long launches;    //!< kernel launches issued by HIP_Launch()/HIP_LaunchMain() (captured ones included)
+	//! graphs: one per (block length, W, active Mur planes), captured at the first block of its kind and replayed
+	struct WindowGraph { hipGraphExec_t exec; unsigned long long launches, checks; double capture_ms; };
+	std::map<std::vector<unsigned int>, WindowGraph> window_graphs;
+	bool window_graphs_on;          //!< not with OPENEMS_HIP_KERNEL_TIMES, OPENEMS_HIP_WINDOW_GRAPH=0, or after a failed capture
+	bool window_logged;             //!< the schedule's line is printed (after the first chunk)
+	unsigned long long window_steps, window_blocks, window_chunks;
+	unsigned long long window_block_launches;   //!< the launches of the last block of T steps launched without a graph
+	//! OPENEMS_HIP_WINDOW_CHECK=1, the dependency checker (development, slow): per node the half-step of its last voltage
+	//! (stamp_v) and current (stamp_i) update, checked before every launch of the schedule (see window_check)
+	bool window_check;
+	int *stamp_v, *stamp_i;
+	HIP_WindowCheckRecord* check_rec;
+	unsigned long long checked_steps, checked_launches;
+	//! The main voltage / current update of the nodes [x0,x1) x [y0,y1) (all z) for the windowed blocks:
+	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window, the Mur
+	//! planes of \a mur_active in the voltage update as UpdateVoltages() has them (mode 1 and 2)
+	void WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int step_in_block, unsigned int mur_active);
+	void WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int step_in_block);
+	//! The decisions of the first timestep (UPML, shape, Mur), the schedule's T and W, the checker; false: refused
+	bool WindowPrepare();
+	//! The frontiers of the window whose V frontier of step 0 is \a F, for a block of \a L timesteps
+	void WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const;
+	//! The launches of a block of \a L timesteps from timestep \a ts with windows of \a W planes (the step base is
+	//! written before); \a host: the extension whose HostStep() runs after its apply-voltage launch (L = 1, W = nx)
+	void WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host);
+	//! n timesteps from \a start_ts as blocks (graphs when possible)
+	void WindowRun(unsigned int start_ts, unsigned int n);
+	//! The hook for the tuner (G7): WindowRun() with the current win_T, win_W, timed on the device, in ms
+	float WindowTimedRun(unsigned int start_ts, unsigned int n);
+	//! the Mur planes active at timestep \a ts (bit 2*ny + (line>0)), and the next timestep after \a ts where that changes
+	unsigned int MurActive(unsigned int ts) const;
+	unsigned int MurNextChange(unsigned int ts) const;
+	//! Checker (window_check): \a kind (HIP_WindowCheckKind) of the nodes [B, E) at step_in_block \a sib
+	void WindowCheck(unsigned int kind, const HIP_GridDim& B, const HIP_GridDim& E, unsigned int sib);
 
 	//! Field snapshots (see GPU_Backend_HIP::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy stream into a page-locked host buffer
@@ -353,13 +581,21 @@ struct GPU_Backend_HIP::Impl
 	//! Report the compressible buffers once (verbose level 1 and up), after the last of Init() and DecideFusedStep()
 	void LogCompressible();
 
-	//! Device buffer of the set indices of \a sets (16 or 32 bit)
-	void* AllocIndex(const GPU_CoeffSets& sets)
+	//! Device buffer of the set indices of \a sets (16 or 32 bit); \a padded: the index of the main updates,
+	//! one per node of the device layout (see numCellsD)
+	void* AllocIndex(const GPU_CoeffSets& sets, bool padded=false)
 	{
 		if (sets.mode==1)
 		{
 			std::vector<unsigned short> index16(sets.index.begin(), sets.index.end());
+			if (padded)
+				index16 = Padded(index16.data(), index16.size());
 			return Alloc<unsigned short>(index16.size(), index16.data(), HIP_AllocCoeff, "index");
+		}
+		if (padded)
+		{
+			const std::vector<unsigned int> index32 = Padded(sets.index.data(), sets.index.size());
+			return Alloc<unsigned int>(index32.size(), index32.data(), HIP_AllocCoeff, "index");
 		}
 		return Alloc<unsigned int>(sets.index.size(), sets.index.data(), HIP_AllocCoeff, "index");
 	}
@@ -415,6 +651,47 @@ void HIP_Launch(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_
 	if (timed)
 		HIP_KernelTimes::Begin(d->Stream());
 	kernel<<<GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk), block, 0, d->Stream()>>>(args...);
+	++d->launches;
+	d->CheckLaunch(name);
+	if (timed)
+		HIP_KernelTimes::End(d->Stream(), name);
+}
+
+//! Parse OPENEMS_HIP_WINDOW (\a text, NULL if unset) for a grid of \a nx x lines: unset or 0 off; auto; T,W[,B] with
+//! T, W > 0 (W may be the string NX: the grid's nx; B, the rows of a y tile, is accepted and not used). Anything
+//! else is on but not valid (the backend then steps one timestep at a time)
+GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx);
+//! The window rule of auto: W = (0.65 * L2 - table) / plane_bytes - (2T + 1), at least 1, at most nx; the coefficient table
+//! (read by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes);
+
+//! What the windowed schedule needs of a window-capable HIP extension besides GPU_Extension::LaunchInWindow()
+class HIP_WindowHooks
+{
+public:
+	virtual ~HIP_WindowHooks() {}
+	//! The decisions the extension makes in its first hook, before the first block (nothing may synchronize in a capture)
+	virtual void WindowPrepare() {}
+	//! The first timestep >= \a ts at which HostStep() must run, UINT_MAX if none: the schedule runs that timestep alone,
+	//! over the whole grid, and calls HostStep() right after this extension's apply-voltage launch (where the single
+	//! step does its host work)
+	virtual unsigned int NextHostStep(unsigned int ts) const {UNUSED(ts); return UINT_MAX;}
+	virtual void HostStep(unsigned int ts) {UNUSED(ts);}
+};
+
+//! Launch \a kernel, one of the main kernels, with one thread per (i,j,k) and the block of OPENEMS_HIP_SHAPE (see
+//! GPU_Backend_HIP::Impl::MainBlock()) on the stream of \a d; the kernel checks its bounds
+template <typename Kernel, typename... Args>
+void HIP_LaunchMain(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_t ni, size_t nj, size_t nk, Args... args)
+{
+	if (ni==0 || nj==0 || nk==0)
+		return;
+	dim3 block = d->MainBlock(ni, nj);
+	const bool timed = HIP_KernelTimes::Enabled();
+	if (timed)
+		HIP_KernelTimes::Begin(d->Stream());
+	kernel<<<GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk), block, 0, d->Stream()>>>(args...);
+	++d->launches;
 	d->CheckLaunch(name);
 	if (timed)
 		HIP_KernelTimes::End(d->Stream(), name);

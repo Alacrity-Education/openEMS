@@ -35,9 +35,9 @@
 	const unsigned int y = t / R.lz;
 
 // before the main update: store the scaled old field in the flux, hand the old flux to the engine
-__global__ void upml_pre(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R)
+__device__ __forceinline__ void upml_pre_node(float* field, const UPMLFusedArgs& A, unsigned int set_offset, const HIP_GridDim& N, const UPMLRegion& R,
+                                              unsigned int x, unsigned int y, unsigned int z)
 {
-	UPML_THREAD
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, (size_t)R.lx*R.ly*R.lz, set_offset);
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -50,9 +50,9 @@ __global__ void upml_pre(float* field, UPMLFusedArgs A, unsigned int set_offset,
 }
 
 // after the main update: keep the updated flux, combine it with the stored field
-__global__ void upml_post(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R)
+__device__ __forceinline__ void upml_post_node(float* field, const UPMLFusedArgs& A, unsigned int set_offset, const HIP_GridDim& N, const UPMLRegion& R,
+                                               unsigned int x, unsigned int y, unsigned int z)
 {
-	UPML_THREAD
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, (size_t)R.lx*R.ly*R.lz, set_offset);
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -64,20 +64,73 @@ __global__ void upml_post(float* field, UPMLFusedArgs A, unsigned int set_offset
 	}
 }
 
-// the fused kernels of a whole region, in place or from one buffer of the fused step into the other
+__global__ void upml_pre(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R)
+{
+	UPML_THREAD
+	upml_pre_node(field, A, set_offset, N, R, x, y, z);
+}
+
+__global__ void upml_post(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R)
+{
+	UPML_THREAD
+	upml_post_node(field, A, set_offset, N, R, x, y, z);
+}
+
+// the fused kernels of a whole region, in place or from one buffer of the fused step into the other;
+// FACTOR: the form of the main coefficients (see HIP_MainCoeffT), picked at the launch
+template<bool FACTOR>
 __global__ void upml_fused_volt(float* volt_out, const float* volt_in, const float* curr, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_volt_node(volt_out, volt_in, curr, A, N, R, x, y, z);
+	upml_fused_volt_node<FACTOR>(volt_out, volt_in, curr, A, N, R, x, y, z);
 }
 
+template<bool FACTOR>
 __global__ void upml_fused_curr(float* curr_out, const float* curr_in, const float* volt, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R)
 {
 	UPML_THREAD
-	upml_fused_curr_node(curr_out, curr_in, volt, A, N, R, x, y, z);
+	upml_fused_curr_node<FACTOR>(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
-class HIP_Ext_UPML : public GPU_Extension
+// Windowed blocks (OPENEMS_HIP_WINDOW): the nodes of the region inside the window, local x in [W.x, W.x + W.lx) and local y in
+// [W.y, W.y + W.ly), all z; the statements of the kernels above, in place
+struct UPMLWindow { unsigned int x, y, lx, ly; };
+
+#define UPML_WINDOW_THREAD \
+	const unsigned int t = blockIdx.x*blockDim.x + threadIdx.x; \
+	if (t>=R.lz*W.ly || blockIdx.z>=W.lx) \
+		return; \
+	const unsigned int x = W.x + blockIdx.z; \
+	const unsigned int z = t % R.lz; \
+	const unsigned int y = W.y + t / R.lz;
+
+__global__ void upml_pre_window(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R, UPMLWindow W)
+{
+	UPML_WINDOW_THREAD
+	upml_pre_node(field, A, set_offset, N, R, x, y, z);
+}
+
+__global__ void upml_post_window(float* field, UPMLFusedArgs A, unsigned int set_offset, HIP_GridDim N, UPMLRegion R, UPMLWindow W)
+{
+	UPML_WINDOW_THREAD
+	upml_post_node(field, A, set_offset, N, R, x, y, z);
+}
+
+template<bool FACTOR>
+__global__ void upml_fused_volt_window(float* volt, const float* curr, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R, UPMLWindow W)
+{
+	UPML_WINDOW_THREAD
+	upml_fused_volt_node<FACTOR>(volt, volt, curr, A, N, R, x, y, z);
+}
+
+template<bool FACTOR>
+__global__ void upml_fused_curr_window(float* curr, const float* volt, UPMLFusedArgs A, HIP_GridDim N, UPMLRegion R, UPMLWindow W)
+{
+	UPML_WINDOW_THREAD
+	upml_fused_curr_node<FACTOR>(curr, curr, volt, A, N, R, x, y, z);
+}
+
+class HIP_Ext_UPML : public GPU_Extension, public HIP_WindowHooks
 {
 public:
 	HIP_Ext_UPML(GPU_Backend_HIP::Impl* impl, Operator_Ext_UPML* op_ext, Engine* eng);
@@ -123,6 +176,49 @@ public:
 			Post(d->curr, CurrArgs(), 9);
 	}
 
+	// Windowed blocks (the fused step is never used there): the hooks above restricted to the region's nodes inside the window
+	virtual bool WindowCapable() const {return true;}
+	virtual void WindowPrepare() {Fused();}
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+	{
+		UPMLWindow W;
+		W.x = std::max(x0, m_Region.sx) - m_Region.sx;
+		W.y = std::max(y0, m_Region.sy) - m_Region.sy;
+		const unsigned int ex = std::min(x1, m_Region.sx + m_Region.lx), ey = std::min(y1, m_Region.sy + m_Region.ly);
+		if ((ex<=m_Region.sx + W.x) || (ey<=m_Region.sy + W.y))
+			return;
+		W.lx = ex - m_Region.sx - W.x;
+		W.ly = ey - m_Region.sy - W.y;
+		const unsigned int threads = m_Region.lz*W.ly;
+		if (Fused())
+		{
+			if (m_InMain)
+				return;   // the main kernels update it
+			// the region's nodes are updated as the main nodes are: the dependency checker stamps them
+			const HIP_GridDim B = {m_Region.sx + W.x, m_Region.sy + W.y, m_Region.sz, d->dim.nzd};
+			const HIP_GridDim E = {m_Region.sx + W.x + W.lx, m_Region.sy + W.y + W.ly, m_Region.sz + m_Region.lz, d->dim.nzd};
+			if (phase==GPU_WindowPostVoltage)
+			{
+				d->WindowCheck(HIP_CheckVolt, B, E, step_in_block);
+				HIP_Launch(d, "upml_fused_volt_window", d->Factor() ? upml_fused_volt_window<true> : upml_fused_volt_window<false>, threads, 1, W.lx, d->volt, (const float*)d->curr, VoltArgs(), d->dim, m_Region, W);
+			}
+			else if (phase==GPU_WindowPostCurrent)
+			{
+				d->WindowCheck(HIP_CheckCurr, B, E, step_in_block);
+				HIP_Launch(d, "upml_fused_curr_window", d->Factor() ? upml_fused_curr_window<true> : upml_fused_curr_window<false>, threads, 1, W.lx, d->curr, (const float*)d->volt, CurrArgs(), d->dim, m_Region, W);
+			}
+			return;
+		}
+		if (phase==GPU_WindowPreVoltage)
+			HIP_Launch(d, "upml_pre_window", upml_pre_window, threads, 1, W.lx, d->volt, VoltArgs(), 0u, d->dim, m_Region, W);
+		else if (phase==GPU_WindowPostVoltage)
+			HIP_Launch(d, "upml_post_window", upml_post_window, threads, 1, W.lx, d->volt, VoltArgs(), 0u, d->dim, m_Region, W);
+		else if (phase==GPU_WindowPreCurrent)
+			HIP_Launch(d, "upml_pre_window", upml_pre_window, threads, 1, W.lx, d->curr, CurrArgs(), 9u, d->dim, m_Region, W);
+		else if (phase==GPU_WindowPostCurrent)
+			HIP_Launch(d, "upml_post_window", upml_post_window, threads, 1, W.lx, d->curr, CurrArgs(), 9u, d->dim, m_Region, W);
+	}
+
 protected:
 	// set_offset: the voltage (0) or current (9) coefficients, see upml_coeff()
 	void Pre(float* field, UPMLFusedArgs A, unsigned int set_offset)
@@ -138,11 +234,11 @@ protected:
 	// in place, or in the fused step from the current buffers into the next ones (see update_fused)
 	void FuseVolt(float* volt_out)
 	{
-		HIP_Launch(d, "upml_fused_volt", upml_fused_volt, m_Region.lz*m_Region.ly, 1, m_Region.lx, volt_out, (const float*)d->volt, (const float*)d->curr, VoltArgs(), d->dim, m_Region);
+		HIP_Launch(d, "upml_fused_volt", d->Factor() ? upml_fused_volt<true> : upml_fused_volt<false>, m_Region.lz*m_Region.ly, 1, m_Region.lx, volt_out, (const float*)d->volt, (const float*)d->curr, VoltArgs(), d->dim, m_Region);
 	}
 	void FuseCurr(float* curr_out)
 	{
-		HIP_Launch(d, "upml_fused_curr", upml_fused_curr, m_Region.lz*m_Region.ly, 1, m_Region.lx, curr_out, (const float*)d->curr, (const float*)d->volt, CurrArgs(), d->dim, m_Region);
+		HIP_Launch(d, "upml_fused_curr", d->Factor() ? upml_fused_curr<true> : upml_fused_curr<false>, m_Region.lz*m_Region.ly, 1, m_Region.lx, curr_out, (const float*)d->curr, (const float*)d->volt, CurrArgs(), d->dim, m_Region);
 	}
 	UPMLFusedArgs Args(float* flux, const float* c_old, const float* c_fo, const float* c_fn, const float* full_a, const float* full_b)
 	{

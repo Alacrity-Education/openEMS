@@ -93,6 +93,11 @@ public:
 			HIP_Launch(d, "mur_apply", mur_apply, m_Param.nj, m_Param.ni, 1, d->volt, (const float*)m_Volt_nyP, (const float*)m_Volt_nyPP, d->dim, m_Param);
 	}
 
+	// Windowed blocks: modes 1 and 2 only (the schedule refuses mode 0, whose launches work on whole planes). The
+	// voltage launches of the schedule write the Mur planes active at their timestep (GPU_Backend_HIP::Impl::MurActive(),
+	// from the start timestep of each plane), so there is nothing to launch here
+	virtual bool WindowCapable() const {return true;}
+
 protected:
 	//! the ABC is off until an excitation on its plane is done
 	bool IsActive() {return m_Eng->GetNumberOfTimesteps()>=m_StartTS;}
@@ -128,7 +133,7 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 
 	// for OPENEMS_HIP_MUR_FUSED: CreateExtension() logs this extension at the next position of ext_log
 	m_Face = 2*m_Param.ny + (m_Param.line>0 ? 1 : 0);
-	const HIP_MurPlane plane = {m_Param.ny, m_Param.line, m_Param.line_shift, m_Coeff_nyP, m_Coeff_nyPP, d->ext_log.size()};
+	const HIP_MurPlane plane = {m_Param.ny, m_Param.line, m_Param.line_shift, m_Coeff_nyP, m_Coeff_nyPP, d->ext_log.size(), m_StartTS};
 	d->mur_planes.push_back(plane);
 }
 
