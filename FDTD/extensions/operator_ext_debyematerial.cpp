@@ -132,12 +132,17 @@ bool Operator_Ext_DebyeMaterial::BuildExtension()
 
 	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
 	{
+		// the first hit of the PEC pass at the same edge midpoint against the same column list; with r==0
+		// included the point at r==0 differs from the PEC pass: query
+		bool firstHit = (m_CC_R0_included==false) && m_Op->HasFirstHit(pos[0]);
 		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 		{
-			std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
-				pos[0], pos[1], -1,
-				(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-			);
+			std::vector<CSPrimitives*> vPrims;
+			if (!firstHit)
+				vPrims = m_Op->GetPrimitivesBoundBox(
+					pos[0], pos[1], -1,
+					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+				);
 
 			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 			{
@@ -167,7 +172,18 @@ bool Operator_Ext_DebyeMaterial::BuildExtension()
 					if (vi==0)
 						continue;
 
-					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, true);
+					CSProperties* prop = NULL;
+					if (firstHit)
+					{
+						CSPrimitives* found = m_Op->GetFirstHit(n,pos);
+						if (found)
+						{
+							found->SetPrimitiveUsed(true);
+							prop = found->GetProperty();
+						}
+					}
+					else
+						prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, true);
 					if (prop==NULL)
 						continue;
 					CSPropDebyeMaterial* mat = prop->ToDebyeMaterial();

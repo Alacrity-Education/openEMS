@@ -262,6 +262,9 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 			double L_L[3];
 			for (pos[0]=start[s]; pos[0]<=stop[s]; ++pos[0])
 			{
+				// the voltage loop takes the first hit of the PEC pass at the same edge midpoint against the same column
+				// list; with r==0 included its point at r==0 differs from the PEC pass: it queries
+				bool firstHit = (m_CC_R0_included==false) && m_Op->HasFirstHit(pos[0]);
 				for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 				{
 					std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
@@ -289,7 +292,15 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 
 //						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), true);
 							CSPrimitives* found = NULL;
-							CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &found);
+							CSProperties* prop = NULL;
+							if (firstHit)
+							{
+								found = m_Op->GetFirstHit(n,pos);
+								if (found)
+									prop = found->GetProperty();
+							}
+							else
+								prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &found);
 							if (found && (slab.used.empty() || (slab.used.back()!=found)))
 								slab.used.push_back(found); //SetPrimitiveUsed(true) after the join
 

@@ -243,6 +243,29 @@ public:
 		CSProperties::PropertyType type=CSProperties::ANY
 	) const;
 
+	/*!
+	  The per-edge first-hit table of the PEC pass, for the extension builds that run the same query: for every edge
+	  (n, x, y, z) the first primitive of the MATERIAL | METAL column list GetPrimitivesBoundBox(x, y, -1, ...) that
+	  contains the primal edge midpoint GetYeeCoords(n, pos, coord, false) within CSX->GetDrawingTolerance(), i.e. the
+	  primitive CSX->GetPropertyByCoordPriority(coord, vPrims, ...) finds there.
+
+	  The contract (the device setup pass produces the same table): m_FirstHit is an ArrayNIJK<int32_t> of 3 x the
+	  cells, N-I-J-K ordered; an entry is -1 for no primitive, else the index of the primitive into m_FirstHitPrims, the
+	  sorted full list CSX->GetAllPrimitives(true, MATERIAL | METAL) of the pass (the column lists are subsequences of
+	  it in its order, so the first hit of a column list is that primitive of the full list). An x line is valid only
+	  when m_FirstHitLine[x] is set (the PEC pass of an operator may leave x lines out, e.g. the inner lines of the
+	  cylindrical multigrid operator): for the other lines the consumers query as before. The table exists from
+	  CalcPEC() to the end of the extension builds of CalcECOperator() (not on an operator cache hit, which builds no
+	  table and runs no consumer), then it is freed.
+	  */
+	bool HasFirstHit(unsigned int x) const {return (m_FirstHit!=NULL) && (x<m_FirstHitLine.size()) && (m_FirstHitLine[x]!=0);}
+	//! The first-hit primitive of edge \a n at \a pos, NULL for none; only valid for an x line with HasFirstHit(pos[0])
+	CSPrimitives* GetFirstHit(int n, const unsigned int pos[3]) const
+	{
+		int32_t idx = (*m_FirstHit)(n, pos[0], pos[1], pos[2]);
+		return (idx<0) ? NULL : m_FirstHitPrims[idx];
+	}
+
 protected:
 	//! use New() for creating a new Operator
 	Operator();
@@ -328,6 +351,8 @@ protected:
 
 	//! The first primitive of \a vPrims (priority sorted) that contains \a coords within the drawing tolerance, NULL for none: the loop of ContinuousStructure::GetPropertyByCoordPriority
 	CSPrimitives* FirstPrimitive(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const;
+	//! The index into \a vPrims of the primitive FirstPrimitive() returns, -1 for none
+	int FirstPrimitiveIndex(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const;
 
 	//! The material of the first primitive at \a coords, NULL for none or a non-material property (the background)
 	CSPropMaterial* FindMaterial(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const;
@@ -398,6 +423,17 @@ protected:
 	bool m_PassPrims_On;
 	CSProperties::PropertyType m_PassPrims_Type;
 	std::vector<CSPrimitives*> m_PassPrims; //!< CSX->GetAllPrimitives(true, m_PassPrims_Type), read-only during the pass
+
+	//! The box GetPrimitivesBoundBox() filters with: the lines pos-1 to pos+1 of each axis, the full range for a negative pos
+	void PrimitivesBoundBox(int posX, int posY, int posZ, double boundBox[6]) const;
+	//! Allocate the first-hit table for the PEC pass (after BeginPassPrimitives(MATERIAL | METAL)), see HasFirstHit()
+	void InitFirstHit();
+	void FreeFirstHit();
+	//! The column list of the pass list as GetPrimitivesBoundBox(), and the index of each entry into m_FirstHitPrims
+	std::vector<CSPrimitives*> GetFirstHitBoundBox(int posX, int posY, int posZ, std::vector<int32_t>& index) const;
+	ArrayLib::ArrayNIJK<int32_t>* m_FirstHit;
+	std::vector<CSPrimitives*> m_FirstHitPrims; //!< the copy of m_PassPrims of the PEC pass the table indexes into
+	std::vector<char> m_FirstHitLine; //!< per x line: set when the PEC pass filled the table there
 	FDTD_FLOAT* EC_C[3];
 	FDTD_FLOAT* EC_G[3];
 	FDTD_FLOAT* EC_L[3];
