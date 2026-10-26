@@ -59,6 +59,7 @@ Operator::Operator() : Operator_Base()
 	m_TimeStepVar = 3;
 	m_PassPrims_On = false;
 	m_PassPrims_Type = CSProperties::ANY;
+	m_FirstHit = NULL;
 }
 
 Operator::~Operator()
@@ -138,6 +139,8 @@ void Operator::Delete()
 	m_mueR_ptr = NULL;
 	delete m_sigma_ptr;
 	m_sigma_ptr = NULL;
+
+	FreeFirstHit();
 }
 
 void Operator::Reset()
@@ -1242,6 +1245,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	timer.Lap("ApplyElectricBC");
 
 	BeginPassPrimitives((CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL));
+	InitFirstHit(); // the first hit of every edge CalcPEC queries, for the extension builds below
 	CalcPEC();
 	EndPassPrimitives();
 	timer.Lap("CalcPEC", SetupThreads());
@@ -1262,6 +1266,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
 		timer.Lap("ext '" + m_Op_exts.at(n)->GetExtensionName() + "'");
 	}
+	FreeFirstHit();
 	cache.ExtensionsBuilt();
 
 	//remove inactive extensions
@@ -1489,13 +1494,21 @@ bool Operator::GetCellCenterMaterialAvgCoord(const int pos[], double coord[3]) c
 
 CSPrimitives* Operator::FirstPrimitive(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const
 {
-	CSPrimitives* found = NULL;
+	int i = FirstPrimitiveIndex(coords,vPrims,markAsUsed);
+	if (i<0)
+		return NULL;
+	return vPrims.at(i);
+}
+
+int Operator::FirstPrimitiveIndex(const double* coords, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const
+{
+	int found = -1;
 	double tol = CSX->GetDrawingTolerance();
 	// search in all given primitives if coordinate given is inside
 	for (size_t i=0;i<vPrims.size();++i)
 		if (vPrims.at(i)->IsInside(coords,tol))
 		{
-			found = vPrims.at(i);
+			found = (int)i;
 			if (markAsUsed)
 				vPrims.at(i)->SetPrimitiveUsed(true);
 			// break as soon as a primitive is found since it is expected that the vPrim vector is priority sorted!
@@ -2073,6 +2086,24 @@ Operator::GetPrimitivesBoundBox(
 ) const
 {
 	double boundBox[6];
+	PrimitivesBoundBox(posX, posY, posZ, boundBox);
+
+	if (m_PassPrims_On && (m_PassPrims_Type==type))
+	{
+		// the list of the pass is what GetPrimitivesByBoundBox sorts on every call, filtered by the same rule
+		std::vector<CSPrimitives*> vPrim;
+		for (size_t j=0;j<m_PassPrims.size();++j)
+			if (m_PassPrims.at(j)->IsInsideBox(boundBox)>=0)
+				vPrim.push_back(m_PassPrims.at(j));
+		return vPrim;
+	}
+
+	std::vector<CSPrimitives*> vPrim = this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
+	return vPrim;
+}
+
+void Operator::PrimitivesBoundBox(int posX, int posY, int posZ, double boundBox[6]) const
+{
 	int BBpos[3] = {posX, posY, posZ};
 	for (int n=0;n<3;++n)
 	{
@@ -2087,19 +2118,44 @@ Operator::GetPrimitivesBoundBox(
 			boundBox[2*n+1] = this->GetDiscLine(n, std::min(int(numLines[n])-1, BBpos[n]+1));
 		}
 	}
+}
 
-	if (m_PassPrims_On && (m_PassPrims_Type==type))
-	{
-		// the list of the pass is what GetPrimitivesByBoundBox sorts on every call, filtered by the same rule
-		std::vector<CSPrimitives*> vPrim;
-		for (size_t j=0;j<m_PassPrims.size();++j)
-			if (m_PassPrims.at(j)->IsInsideBox(boundBox)>=0)
-				vPrim.push_back(m_PassPrims.at(j));
-		return vPrim;
-	}
-
-	std::vector<CSPrimitives*> vPrim = this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
+std::vector<CSPrimitives*> Operator::GetFirstHitBoundBox(int posX, int posY, int posZ, std::vector<int32_t>& index) const
+{
+	// the filter of GetPrimitivesBoundBox() on the pass list, keeping the index of every entry into the full list
+	double boundBox[6];
+	PrimitivesBoundBox(posX, posY, posZ, boundBox);
+	std::vector<CSPrimitives*> vPrim;
+	index.clear();
+	for (size_t j=0;j<m_FirstHitPrims.size();++j)
+		if (m_FirstHitPrims.at(j)->IsInsideBox(boundBox)>=0)
+		{
+			vPrim.push_back(m_FirstHitPrims.at(j));
+			index.push_back((int32_t)j);
+		}
 	return vPrim;
+}
+
+void Operator::InitFirstHit()
+{
+	FreeFirstHit();
+	if ((m_PassPrims_On==false) || (m_PassPrims_Type!=(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)))
+		return;
+	if (m_PassPrims.size()>(size_t)INT32_MAX)
+		return;
+	m_FirstHitPrims = m_PassPrims;
+	m_FirstHitLine.assign(numLines[0], 0);
+	m_FirstHit = new ArrayLib::ArrayNIJK<int32_t>("first_hit", numLines);
+}
+
+void Operator::FreeFirstHit()
+{
+	delete m_FirstHit;
+	m_FirstHit = NULL;
+	m_FirstHitPrims.clear();
+	m_FirstHitPrims.shrink_to_fit();
+	m_FirstHitLine.clear();
+	m_FirstHitLine.shrink_to_fit();
 }
 
 void Operator::BeginPassPrimitives(CSProperties::PropertyType type)
@@ -2386,21 +2442,38 @@ void Operator::CalcPEC_Range(unsigned int startX, unsigned int stopX, unsigned i
 {
 	double coord[3];
 	unsigned int pos[3];
+	// with the first-hit table, the column list comes from the same pass list with the same filter, and the
+	// first hit from FirstPrimitive (the loop of GetPropertyByCoordPriority), its index recorded per edge
+	bool firstHit = (m_FirstHit!=NULL);
+	std::vector<int32_t> vIndex;
 	for (pos[0]=startX; pos[0]<=stopX; ++pos[0])
 	{
 		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 		{
-			std::vector<CSPrimitives*> vPrims = this->GetPrimitivesBoundBox(
-				pos[0], pos[1], -1,
-				(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-			);
+			std::vector<CSPrimitives*> vPrims;
+			if (firstHit)
+				vPrims = GetFirstHitBoundBox(pos[0], pos[1], -1, vIndex);
+			else
+				vPrims = this->GetPrimitivesBoundBox(
+					pos[0], pos[1], -1,
+					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+				);
 
 			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 			{
 				for (int n=0; n<3; ++n)
 				{
 					GetYeeCoords(n,pos,coord,false);
-					CSProperties* prop = CSX->GetPropertyByCoordPriority(coord, vPrims, true);
+					CSProperties* prop = NULL;
+					if (firstHit)
+					{
+						int i = FirstPrimitiveIndex(coord, vPrims, true);
+						(*m_FirstHit)(n,pos[0],pos[1],pos[2]) = (i<0) ? -1 : vIndex[i];
+						if (i>=0)
+							prop = vPrims.at(i)->GetProperty();
+					}
+					else
+						prop = CSX->GetPropertyByCoordPriority(coord, vPrims, true);
 					if (prop)
 					{
 						if (prop->GetType()==CSProperties::METAL) //set to PEC
@@ -2413,6 +2486,8 @@ void Operator::CalcPEC_Range(unsigned int startX, unsigned int stopX, unsigned i
 				}
 			}
 		}
+		if (firstHit)
+			m_FirstHitLine[pos[0]] = 1;
 	}
 }
 

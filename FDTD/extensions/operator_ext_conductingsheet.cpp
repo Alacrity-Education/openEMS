@@ -126,12 +126,16 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 		bool disable_pos;
 		for (pos[0]=start[s]; pos[0]<=stop[s]; ++pos[0])
 		{
+			// the first hit of the PEC pass at the same edge midpoint against the same column list, else the query
+			bool firstHit = m_Op->HasFirstHit(pos[0]);
 			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 			{
-				std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
-					pos[0], pos[1], -1,
-					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-				);
+				std::vector<CSPrimitives*> vPrims;
+				if (!firstHit)
+					vPrims = m_Op->GetPrimitivesBoundBox(
+						pos[0], pos[1], -1,
+						(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+					);
 
 				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 				{
@@ -159,7 +163,15 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 							disable_pos = true;
 
 //						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
-						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
+						CSProperties* prop = NULL;
+						if (firstHit)
+						{
+							cs_sheet = m_Op->GetFirstHit(n,pos);
+							if (cs_sheet)
+								prop = cs_sheet->GetProperty();
+						}
+						else
+							prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
 						CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
 						if (cs_prop)
 						{
