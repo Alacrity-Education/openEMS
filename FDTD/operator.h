@@ -278,6 +278,20 @@ protected:
 	double CalcTimestep_Var1();
 	double CalcTimestep_Var3();
 
+	//! The smallest timestep of a Var3 search and its first position in the serial loop order (n, z, y, x)
+	struct Timestep_Min
+	{
+		double dT;
+		unsigned int n;
+		unsigned int pos[3];
+	};
+	//! The Var3 search over the x lines \a xStart to \a xStop (inclusive) in the serial loop order, with the address operator \a adrOp
+	void CalcTimestep_Var3_Range(unsigned int xStart, unsigned int xStop, AdrOp* adrOp, Timestep_Min& tmin) const;
+	//! The Var3 search over the whole mesh: serial on MainOp here, over x-slabs in the threaded operators
+	virtual void CalcTimestep_Var3_Search(Timestep_Min& tmin);
+	//! The Var3 search over the x-slabs \a start to \a stop, one thread and one copy of MainOp per slab, merged to the serial result
+	void CalcTimestep_Var3_Slabs(const std::vector<unsigned int>& start, const std::vector<unsigned int>& stop, Timestep_Min& tmin);
+
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos
 	virtual bool Calc_ECPos(
 		int ny,
@@ -347,6 +361,12 @@ protected:
 
 	//! Calc operator at certain \a pos
 	virtual void Calc_ECOperatorPos(int n, unsigned int* pos);
+	//! Calc operator at \a pos with the array index \a i of \a pos, without touching MainOp
+	void Calc_ECOperatorIndex(int n, const unsigned int* pos, unsigned int i);
+	//! The coefficient loop of CalcECOperator over all nodes: serial here, over x-slabs in the threaded operators
+	virtual void Calc_ECOperator_All();
+	//! The coefficient loop over the x-slabs \a start to \a stop (inclusive), one thread per slab, the index from MainOp->GetPos at (0,0,0)
+	void Calc_ECOperator_Slabs(const std::vector<unsigned int>& start, const std::vector<unsigned int>& stop);
 
 	//! Calculate and setup lumped elements
 	virtual bool Calc_LumpedElements();

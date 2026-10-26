@@ -20,6 +20,8 @@
 #include <stdexcept>
 #include <chrono>
 #include <sstream>
+#include <thread>
+#include <functional>
 #include "operator.h"
 #include "operator_cache.h"
 #include "engine.h"
@@ -964,6 +966,11 @@ void Operator::SetExcitationSignal(Excitation* exc)
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
 	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	Calc_ECOperatorIndex(n,pos,i);
+}
+
+void Operator::Calc_ECOperatorIndex(int n, const unsigned int* pos, unsigned int i)
+{
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -989,6 +996,60 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 		SetII(n,pos[0],pos[1],pos[2], 0 );
 		SetIV(n,pos[0],pos[1],pos[2], 0 );
 	}
+}
+
+void Operator::Calc_ECOperator_All()
+{
+	unsigned int pos[3];
+
+	for (int n=0; n<3; ++n)
+	{
+		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+		{
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			{
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+				{
+					Calc_ECOperatorPos(n,pos);
+				}
+			}
+		}
+	}
+}
+
+void Operator::Calc_ECOperator_Slabs(const std::vector<unsigned int>& start, const std::vector<unsigned int>& stop)
+{
+	// every node is written once by the thread of its x line; the index comes from MainOp->GetPos()
+	// relative to (0,0,0), as in Calc_EC_Range, so no worker moves the shared MainOp
+	MainOp->SetPos(0,0,0);
+	auto slab = [this, &start, &stop](size_t s)
+	{
+		unsigned int pos[3];
+		for (int n=0; n<3; ++n)
+		{
+			for (pos[0]=start.at(s); pos[0]<=stop.at(s); ++pos[0])
+			{
+				for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+				{
+					for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+					{
+						Calc_ECOperatorIndex(n,pos,MainOp->GetPos(pos[0],pos[1],pos[2]));
+					}
+				}
+			}
+		}
+	};
+	if (start.size()>1)
+	{
+		std::vector<std::thread> threads;
+		for (size_t s=0; s<start.size(); ++s)
+			threads.push_back(std::thread(slab, s));
+		for (size_t s=0; s<threads.size(); ++s)
+			threads[s].join();
+	}
+	else if (start.size()==1)
+		slab(0);
+	MainOp->SetPos(numLines[0]-1,numLines[1]-1,numLines[2]-1); //where the serial loop leaves it
 }
 
 namespace
@@ -1151,7 +1212,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 	else
 		CalcTimestep();
-	timer.Lap("CalcTimestep");
+	timer.Lap("CalcTimestep", (m_TimeStepVar==3) ? SetupThreads() : 1);
 
 	dT*=m_TimeStepFactor;
 
@@ -1168,23 +1229,8 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	InitOperator();
 	timer.Lap("InitOperator");
 
-	unsigned int pos[3];
-
-	for (int n=0; n<3; ++n)
-	{
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
-		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-			{
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
-				{
-					Calc_ECOperatorPos(n,pos);
-				}
-			}
-		}
-	}
-
-	timer.Lap("coefficients");
+	Calc_ECOperator_All();
+	timer.Lap("coefficients", SetupThreads());
 
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
@@ -2193,15 +2239,39 @@ double Operator::CalcTimestep_Var3()
 {
 	dT=1e200;
 	m_Used_TS_Name = std::string("Rennings_2");
+	MainOp->SetReflection2Cell();
+	Timestep_Min tmin;
+	tmin.dT = dT;
+	tmin.n = 0;
+	tmin.pos[0] = 0;
+	tmin.pos[1] = 0;
+	tmin.pos[2] = 0;
+	CalcTimestep_Var3_Search(tmin);
+	dT = tmin.dT;
+	if (dT==0)
+	{
+		throw std::runtime_error("Operator::CalcTimestep: Timestep is zero... this is not supposed to happen!");
+	}
+	if (g_settings.GetVerboseLevel()>1)
+	{
+		cout << "Operator::CalcTimestep_Var3: Smallest timestep (" << dT << "s) found at position: " <<  tmin.n << " : " << tmin.pos[0] << ";" <<  tmin.pos[1] << ";" <<  tmin.pos[2] << endl;
+	}
+	return 0;
+}
+
+void Operator::CalcTimestep_Var3_Search(Timestep_Min& tmin)
+{
+	CalcTimestep_Var3_Range(0,numLines[0]-1,MainOp,tmin);
+}
+
+void Operator::CalcTimestep_Var3_Range(unsigned int xStart, unsigned int xStop, AdrOp* adrOp, Timestep_Min& tmin) const
+{
 	double newT;
 	unsigned int pos[3];
-	unsigned int smallest_pos[3] = {0, 0, 0};
-	unsigned int smallest_n = 0;
 	unsigned int ipos;
 	double w_total=0;
 	double wqp=0,wt1=0,wt2=0;
 	double wt_4[4]={0,0,0,0};
-	MainOp->SetReflection2Cell();
 	for (int n=0; n<3; ++n)
 	{
 		int nP = (n+1)%3;
@@ -2211,56 +2281,92 @@ double Operator::CalcTimestep_Var3()
 		{
 			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 			{
-				for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+				for (pos[0]=xStart; pos[0]<=xStop; ++pos[0])
 				{
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nP,-1);
-					wqp += 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nPP,-1);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
+					adrOp->ResetShift();
+					ipos = adrOp->SetPos(pos[0],pos[1],pos[2]);
+					wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][adrOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
+					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][adrOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
+					ipos = adrOp->Shift(nP,-1);
+					wqp += 1/(EC_L[nPP][ipos]*EC_C[n][adrOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
+					ipos = adrOp->Shift(nPP,-1);
+					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][adrOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
 
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
+					adrOp->ResetShift();
+					ipos = adrOp->SetPos(pos[0],pos[1],pos[2]);
 					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][ipos]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][ipos]);
+					wt_4[1] = 1/(EC_L[nPP][adrOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][ipos]);
 					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][ipos]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][ipos]);
+					wt_4[3] = 1/(EC_L[nP ][adrOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][ipos]);
 
 					wt1 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
 
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
+					adrOp->ResetShift();
+					ipos = adrOp->SetPos(pos[0],pos[1],pos[2]);
+					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][adrOp->GetShiftedPos(n,1)]);
+					wt_4[1] = 1/(EC_L[nPP][adrOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][adrOp->GetShiftedPos(n,1)]);
+					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][adrOp->GetShiftedPos(n,1)]);
+					wt_4[3] = 1/(EC_L[nP ][adrOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][adrOp->GetShiftedPos(n,1)]);
 
 					wt2 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
 
 					w_total = wqp + wt1 + wt2;
 					newT = 2/sqrt( w_total );
-					if ((newT<dT) && (newT>0.0))
+					if ((newT<tmin.dT) && (newT>0.0))
 					{
-						dT=newT;
-						smallest_pos[0]=pos[0];smallest_pos[1]=pos[1];smallest_pos[2]=pos[2];
-						smallest_n = n;
+						tmin.dT=newT;
+						tmin.pos[0]=pos[0];tmin.pos[1]=pos[1];tmin.pos[2]=pos[2];
+						tmin.n = n;
 					}
 				}
 			}
 		}
 	}
-	if (dT==0)
+}
+
+void Operator::CalcTimestep_Var3_Slabs(const std::vector<unsigned int>& start, const std::vector<unsigned int>& stop, Timestep_Min& tmin)
+{
+	// one copy of MainOp per slab: the search moves its address operator at every node
+	std::vector<Timestep_Min> part(start.size(), tmin);
+	std::vector<AdrOp*> adrOp(start.size(), NULL);
+	for (size_t s=0; s<start.size(); ++s)
 	{
-		throw std::runtime_error("Operator::CalcTimestep: Timestep is zero... this is not supposed to happen!");
+		adrOp.at(s) = new AdrOp(MainOp);
+		adrOp.at(s)->SetReflection2Cell();
 	}
-	if (g_settings.GetVerboseLevel()>1)
+	if (start.size()>1)
 	{
-		cout << "Operator::CalcTimestep_Var3: Smallest timestep (" << dT << "s) found at position: " <<  smallest_n << " : " << smallest_pos[0] << ";" <<  smallest_pos[1] << ";" <<  smallest_pos[2] << endl;
+		std::vector<std::thread> threads;
+		for (size_t s=0; s<start.size(); ++s)
+			threads.push_back(std::thread(&Operator::CalcTimestep_Var3_Range, this, start.at(s), stop.at(s), adrOp.at(s), std::ref(part.at(s))));
+		for (size_t s=0; s<threads.size(); ++s)
+			threads[s].join();
 	}
-	return 0;
+	else if (start.size()==1)
+		CalcTimestep_Var3_Range(start.at(0), stop.at(0), adrOp.at(0), part.at(0));
+	for (size_t s=0; s<start.size(); ++s)
+		delete adrOp.at(s);
+
+	// the smallest value; among equal values the position the serial loop (n, z, y, x) meets first
+	for (size_t s=0; s<part.size(); ++s)
+	{
+		const Timestep_Min& p = part.at(s);
+		bool first = false;
+		if (p.n!=tmin.n)
+			first = p.n<tmin.n;
+		else if (p.pos[2]!=tmin.pos[2])
+			first = p.pos[2]<tmin.pos[2];
+		else if (p.pos[1]!=tmin.pos[1])
+			first = p.pos[1]<tmin.pos[1];
+		else
+			first = p.pos[0]<tmin.pos[0];
+		if ((p.dT<tmin.dT) || ((p.dT==tmin.dT) && first))
+			tmin = p;
+	}
+
+	// MainOp where the serial search leaves it
+	MainOp->ResetShift();
+	MainOp->SetPos(numLines[0]-1,numLines[1]-1,numLines[2]-1);
 }
 
 bool Operator::CalcPEC()

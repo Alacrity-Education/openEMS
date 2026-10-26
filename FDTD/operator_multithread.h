@@ -48,6 +48,12 @@ protected:
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
 
+	//! Number of threads of Calc_EC, CalcPEC, the timestep search and the coefficient loop
+	virtual unsigned int SetupThreads() const {return m_numThreads;}
+	//! the timestep search and the coefficient loop over the x line ranges of the operator threads
+	virtual void CalcTimestep_Var3_Search(Timestep_Min& tmin);
+	virtual void Calc_ECOperator_All();
+
 	//! Operator cache hit: the workers leave without building
 	virtual void SkipBuildThreads();
 	bool m_SkipBuild;
