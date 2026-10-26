@@ -20,9 +20,13 @@
 
 #include "operator.h"
 
+#include <cstdint>
+#include <string>
 #include <vector>
 
 class GPU_Backend;
+struct GPU_SetupModel;
+struct GPU_SetupResult;
 
 //! Operator for the GPU engine
 /*!
@@ -50,6 +54,17 @@ protected:
 	  */
 	virtual bool Calc_EC();
 	virtual bool CalcPEC();
+	//! The CPU paths of Calc_EC and CalcPEC, the threads over x line ranges
+	bool Calc_EC_Threads();
+	bool CalcPEC_Threads();
+	//! The material pass on the backend (OPENEMS_SETUP_DEVICE, see operator_gpu.cpp), false with the reason when the CPU path has to run
+	bool Calc_EC_Device(bool verify, std::string& reason);
+	//! The PEC decision from the first-hit table the device pass produced
+	void CalcPEC_FromTable(unsigned int xStart, unsigned int xStop, unsigned int* counter);
+	//! Compare the device result with the host arrays, see OPENEMS_SETUP_DEVICE_VERIFY
+	void VerifyEC(const GPU_SetupResult& result, size_t cells);
+	void VerifyPEC();
+	void FreeSetupDevice();
 	virtual unsigned int SetupThreads() const;
 	//! the timestep search and the coefficient loop over the same x line ranges
 	virtual void CalcTimestep_Var3_Search(Timestep_Min& tmin);
@@ -59,6 +74,15 @@ protected:
 	void ThreadRanges(std::vector<unsigned int>& start, std::vector<unsigned int>& stop) const;
 
 	GPU_Backend* m_Backend; //!< until CreateEngine()
+
+	// the state of the device pass between Calc_EC and CalcPEC (the first-hit table is made with the material pass, the PEC decision needs the table allocated by CalcECOperator)
+	GPU_SetupModel* m_SetupModel; //!< NULL when the CPU path runs
+	std::vector<int32_t> m_SetupFirstHit; //!< the table of the device pass, n-major in the memory order of m_FirstHit
+	std::vector<uint8_t> m_SetupUsed; //!< the used flags of the device pass per model primitive
+	std::vector<uint8_t> m_SetupUsed0; //!< verify: the used flags of the model primitives before the CPU pass
+	bool m_SetupVerify;
+	double m_VerifySeconds;
+	double m_VerifyBytes;
 };
 
 #endif // OPERATOR_GPU_H

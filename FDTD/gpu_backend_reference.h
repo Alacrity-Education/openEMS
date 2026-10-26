@@ -49,6 +49,9 @@ public:
 
 	virtual bool Init(const Operator* op);
 
+	//! The material pass on the host, single-threaded, in the structure of the device kernels (gpu_setup_kernels.h)
+	virtual bool SetupOperator(const GPU_SetupModel& model, GPU_SetupResult& result);
+
 	virtual void UpdateVoltages();
 	virtual void UpdateCurrents();
 

@@ -30,6 +30,8 @@
 
 class Operator;
 class Engine;
+struct GPU_SetupModel;
+struct GPU_SetupResult;
 class Engine_Extension;
 
 //! The hook of a timestep a window-capable extension runs in a windowed block, see GPU_Extension::LaunchInWindow()
@@ -190,6 +192,15 @@ public:
 	  step, snapshots) is optional: without it the backend takes the slower path.
 	  */
 	virtual bool Init(const Operator* op) = 0;
+
+	//! The material pass of the operator build on the device (see gpu_setup_model.h): the capacitance, conductivity, inductance and loss values of every edge, the first-hit primitive of every edge and the used flags of the primitives
+	/*!
+	  Called by Operator_GPU while it builds \a op, before Init(). The contract (the data, the memory layouts and the
+	  exactness rule) is in gpu_setup_model.h and gpu_setup_kernels.h: the result is bit-identical to the CPU path.
+	  \a result holds host memory owned by the caller. Returns false if this backend does not implement the entry
+	  or refuses the model: the operator then takes the CPU path. A device failure throws std::runtime_error.
+	  */
+	virtual bool SetupOperator(const GPU_SetupModel& model, GPU_SetupResult& result) {UNUSED(model); UNUSED(result); return false;}
 
 	//! Main voltage update over the whole domain, equivalent to Engine::UpdateVoltages
 	virtual void UpdateVoltages() = 0;
