@@ -28,8 +28,9 @@
  *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where that leaves fewer
  *     than T planes a window, T = 4, then 2: on a small L2 the halo of T = 8 alone takes most of it), then the
  *     tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of all x planes) and
- *     refines the three best with W -/+25 % on the first timesteps of the run (real timesteps: every candidate is
- *     bit-identical) and keeps the fastest; every run tunes. rule: the rule without the tuner.
+ *     refines the three best windowed ones with W -/+25 % on the first timesteps of the run (real timesteps: every
+ *     candidate is bit-identical) and keeps the fastest, one window only if 10 % faster than the best windowed one;
+ *     every run tunes. rule: the rule without the tuner.
  *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
  *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
  *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
@@ -2372,6 +2373,7 @@ float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int 
 // tune does not change the result and costs only the slower candidates' time; nothing is copied or restored.
 static const unsigned int HIP_TUNE_MAX_CANDIDATES = 13;   // the first list (the refinement adds up to 6)
 static const unsigned int HIP_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
+static const double HIP_TUNE_ONE_WINDOW_MARGIN = 1.10;  // one window over all of x must be this much faster (WindowTuneFinish())
 
 void GPU_Backend_HIP::Impl::WindowTunePrepare()
 {
@@ -2456,6 +2458,8 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 			for (size_t k=0; (k<3) && (k<best.size()); ++k)
 			{
 				const unsigned int W = best[k].W;
+				if (W>=dim.nx)
+					continue;   // one window over all of x is not refined (W -25 % is two windows, not a better one)
 				const unsigned int lo = std::max(1u, std::min(W - 1, (unsigned int)std::lround(0.75*W)));
 				const unsigned int hi = std::min(dim.nx, std::max(W + 1, (unsigned int)std::lround(1.25*W)));
 				const unsigned int ws[2] = {lo, hi};
@@ -2536,6 +2540,18 @@ void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
 		}
 		WindowDropGraphs(win_W);
 		return;
+	}
+	// one window over all of x only when it beats the best windowed candidate clearly: where the timed blocks
+	// barely discriminate (an Arc B580 through chipStar: 6180 against 6088 MC/s timed, 1343 against 2146 run) a near
+	// tie must not drop the run to the single step's work; on an H100 and an A100 it wins by 20 and 28 %
+	if (tune_cands[best].W>=dim.nx)
+	{
+		int windowed = -1;
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if ((tune_cands[k].mcs>=0) && (tune_cands[k].W<dim.nx) && ((windowed<0) || (tune_cands[k].mcs>tune_cands[windowed].mcs)))
+				windowed = (int)k;
+		if ((windowed>=0) && (tune_cands[best].mcs<HIP_TUNE_ONE_WINDOW_MARGIN*tune_cands[windowed].mcs))
+			best = windowed;
 	}
 	win_T = tune_cands[best].T;
 	win_W = tune_cands[best].W;
