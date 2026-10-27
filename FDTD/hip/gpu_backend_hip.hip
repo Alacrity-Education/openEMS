@@ -41,7 +41,9 @@
  *     grids where the fused step is blocked, unless that more than doubles the z lines or the padded fields and
  *     coefficients would take more than half of the free device memory; 0: off.
  * OPENEMS_HIP_SHAPE = auto (default) | 0
- *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep,
+ *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep;
+ *     a candidate within 0.5 % of the fastest ties with it, and a tie goes to the first listed, 32x8 (on the PCB,
+ *     32x8, 64x4 and 32x4 tie within 0.03 % there, while inside the windowed blocks 32x8 is 1.8 to 2.6 % faster).
  *     0 the former block. ZPAD and SHAPE together: small PCB 10226 to 11572 MC/s (+13 %), the PCB
  *     12822 to 13877 (+8.2 %).
  * OPENEMS_HIP_INDEX = 32 | 64
@@ -1283,8 +1285,12 @@ void GPU_Backend_HIP::Impl::DecideShape()
 		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
 		// shape, after a warm-up, rounds of update_voltages + update_currents pairs, the best round counts. The UPML
 		// regions along z in the main kernels (HIP_ZSlabs) update their flux in place: the timed launches take every
-		// node of the range as a main node instead (the same lines and reads, without the flux)
-		static const unsigned int candidates[][2] = {{16, 16}, {32, 8}, {32, 4}, {64, 4}, {128, 2}};
+		// node of the range as a main node instead (the same lines and reads, without the flux). The candidates in
+		// the order of preference: a tie within 0.5 % of the fastest goes to the first listed (32x8: on a PCB of
+		// 28.7 Mcells three shapes tied within 0.03 % here, and inside the windowed blocks 32x8 ran 1.8 to 2.6 %
+		// faster than the other two)
+		static const unsigned int candidates[][2] = {{32, 8}, {64, 4}, {32, 4}, {16, 16}, {128, 2}};
+		const float tie = 1.005f;
 		const unsigned int n_cand = sizeof(candidates)/sizeof(candidates[0]);
 		const unsigned int pairs = 20, rounds = 2;
 		const bool c = coeff_mode>0;
@@ -1328,10 +1334,13 @@ void GPU_Backend_HIP::Impl::DecideShape()
 					HIP_Check(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
 					best[k] = std::min(best[k], 1000*ms/pairs);
 				}
-			unsigned int b = 0;
+			unsigned int fastest = 0;
 			for (unsigned int k=1; k<n_cand; ++k)
-				if (best[k]<best[b])
-					b = k;
+				if (best[k]<best[fastest])
+					fastest = k;
+			unsigned int b = 0;
+			while (best[b]>tie*best[fastest])
+				++b;
 			shape_mode = 1;
 			shape_tz = candidates[b][0];
 			shape_ty = candidates[b][1];
@@ -1339,6 +1348,8 @@ void GPU_Backend_HIP::Impl::DecideShape()
 			for (unsigned int k=0; k<n_cand; ++k)
 				reason << " " << candidates[k][0] << "x" << candidates[k][1] << " " << std::fixed << std::setprecision(1) << best[k] << " us";
 			reason << " per voltage and current update, best " << shape_tz << "x" << shape_ty;
+			if (b!=fastest)
+				reason << " (" << candidates[fastest][0] << "x" << candidates[fastest][1] << " within 0.5 %: the first listed wins)";
 		}
 		else
 		{
