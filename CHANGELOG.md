@@ -72,7 +72,10 @@ there are unreleased changes. It becomes the next release entry.
   unpadded layout where the padding would more than double the z lines or the
   padded grid would take more than half of the free device memory. It also
   times the block of its separate main kernels on the live grid at the first
-  timestep (`OPENEMS_HIP_SHAPE=auto`, the default; `0` the former block). The
+  timestep (`OPENEMS_HIP_SHAPE=auto`, the default; `0` the former block;
+  `cN` or `TZxTY` forced), among them a compact layout that runs the z lines
+  of a plane one after the other in blocks of 128 or 256 threads, so that a z
+  line of 44 nodes takes 44 lanes instead of two warps. The
   results are bit-identical; the fused step keeps the unpadded layout. On an
   RTX 5090 a model of 3.06 Mcells (40 z lines, Mur and sheets) runs at 11572
   MC/s instead of 10226 (+13 %), its two main kernels taking 172 us a step

@@ -226,9 +226,11 @@ struct GPU_Backend_HIP::Impl
 	}
 	//! Block of the main kernels (update_voltages, update_voltages_inner, update_currents), TZ x TY threads:
 	//! OPENEMS_HIP_SHAPE, read in Init(): shape_mode 0 Block(), 2 auto (default: timed
-	//! at the first voltage update, see DecideShape(), which sets 1 and the best shape_tz x shape_ty)
+	//! at the first voltage update, see DecideShape(), which sets 1 and the best shape_tz x shape_ty, or 3 and the best
+	//! compact layout of shape_tz threads)
 	int shape_mode;
 	unsigned int shape_tz, shape_ty;
+	bool shape_forced;              //!< OPENEMS_HIP_SHAPE=cN or TZxTY: no timing
 	bool shape_decided;
 	//! the block of the main kernels decided by DecideShape() (before DecideMurFused()): z along threadIdx.x in
 	//! shape_block.x lanes, y along threadIdx.y, x along the grid z-dimension; z = B.nz + blockIdx.x*shape_block.x +
@@ -236,6 +238,9 @@ struct GPU_Backend_HIP::Impl
 	//! (0, 0, 0) until decided or with the fused step
 	dim3 shape_block;
 	dim3 MainBlock(size_t ni, size_t nj) const {return (shape_mode==0) ? Block(ni, nj) : dim3(shape_tz, shape_ty, 1);}
+	//! shape_mode 3: the compact layout, one-dimensional blocks of shape_tz threads over the y rows of threads_z threads
+	//! each, one after the other (HIP_ZSlabs::compact): no idle lanes after each z line but the last of a plane
+	bool MainCompact() const {return shape_mode==3;}
 	//! Decide the block of the main kernels once (log it); auto: time the candidates on copies of the fields
 	void DecideShape();
 
@@ -555,7 +560,9 @@ void HIP_LaunchMain(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, s
 	const bool timed = HIP_KernelTimes::Enabled();
 	if (timed)
 		HIP_KernelTimes::Begin(d->Stream());
-	kernel<<<GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk), block, 0, d->Stream()>>>(args...);
+	const dim3 grid = d->MainCompact() ? dim3((unsigned int)((ni*nj + block.x - 1)/block.x), 1, (unsigned int)nk)
+	                                   : GPU_Backend_HIP::Impl::Grid(block, ni, nj, nk);
+	kernel<<<grid, block, 0, d->Stream()>>>(args...);
 	++d->launches;
 	d->CheckLaunch(name);
 	if (timed)

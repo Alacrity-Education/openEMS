@@ -40,12 +40,15 @@
  *     The z stride of the device layout rounded up to 64, so that every z line starts on the same alignment. auto: on
  *     grids where the fused step is blocked, unless that more than doubles the z lines or the padded fields and
  *     coefficients would take more than half of the free device memory; 0: off.
- * OPENEMS_HIP_SHAPE = auto (default) | 0
+ * OPENEMS_HIP_SHAPE = auto (default) | 0 | cN | TZxTY
  *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep;
  *     a candidate within 0.5 % of the fastest ties with it, and a tie goes to the first listed, 32x8 (on the PCB,
  *     32x8, 64x4 and 32x4 tie within 0.03 % there, while inside the windowed blocks 32x8 is 1.8 to 2.6 % faster).
- *     0 the former block. ZPAD and SHAPE together: small PCB 10226 to 11572 MC/s (+13 %), the PCB
- *     12822 to 13877 (+8.2 %).
+ *     0 the former block, cN (N a multiple of 64) or TZxTY forced. The candidates TZxTY take TZ threads along z and
+ *     TY rows; cN (c128, c256), the compact layout, runs the y rows of the z lines one after the other in blocks of N
+ *     threads, so a z line of 44 nodes takes 44 lanes instead of two warps: the PCB single step on an H100 16912
+ *     MC/s instead of 15610 (c128), on an A100 11102 instead of 10741 (c256). ZPAD and SHAPE together: small PCB
+ *     10226 to 11572 MC/s (+13 %), the PCB 12822 to 13877 (+8.2 %).
  * OPENEMS_HIP_INDEX = 32 | 64
  *     The index width of the fused step; default 32 on NVIDIA where the grid fits (V100: 64 registers against 126,
  *     half the occupancy with 64), 64 on AMD.
@@ -92,6 +95,22 @@
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/extensions/operator_ext_steadystate.h"
 
+// The thread of a main kernel: its index tz along z (see GPU_Backend_HIP::Impl::MainRange()) and its y row ty. Two-
+// dimensional blocks (Z.compact 0): tz along x of the grid and the block, ty along y; the compact layout: the rows of
+// Z.compact threads one after the other in one-dimensional blocks (a z line of 44 nodes then takes 44 lanes, not 64)
+__device__ __forceinline__ void main_thread(const HIP_ZSlabs& Z, unsigned int& tz, unsigned int& ty)
+{
+	if (Z.compact)
+	{
+		const unsigned int t = blockIdx.x*blockDim.x + threadIdx.x;
+		ty = __umulhi(t, Z.compact_m);
+		tz = t - ty*Z.compact;
+		return;
+	}
+	tz = blockIdx.x*blockDim.x + threadIdx.x;
+	ty = blockIdx.y*blockDim.y + threadIdx.y;
+}
+
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
 // y-threads, x along the grid z-dimension. The coefficients are read with main_coeff().
@@ -101,7 +120,8 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
 {
 	// with UPML regions along z: slab lo, main nodes and slab hi in whole warps each (no divergence)
-	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -119,7 +139,7 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + blockIdx.z;
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -336,7 +356,8 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
                                       HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S,
                                       HIP_MurZFaces M)
 {
-	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -354,7 +375,7 @@ __global__ void update_voltages_inner(float* __restrict__ volt, const float* __r
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + blockIdx.z;
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -445,7 +466,8 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
 {
 	// with UPML regions along z: slab lo, main nodes and slab hi in whole warps each (no divergence)
-	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -463,7 +485,7 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + blockIdx.z;
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -863,6 +885,7 @@ GPU_Backend_HIP::Impl::Impl()
 	numCells = numCellsD = 0;
 	shape_mode = 0;
 	shape_tz = shape_ty = 0;
+	shape_forced = false;
 	shape_decided = false;
 	shape_block = dim3(0, 0, 0);
 	volt = curr = vv = vi = ii = iv = NULL;
@@ -1093,6 +1116,23 @@ std::string GPU_Backend_HIP::Impl::MurRefusal() const
 	return std::string();
 }
 
+// HIP_ZSlabs::compact_m of rows of \a R threads: 2^32 / R rounded up; __umulhi(t, m) = t / R exactly for t < 2^32 / R
+// (the error of m is below 1, so t*m/2^32 stays below the next multiple of 1/R)
+static unsigned int HIP_CompactM(unsigned int R)
+{
+	return (unsigned int)((0x100000000ULL + R - 1)/R);
+}
+
+// true if the threads of the z positions tz_a and tz_b are in the same warp of \a w threads in every one of \a rows
+// rows of \a R threads of the compact layout (blocks of a multiple of w threads)
+static bool HIP_SameWarpZCompact(unsigned int tz_a, unsigned int tz_b, unsigned int R, unsigned int rows, unsigned int w)
+{
+	for (unsigned int r=0; r<rows; ++r)
+		if (((size_t)r*R + tz_a)/w != ((size_t)r*R + tz_b)/w)
+			return false;
+	return true;
+}
+
 // true if the threads of the z positions tz_a and tz_b (thread index along z: threadIdx.x of blocks of \a block
 // threads, see MainRange()) are in the same warp of \a w threads, for every y and x thread of the block
 static bool HIP_SameWarpZ(unsigned int tz_a, unsigned int tz_b, const dim3& block, unsigned int w)
@@ -1134,7 +1174,8 @@ std::string GPU_Backend_HIP::Impl::MurZFaceRefusal()
 	const dim3 block = (shape_block.x>0) ? shape_block : Block(threads_z, E.ny-B.ny);
 	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
 	for (unsigned int f=0; f<2; ++f)
-		if ((mur_zf.c_x[f]!=NULL) && !HIP_SameWarpZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, ctx->warp_size))
+		if ((mur_zf.c_x[f]!=NULL) && !(MainCompact() ? HIP_SameWarpZCompact(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), threads_z, E.ny-B.ny, ctx->warp_size)
+		                                             : HIP_SameWarpZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, ctx->warp_size)))
 			return std::string("the line and the shift line of the z-") + (f ? "high" : "low") + " plane are in different warps";
 	return std::string();
 }
@@ -1260,6 +1301,8 @@ void GPU_Backend_HIP::Impl::MainRange(HIP_GridDim& B, HIP_GridDim& E, unsigned i
 		zslabs.t_int = warps(zslabs.z_hi - zslabs.z_lo);
 		threads_z = zslabs.t_lo + zslabs.t_int + warps(E.nz - zslabs.z_hi);
 	}
+	zslabs.compact = MainCompact() ? threads_z : 0;
+	zslabs.compact_m = MainCompact() ? HIP_CompactM(threads_z) : 0;
 }
 
 void GPU_Backend_HIP::Impl::DecideShape()
@@ -1280,6 +1323,8 @@ void GPU_Backend_HIP::Impl::DecideShape()
 	std::ostringstream reason;
 	if (shape_mode==0)
 		reason << "default";
+	else if (shape_forced)
+		reason << "OPENEMS_HIP_SHAPE";
 	else
 	{
 		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
@@ -1288,10 +1333,22 @@ void GPU_Backend_HIP::Impl::DecideShape()
 		// node of the range as a main node instead (the same lines and reads, without the flux). The candidates in
 		// the order of preference: a tie within 0.5 % of the fastest goes to the first listed (32x8: on a PCB of
 		// 28.7 Mcells three shapes tied within 0.03 % here, and inside the windowed blocks 32x8 ran 1.8 to 2.6 %
-		// faster than the other two)
-		static const unsigned int candidates[][2] = {{32, 8}, {64, 4}, {32, 4}, {16, 16}, {128, 2}};
+		// faster than the other two). TZ x 1: the compact layout (blocks of TZ threads over the rows of threads_z
+		// threads, see main_thread()), offered only where the Mur z faces' line and shift line stay in one warp in
+		// every row (MurZFaceRefusal())
+		static const unsigned int listed[][2] = {{32, 8}, {128, 1}, {256, 1}, {64, 4}, {32, 4}, {16, 16}, {128, 2}};
 		const float tie = 1.005f;
-		const unsigned int n_cand = sizeof(candidates)/sizeof(candidates[0]);
+		bool compact_ok = (threads_z*(unsigned long long)(E.ny-B.ny)*threads_z < 0x100000000ULL);
+		auto tzof = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((mur_planes[k].ny==2) && !HIP_SameWarpZCompact(tzof(mur_planes[k].line), tzof(mur_planes[k].shift), threads_z, E.ny-B.ny, ctx->warp_size))
+				compact_ok = false;
+		std::vector<dim3> candidates;
+		for (size_t k=0; k<sizeof(listed)/sizeof(listed[0]); ++k)
+			if (compact_ok || (listed[k][1]>1))
+				candidates.push_back(dim3(listed[k][0], listed[k][1], 1));
+		auto name = [](const dim3& b) {return (b.y==1) ? "c" + std::to_string(b.x) : std::to_string(b.x) + "x" + std::to_string(b.y);};
+		const unsigned int n_cand = (unsigned int)candidates.size();
 		const unsigned int pairs = 20, rounds = 2;
 		const bool c = coeff_mode>0;
 		const unsigned int nt = E.nz - B.nz, nj = E.ny - B.ny, nk = E.nx - B.nx;
@@ -1309,8 +1366,11 @@ void GPU_Backend_HIP::Impl::DecideShape()
 			Z.z_hi = E.nz;
 			auto run = [&](unsigned int k, unsigned int n)
 			{
-				const dim3 block(candidates[k][0], candidates[k][1], 1);
-				const dim3 grid = Grid(block, nt, nj, nk);
+				const dim3 block = candidates[k];
+				const bool compact = block.y==1;
+				const dim3 grid = compact ? dim3((nt*nj + block.x - 1)/block.x, 1, nk) : Grid(block, nt, nj, nk);
+				Z.compact = compact ? nt : 0;
+				Z.compact_m = compact ? HIP_CompactM(nt) : 0;
 				for (unsigned int p=0; p<n; ++p)
 				{
 					update_voltages<<<grid, block, 0, Stream()>>>(v, (const float*)i, (const void*)index, (const float*)(c ? coeff : vv),
@@ -1341,15 +1401,17 @@ void GPU_Backend_HIP::Impl::DecideShape()
 			unsigned int b = 0;
 			while (best[b]>tie*best[fastest])
 				++b;
-			shape_mode = 1;
-			shape_tz = candidates[b][0];
-			shape_ty = candidates[b][1];
+			shape_mode = (candidates[b].y==1) ? 3 : 1;
+			shape_tz = candidates[b].x;
+			shape_ty = candidates[b].y;
 			reason << "timed:";
 			for (unsigned int k=0; k<n_cand; ++k)
-				reason << " " << candidates[k][0] << "x" << candidates[k][1] << " " << std::fixed << std::setprecision(1) << best[k] << " us";
-			reason << " per voltage and current update, best " << shape_tz << "x" << shape_ty;
+				reason << " " << name(candidates[k]) << " " << std::fixed << std::setprecision(1) << best[k] << " us";
+			reason << " per voltage and current update, best " << name(candidates[b]);
 			if (b!=fastest)
-				reason << " (" << candidates[fastest][0] << "x" << candidates[fastest][1] << " within 0.5 %: the first listed wins)";
+				reason << " (" << name(candidates[fastest]) << " within 0.5 %: the first listed wins)";
+			if (!compact_ok)
+				reason << " (compact layouts refused: a Mur z face's line and shift line in different warps)";
 		}
 		else
 		{
@@ -1367,7 +1429,8 @@ void GPU_Backend_HIP::Impl::DecideShape()
 	}
 	shape_block = MainBlock(threads_z, E.ny-B.ny);
 	if (verbose)
-		std::cout << "GPU_Backend_HIP: shape: " << shape_block.x << "x" << shape_block.y << " (" << reason.str() << ")" << std::endl;
+		std::cout << "GPU_Backend_HIP: shape: " << (MainCompact() ? "c" : "") << shape_block.x
+		          << (MainCompact() ? std::string() : "x" + std::to_string(shape_block.y)) << " (" << reason.str() << ")" << std::endl;
 }
 
 void GPU_Backend_HIP::Impl::FreeSnapshots()
@@ -1654,10 +1717,26 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	if (const char* env = getenv("OPENEMS_HIP_SHAPE"))
 	{
 		const std::string shape = env;
+		unsigned int tz = 0, ty = 0;
+		char tail = 0;
 		if (shape=="0")
 			d->shape_mode = 0;
+		else if ((sscanf(shape.c_str(), "c%u%c", &tz, &tail)==1) && (tz>0) && (tz%64==0) && (tz<=1024))
+		{
+			d->shape_mode = 3;
+			d->shape_tz = tz;
+			d->shape_ty = 1;
+			d->shape_forced = true;
+		}
+		else if ((sscanf(shape.c_str(), "%ux%u%c", &tz, &ty, &tail)==2) && (tz>0) && (ty>1) && (tz*ty<=1024))
+		{
+			d->shape_mode = 1;
+			d->shape_tz = tz;
+			d->shape_ty = ty;
+			d->shape_forced = true;
+		}
 		else if (shape!="auto")
-			std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_SHAPE=" << shape << " is not 0 or auto, using auto" << std::endl;
+			std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_SHAPE=" << shape << " is not 0, auto, cN or TZxTY, using auto" << std::endl;
 	}
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
 	d->main_stop = d->dim;
