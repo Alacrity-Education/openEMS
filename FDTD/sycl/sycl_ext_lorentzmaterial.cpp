@@ -225,6 +225,7 @@ void SYCL_Ext_LorentzMaterial::Setup(std::vector<ADEGroup>& groups, std::vector<
 	G.count = count;
 	G.sn = d->numCells;
 	G.pos = d->Alloc<size_t>(count, flat.data());
+	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_SYCL::Impl::MurRefusal()
 	G.orders = 1;
 	G.dirs = ord.dirs;
 	G.o[0] = ord;

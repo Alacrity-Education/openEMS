@@ -161,6 +161,77 @@ inline SYCL_MainCoeffT<I, FACTOR> main_coeff(const void* index, const float* ca,
 	}
 }
 
+//! The main voltage update of component \a n of node \a i from its old value \a old: the statements of
+//! update_voltages, for the kernels of the Mur modes (see GPU_Backend_SYCL::Impl::mur_mode), which
+//! must reproduce its results bit for bit. xm, ym, zm: the shifts to the previous line (0 on the first).
+template<typename I, bool FACTOR>
+inline float volt_update_node(unsigned int n, float old, const float* curr, const SYCL_MainCoeffT<I, FACTOR>& C,
+                              I sn, I i, I xm, I ym, I zm)
+{
+	float v;
+	if (n==0)
+	{
+		v  = old * C.a[0];
+		v += C.b[0] * (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
+	}
+	else if (n==1)
+	{
+		v  = old * C.a[C.s];
+		v += C.b[C.s] * (curr[i] - curr[i-zm] - curr[2*sn+i] + curr[2*sn+i-xm]);
+	}
+	else
+	{
+		v  = old * C.a[2*C.s];
+		v += C.b[2*C.s] * (curr[sn+i] - curr[sn+i-xm] - curr[i] + curr[i-ym]);
+	}
+	return v;
+}
+
+//! volt_update_node() of the node (x, y, z)
+template<typename I, bool FACTOR>
+inline float volt_update_at(unsigned int n, float old, const float* curr, const void* index, const float* ca,
+                            const float* cb, unsigned int mode, const SYCL_GridDim& N,
+                            unsigned int x, unsigned int y, unsigned int z)
+{
+	const I sn = (I)N.nx*N.ny*N.nz;
+	const I i  = nijk<I>(N, 0, x, y, z);
+	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
+	const I ym = (y>0) ? N.nz : 0;
+	const I zm = (z>0) ? 1 : 0;
+	return volt_update_node<I, FACTOR>(n, old, curr, main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z), sn, i, xm, ym, zm);
+}
+
+//! Mur planes of Mur mode 1 (mur_shell), face f = 2*ny + (line>0); the kernel reads them from device
+//! memory (GPU_Backend_SYCL::Impl::mur_dev: a by-value array indexed at run time would be copied to
+//! private memory by every work-item), the active bits are an argument
+struct SYCL_MurFace
+{
+	const float* c_nyP;    //!< coefficients of component nyP, at (i,j) = i*numLines[nyPP] + j
+	const float* c_nyPP;   //!< coefficients of component nyPP
+	unsigned int line, shift;
+	unsigned int rank;     //!< position in the apply order of the Mur planes: the higher one is applied later
+};
+struct SYCL_MurFaces
+{
+	SYCL_MurFace f[6];
+	unsigned int active;   //!< bit f: face f has a Mur plane that is active in this timestep
+};
+
+//! Nodes of Mur mode 1: update_voltages_inner updates the main nodes [B, E) inside [L, H), mur_shell the others
+struct SYCL_MurShell
+{
+	SYCL_GridDim B, E, L, H;
+};
+
+//! A Mur plane of the grid, registered by SYCL_Ext_Mur_ABC
+struct SYCL_MurPlane
+{
+	int ny;
+	unsigned int line, shift;
+	const float *c_nyP, *c_nyPP;
+	size_t seq;   //!< position of its extension in the extension order (see GPU_Backend_SYCL::Impl::ext_log)
+};
+
 #include "sycl_upml.h"
 
 //! Run \a f, converting a sycl::exception into a std::runtime_error naming \a what
@@ -264,6 +335,30 @@ struct GPU_Backend_SYCL::Impl
 	//! Decide once whether the fused step is used, and prepare it; it keeps the UPML z slabs
 	//! (zslab_lo, zslab_hi) in its kernel or leaves them to the region kernels (clears the flags)
 	bool DecideFusedStep();
+
+	//! Extensions in the order the engine created them (its extension order), see CreateExtension(): the
+	//! voltages they register in volt_modified are [vm_begin, vm_end), the nodes they register in
+	//! ext_nodes [nodes_begin, nodes_end)
+	struct ExtRecord { Engine_Extension* eng_ext; size_t vm_begin, vm_end, nodes_begin, nodes_end; };
+	std::vector<ExtRecord> ext_log;
+	//! Flat node indices (x*ny*nz + y*nz + z) an extension reads or writes the voltages of at its hooks, registered
+	//! by its constructor (the dispersive materials and sheets), for the check of MurRefusal()
+	std::vector<size_t> ext_nodes;
+	//! The Mur mode in use, -1 until DecideMurFused() (the first voltage update), which takes the highest one the grid
+	//! allows: 0 the three launches per Mur plane, 1 the Mur planes in the voltage update (update_voltages_inner and
+	//! mur_shell, see mur_volt_component); the Mur hooks of a timestep that started before the decision finish it as
+	//! mode 0
+	int mur_mode;
+	std::vector<SYCL_MurPlane> mur_planes;
+	SYCL_MurFaces mur;                        //!< the planes of mode 1, active bits set by the Mur hooks
+	SYCL_MurFace* mur_dev;                    //!< device copy of mur.f (the kernel indexes it)
+	SYCL_MurShell mur_shell;                  //!< the nodes of the two kernels of mode 1
+	size_t mur_shell_count;                   //!< number of nodes of mur_shell
+	bool mur_released;                        //!< a Mur extension was deleted (host fallback): mode 0
+	//! Decide once which Mur mode is used (the highest one the grid allows), log it
+	void DecideMurFused();
+	//! Why mode 1 cannot be used on this grid, empty if it can
+	std::string MurRefusal() const;
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer

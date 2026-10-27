@@ -39,6 +39,15 @@ there are unreleased changes. It becomes the next release entry.
   from 1-D tables, which shrinks the 59 MB table of a gerber2ems board
   mesh to 1.3 MB at a relative difference below 1e-5 of the peak field.
   `--verbose=2` prints the mode, the set count and the fused-step decision.
+- The SYCL backend runs the Mur ABC inside the voltage update, with
+  bit-identical results: the voltages of the Mur planes (the boundary line and
+  the line next to it) are updated in one launch with their Mur values, beside
+  the main update of the other nodes (two launches per timestep instead of one
+  plus three per plane). A grid where this does not apply (a Mur plane through
+  a UPML region, TF/SF, steady-state detection, or a material or lumped element
+  on a plane) runs the separate launches, which `--verbose=2` prints. On an
+  Arc B580 a PCB model of 3.06 Mcells with Mur on all six faces settles at
+  2384 MC/s instead of 2157 (+10.5 %).
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
