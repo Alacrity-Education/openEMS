@@ -27,9 +27,9 @@
  *     block captured once as a graph and replayed; the voltage and current frontiers step back one plane per step,
  *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where that leaves fewer
  *     than T planes a window, T = 4, then 2: on a small L2 the halo of T = 8 alone takes most of it), then the
- *     tuner times up to 12 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2) and refines the three best with
- *     W -/+25 % on the first timesteps of the run (real timesteps: every candidate is bit-identical) and keeps the
- *     fastest; every run tunes. rule: the rule without the tuner.
+ *     tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of all x planes) and
+ *     refines the three best with W -/+25 % on the first timesteps of the run (real timesteps: every candidate is
+ *     bit-identical) and keeps the fastest; every run tunes. rule: the rule without the tuner.
  *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
  *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
  *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
@@ -2281,7 +2281,7 @@ float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int 
 // W -25 % and +25 %, the best measured one runs from then on. The candidates run real timesteps, in the chunks the
 // engine hands over: every schedule is bit-identical to the single step (the frontiers of WindowFrontiers()), so the
 // tune does not change the result and costs only the slower candidates' time; nothing is copied or restored.
-static const unsigned int HIP_TUNE_MAX_CANDIDATES = 12;   // the first list (the refinement adds up to 6)
+static const unsigned int HIP_TUNE_MAX_CANDIDATES = 13;   // the first list (the refinement adds up to 6)
 static const unsigned int HIP_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
 
 void GPU_Backend_HIP::Impl::WindowTunePrepare()
@@ -2303,6 +2303,9 @@ void GPU_Backend_HIP::Impl::WindowTunePrepare()
 		}
 	};
 	add(tune_rule_T, tune_rule_W);
+	// one window over all of x, the single step's work in graphs: the fastest where the L2 gains less than the small
+	// extension kernels of many windows cost (H100, A100: each window runs them again, a few us each)
+	add(16, dim.nx);
 	static const unsigned int Ts[] = {8, 16, 4, 2};
 	static const double margins[] = {0.65, 0.45, 0.85};
 	for (unsigned int t=0; t<4; ++t)

@@ -91,6 +91,9 @@ there are unreleased changes. It becomes the next release entry.
   T and W on the first few hundred timesteps of a run (real timesteps, each
   candidate bit-identical; the model of 3.06 Mcells: T=16, W=193, 23906
   MC/s, +9.3 % over T=8, W=143); every run tunes, `rule` or `T,W` skip it.
+  One window over all of x is among the candidates: on an H100 and an A100 the
+  L2 gains less than the windows' extra launches cost, and `auto` runs the PCB
+  model 1.12x and 1.23x faster with it.
   `auto` keeps the fused step on grids where it folds the UPML regions into
   its kernel and one window covers the grid (no L2 gain there). The
   environment knobs of the HIP backend are listed with their defaults and
