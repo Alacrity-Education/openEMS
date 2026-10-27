@@ -44,11 +44,11 @@
  *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep;
  *     a candidate within 0.5 % of the fastest ties with it, and a tie goes to the first listed, 32x8 (on the PCB,
  *     32x8, 64x4 and 32x4 tie within 0.03 % there, while inside the windowed blocks 32x8 is 1.8 to 2.6 % faster).
- *     0 the former block, cN (N a multiple of 64) or TZxTY forced. The candidates TZxTY take TZ threads along z and
- *     TY rows; cN (c128, c256), the compact layout, runs the y rows of the z lines one after the other in blocks of N
- *     threads, so a z line of 44 nodes takes 44 lanes instead of two warps: the PCB single step on an H100 16912
- *     MC/s instead of 15610 (c128), on an A100 11102 instead of 10741 (c256). ZPAD and SHAPE together: small PCB
- *     10226 to 11572 MC/s (+13 %), the PCB 12822 to 13877 (+8.2 %).
+ *     0 the former block, cN (N a multiple of 64) or TZxTY forced (at most 256 threads). The candidates TZxTY take
+ *     TZ threads along z and TY rows; cN (c128, c256), the compact layout, runs the y rows of the z lines one after
+ *     the other in blocks of N threads, so a z line of 44 nodes takes 44 lanes instead of two warps: the PCB single
+ *     step on an H100 16912 MC/s instead of 15610 (c128), on an A100 11102 instead of 10741 (c256). ZPAD and SHAPE
+ *     together: small PCB 10226 to 11572 MC/s (+13 %), the PCB 12822 to 13877 (+8.2 %).
  * OPENEMS_HIP_INDEX = 32 | 64
  *     The index width of the fused step; default 32 on NVIDIA where the grid fits (V100: 64 registers against 126,
  *     half the occupancy with 64), 64 on AMD.
@@ -111,11 +111,21 @@ __device__ __forceinline__ void main_thread(const HIP_ZSlabs& Z, unsigned int& t
 	ty = blockIdx.y*blockDim.y + threadIdx.y;
 }
 
+// The occupancy of the main kernels on the A100 (sm_80) and the H100 (sm_90): without a bound they take 47 and 56
+// registers there (10 and 9 blocks of 128 threads per multiprocessor); bounded to 6 blocks of 256 (40 registers) they
+// run more warps at once (H100, the PCB model: single step +6.2 %). Blocks of the main kernels have at most 256
+// threads (the shapes of DecideShape(), Block(), OPENEMS_HIP_SHAPE). Other architectures keep the compiler's choice.
+#if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__==800) || (__CUDA_ARCH__==900))
+#define HIP_MAIN_BOUNDS __launch_bounds__(256, 6)
+#else
+#define HIP_MAIN_BOUNDS
+#endif
+
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
 // y-threads, x along the grid z-dimension. The coefficients are read with main_coeff().
 // Nodes below Z.z_lo or from Z.z_hi on belong to UPML regions along z (see HIP_ZSlabs).
-__global__ void update_voltages(float* __restrict__ volt, const float* __restrict__ curr,
+__global__ void HIP_MAIN_BOUNDS update_voltages(float* __restrict__ volt, const float* __restrict__ curr,
                                 const void* index, const float* ca, const float* cb, unsigned int mode,
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
 {
@@ -351,7 +361,7 @@ __device__ __forceinline__ void mur_zface_lane(const HIP_MurZFaces& M, unsigned 
 // and the warps on the outer z lines of every line run both paths. ZF (Mur mode 2): the box covers
 // the z faces too, whose interior gets its Mur values from mur_zface_lane().
 template<bool ZF>
-__global__ void update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
+__global__ void HIP_MAIN_BOUNDS update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
                                       const void* index, const float* ca, const float* cb, unsigned int mode,
                                       HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S,
                                       HIP_MurZFaces M)
@@ -461,7 +471,7 @@ __global__ void mur_shell(float* volt, const float* curr, const void* index, con
 }
 
 // the currents on the last mesh line of each direction are not updated
-__global__ void update_currents(float* __restrict__ curr, const float* __restrict__ volt,
+__global__ void HIP_MAIN_BOUNDS update_currents(float* __restrict__ curr, const float* __restrict__ volt,
                                 const void* index, const float* ca, const float* cb, unsigned int mode,
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
 {
@@ -1721,14 +1731,14 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 		char tail = 0;
 		if (shape=="0")
 			d->shape_mode = 0;
-		else if ((sscanf(shape.c_str(), "c%u%c", &tz, &tail)==1) && (tz>0) && (tz%64==0) && (tz<=1024))
+		else if ((sscanf(shape.c_str(), "c%u%c", &tz, &tail)==1) && (tz>0) && (tz%64==0) && (tz<=256))
 		{
 			d->shape_mode = 3;
 			d->shape_tz = tz;
 			d->shape_ty = 1;
 			d->shape_forced = true;
 		}
-		else if ((sscanf(shape.c_str(), "%ux%u%c", &tz, &ty, &tail)==2) && (tz>0) && (ty>1) && (tz*ty<=1024))
+		else if ((sscanf(shape.c_str(), "%ux%u%c", &tz, &ty, &tail)==2) && (tz>0) && (ty>1) && (tz*ty<=256))
 		{
 			d->shape_mode = 1;
 			d->shape_tz = tz;
