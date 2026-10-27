@@ -1590,6 +1590,13 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->dim.ny = numLines[1];
 	d->dim.nz = numLines[2];
 	d->numCells = (size_t)numLines[0]*numLines[1]*numLines[2];
+	if (g_settings.GetVerboseLevel()>1)
+	{
+		const sycl::device& dev = d->ctx->device;
+		std::cout << "GPU_Backend_SYCL: " << d->ctx->name << ": " << dev.get_info<sycl::info::device::max_compute_units>()
+		          << " compute units, L2 cache " << dev.get_info<sycl::info::device::global_mem_cache_size>()/(1024*1024)
+		          << " MiB, sub-group size " << d->ctx->sub_group_size << std::endl;
+	}
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
