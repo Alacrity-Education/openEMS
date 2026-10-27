@@ -182,6 +182,7 @@ SYCL_Ext_Mur_ABC::~SYCL_Ext_Mur_ABC()
 	// the host fallback deletes the device extensions: no Mur in the main update any more
 	d->mur_released = true;
 	d->mur_mode = 0;
+	d->mur_zf_on = false;
 	d->mur.active = 0;
 }
 

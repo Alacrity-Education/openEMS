@@ -48,6 +48,13 @@ there are unreleased changes. It becomes the next release entry.
   on a plane) runs the separate launches, which `--verbose=2` prints. On an
   Arc B580 a PCB model of 3.06 Mcells with Mur on all six faces settles at
   2384 MC/s instead of 2157 (+10.5 %).
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are neighbouring work-items
+  of one sub-group and exchange their values through sub-group shifts
+  (bit-identical; a grid with fewer than 6 z lines, no Mur plane on a z face,
+  or the two lines in different sub-groups keeps them in the shell launch).
+  On an Arc B580 the 3.06 Mcell model settles at 3095 MC/s with the z faces
+  in the kernel instead of 2384.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

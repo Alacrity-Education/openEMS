@@ -223,6 +223,17 @@ struct SYCL_MurShell
 	SYCL_GridDim B, E, L, H;
 };
 
+//! The z faces of Mur mode 2: the interior of each (x and y inside [SYCL_MurShell::L, H)) is updated by
+//! update_voltages_inner (mur_zface_lanes()), which exchanges the values of the Mur line and the shift line of a
+//! z line through sub-group shifts. Index 0 the z-low, 1 the z-high plane
+struct SYCL_MurZFaces
+{
+	const float* c_x[2];   //!< coefficients of component x (the plane's nyP), at x*ny + y
+	const float* c_y[2];   //!< coefficients of component y (the plane's nyPP), at x*ny + y
+	unsigned int line[2], shift[2];
+	unsigned int active;   //!< bit f: plane f exists and is active in this timestep
+};
+
 //! A Mur plane of the grid, registered by SYCL_Ext_Mur_ABC
 struct SYCL_MurPlane
 {
@@ -346,8 +357,8 @@ struct GPU_Backend_SYCL::Impl
 	std::vector<size_t> ext_nodes;
 	//! The Mur mode in use, -1 until DecideMurFused() (the first voltage update), which takes the highest one the grid
 	//! allows: 0 the three launches per Mur plane, 1 the Mur planes in the voltage update (update_voltages_inner and
-	//! mur_shell, see mur_volt_component); the Mur hooks of a timestep that started before the decision finish it as
-	//! mode 0
+	//! mur_shell, see mur_volt_component), 2 as 1 with the interior of the z faces in update_voltages_inner
+	//! (mur_zface_lanes()); the Mur hooks of a timestep that started before the decision finish it as mode 0
 	int mur_mode;
 	std::vector<SYCL_MurPlane> mur_planes;
 	SYCL_MurFaces mur;                        //!< the planes of mode 1, active bits set by the Mur hooks
@@ -355,10 +366,15 @@ struct GPU_Backend_SYCL::Impl
 	SYCL_MurShell mur_shell;                  //!< the nodes of the two kernels of mode 1
 	size_t mur_shell_count;                   //!< number of nodes of mur_shell
 	bool mur_released;                        //!< a Mur extension was deleted (host fallback): mode 0
+	bool mur_zf_on;                           //!< mode 1 with the z faces of Mur mode 2
+	SYCL_MurZFaces mur_zf;                    //!< the z planes of mode 2 (active bits set at the launch)
+	unsigned int mur_zf_sg;                   //!< the sub-group size of update_voltages_inner in mode 2 (16 or 32)
 	//! Decide once which Mur mode is used (the highest one the grid allows), log it
 	void DecideMurFused();
 	//! Why mode 1 cannot be used on this grid, empty if it can
 	std::string MurRefusal() const;
+	//! Why the z faces of mode 2 cannot run in update_voltages_inner, empty if they can (call after MurRefusal())
+	std::string MurZFaceRefusal();
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer

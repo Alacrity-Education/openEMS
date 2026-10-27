@@ -16,6 +16,37 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/*
+ * Environment knobs of the SYCL backend (read once when a grid is set up; --verbose=2 prints the decisions).
+ * Every knob changes how the backend computes, never what: unless a knob says otherwise its settings are
+ * bit-identical to each other. Speeds are from an Arc B580: "small PCB" is a PCB model of 3.06 Mcells (337 x 227
+ * x 40, Mur on six faces, four copper sheet planes).
+ *
+ * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
+ *     Development: the sub-group size of the voltage kernel that updates the Mur z faces inside the main update
+ *     (Mur mode 2, the line and shift line of a z line exchange their values by sub-group shifts). small PCB:
+ *     3095 MC/s with 32, 2937 with 16.
+ * OPENEMS_SYCL_FUSED_STEP = unset (default) | 0 | 1
+ *     The voltage and current updates fused into one pass; unset: on grids without UPML, Mur, absorbing sheets,
+ *     TF/SF and dispersive materials; 1: on every Cartesian grid the extensions allow (with a fix-up of the
+ *     currents next to the voltages the extensions change); 0: never.
+ * OPENEMS_SYCL_FUSED_XC, OPENEMS_SYCL_FUSED_TY, OPENEMS_SYCL_FUSED_TZ
+ *     Development: the tile of the fused step (XC x lines per work-group, default 4; TY rows along y, 4, 8 or 16,
+ *     default 8; TZ work-items along z, 16 or 32, default 32).
+ * OPENEMS_SYCL_FUSED_REGIONS = 1 (default) | 0 | 2
+ *     The UPML z slabs in the fused kernel with aligned tiles; 0 left to the region kernels; 2 one z tiling.
+ * OPENEMS_SYCL_INDEX = 32 | 64
+ *     The index width of the kernels; default 32 where the fields fit.
+ * OPENEMS_SYCL_UPML_FUSION = 1 (default) | 0
+ *     The UPML regions fused with the main updates; 0 the separate pre/post kernels.
+ * OPENEMS_SYCL_COEFF = sets (default) | full | factor, OPENEMS_SYCL_COEFF_ULP = 2 (default)
+ *     The storage of the update coefficients: deduplicated sets, full arrays, or sets divided by the mesh geometry
+ *     (Cartesian meshes; within COEFF_ULP units in the last place of the stored coefficients, not bit-identical).
+ * OPENEMS_SYCL_KERNEL_TIMES = 0 (default) | 1
+ *     Development: a table of kernel times at the end of the run, waiting after every launch: kernel shares,
+ *     never speeds.
+ */
+
 #include <sycl/sycl.hpp>
 #include <algorithm>
 #include <climits>
@@ -238,58 +269,119 @@ inline void mur_volt_node(float* volt, const float* curr, const void* index, con
 	mur_volt_component<2, I, FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
 }
 
+// Mur mode 2: the Mur values of the tangential components x and y of the nodes L on the line of an active z
+// plane, from the node S on its shift line in the same z line, the neighbouring work-item of the same sub-group
+// (z is the contiguous work-item dimension; DecideMurFused() refuses the mode when a line and its shift line fall
+// into different sub-groups or are not adjacent, MurZFaceRefusal()). Called by every work-item of
+// update_voltages_inner<..., true> (a sub-group function: \a node false where the work-item has no node of the
+// interior of the z faces or inside them), with the old values o_x, o_y and the main updates v_x, v_y of its own
+// node (index xy = x*ny + y of the plane's coefficients, as the Mur extension indexes them: i along nyP = x, j
+// along nyPP = y). The values of S come over by a shift by one work-item; L replaces its main update with
+//     v = V_old(S) - k*V_old(L);  v = v + k*V_new(S)
+// the statements of mur_pre and mur_post, which mur_apply writes. The z component of L stays its main update (the
+// z planes write only x and y), and S keeps its main update, as every main node. Node sets: this kernel writes the
+// nodes with x and y inside [S.L, S.H) on every z line of the main range (the z faces' lines and shift lines
+// included); mur_shell the others (the x-face slabs, then the y-face slabs inside x: the 2-line bands along the four
+// edges of each z face, their shift cells too), which never read a voltage this kernel writes.
+inline void mur_zface_lanes(const sycl::sub_group& sg, const SYCL_MurZFaces& M, bool node, unsigned int z, size_t xy,
+                            float o_x, float o_y, float& v_x, float& v_y)
+{
+	for (unsigned int f=0; f<2; ++f)
+	{
+		if (!((M.active>>f) & 1u))
+			continue;   // the same for all work-items
+		// the shift line above the line (z-low): the values of the next work-item, else of the previous one
+		const bool up = M.shift[f]>M.line[f];
+		const float so_x = up ? sycl::shift_group_left(sg, o_x, 1) : sycl::shift_group_right(sg, o_x, 1);
+		const float so_y = up ? sycl::shift_group_left(sg, o_y, 1) : sycl::shift_group_right(sg, o_y, 1);
+		const float sn_x = up ? sycl::shift_group_left(sg, v_x, 1) : sycl::shift_group_right(sg, v_x, 1);
+		const float sn_y = up ? sycl::shift_group_left(sg, v_y, 1) : sycl::shift_group_right(sg, v_y, 1);
+		if (node && (z==M.line[f]))
+		{
+			const float k_x = M.c_x[f][xy];
+			float v = so_x - k_x * o_x;
+			v = v + k_x * sn_x;
+			v_x = v;
+			const float k_y = M.c_y[f][xy];
+			v = so_y - k_y * o_y;
+			v = v + k_y * sn_y;
+			v_y = v;
+		}
+	}
+}
+
 // The main update of the nodes inside the box [S.L, S.H), the statements of update_voltages: in one kernel with
 // the Mur nodes (all the same, see mur_shell) the Mur path would cost every work-group its registers, and the
-// sub-groups on the outer z lines of every line would run both paths.
-template<typename I, bool FACTOR>
+// sub-groups on the outer z lines of every line would run both paths. ZF (Mur mode 2): the box covers the z faces
+// too, whose interior gets its Mur values from mur_zface_lanes(), a sub-group function: no work-item returns early.
+template<typename I, bool FACTOR, bool ZF>
 inline void update_voltages_inner(const sycl::nd_item<3>& it, float* __restrict__ volt, const float* __restrict__ curr,
                                   const void* index, const float* ca, const float* cb, unsigned int mode,
                                   const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z,
-                                  const SYCL_MurShell& S)
+                                  const SYCL_MurShell& S, const SYCL_MurZFaces& M)
 {
 	const unsigned int tz = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
 	unsigned int z = B.nz + tz;
+	bool live = true;
 	if (Z.t_int)
 	{
 		if (tz<Z.t_lo)
 		{
 			if (B.nz+tz>=Z.z_lo)
-				return;
+				live = false;
 		}
 		else if (tz<Z.t_lo+Z.t_int)
 		{
 			z = Z.z_lo + (tz-Z.t_lo);
 			if (z>=Z.z_hi)
-				return;
+				live = false;
 		}
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
 	const unsigned int y = B.ny + it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
 	const unsigned int x = B.nx + it.get_group(0);
-	if (z>=E.nz || y>=E.ny || x>=E.nx)
-		return;
-	if (z<Z.z_lo)
+	live = live && (z<E.nz) && (y<E.ny) && (x<E.nx);
+	if (live && (z<Z.z_lo))
 	{
 		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
-		return;
+		live = false;
 	}
-	if (z>=Z.z_hi)
+	else if (live && (z>=Z.z_hi))
 	{
 		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
-		return;
+		live = false;
 	}
-	if ((x<S.L.nx) || (x>=S.H.nx) || (y<S.L.ny) || (y>=S.H.ny) || (z<S.L.nz) || (z>=S.H.nz))
-		return;   // a node of mur_shell
+	// a node of mur_shell otherwise
+	const bool node = live && (x>=S.L.nx) && (x<S.H.nx) && (y>=S.L.ny) && (y<S.H.ny) && (z>=S.L.nz) && (z<S.H.nz);
+	if constexpr (!ZF)
+	{
+		(void)M;
+		if (!node)
+			return;
+	}
 	const I sn = (I)N.nx*N.ny*N.nz;
-	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-	const I ym = (y>0) ? N.nz : 0;
-	const I zm = (z>0) ? 1 : 0;
-	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
-	volt[i]      = volt_update_node<I, FACTOR>(0, volt[i], curr, C, sn, i, xm, ym, zm);
-	volt[sn+i]   = volt_update_node<I, FACTOR>(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
-	volt[2*sn+i] = volt_update_node<I, FACTOR>(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+	const I i  = node ? nijk<I>(N, 0, x, y, z) : 0;
+	float o_x = 0, o_y = 0, v_x = 0, v_y = 0;
+	if (node)
+	{
+		const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
+		const I ym = (y>0) ? N.nz : 0;
+		const I zm = (z>0) ? 1 : 0;
+		const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
+		o_x = volt[i];
+		o_y = volt[sn+i];
+		v_x = volt_update_node<I, FACTOR>(0, o_x, curr, C, sn, i, xm, ym, zm);
+		v_y = volt_update_node<I, FACTOR>(1, o_y, curr, C, sn, i, xm, ym, zm);
+		volt[2*sn+i] = volt_update_node<I, FACTOR>(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+	}
+	if constexpr (ZF)
+		mur_zface_lanes(it.get_sub_group(), M, node, z, (size_t)x*N.ny + y, o_x, o_y, v_x, v_y);
+	if (node)
+	{
+		volt[i]    = v_x;
+		volt[sn+i] = v_y;
+	}
 }
 
 // the j-th of the n0 + (E-H) lines of an axis outside [L, H) (n0 = L-B)
@@ -300,7 +392,8 @@ inline unsigned int mur_shell_line(unsigned int j, unsigned int B, unsigned int 
 
 // The main nodes outside the box [S.L, S.H): the lines and shift lines of the Mur planes (inactive ones too),
 // one work-item per node, as the slabs of the x faces (all y, z), of the y faces (x inside) and of the z faces
-// (x and y inside). Launched right after update_voltages_inner, on nodes disjoint from its own.
+// (x and y inside; with Mur mode 2 S spans all z lines, so there are none: update_voltages_inner<..., true>
+// has them). Launched right after update_voltages_inner, on nodes disjoint from its own.
 template<typename I, bool FACTOR>
 inline void mur_shell(const sycl::nd_item<3>& it, float* volt, const float* curr, const void* index, const float* ca, const float* cb,
                       unsigned int mode, const SYCL_GridDim& N, const SYCL_MurShell& S, const SYCL_MurFace* F, unsigned int active)
@@ -851,9 +944,10 @@ static void launch_update_voltages(GPU_Backend_SYCL::Impl* d, unsigned int threa
 	});
 }
 
-// Mur mode 1: update_voltages_inner, then mur_shell (see mur_volt_component)
-template<typename I, bool FACTOR>
-static void launch_update_voltages_inner(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
+// Mur modes 1 and 2: update_voltages_inner, then mur_shell (see mur_volt_component)
+template<typename I, bool FACTOR, bool ZF, unsigned int SG>
+static void launch_update_voltages_inner(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E,
+                                         const SYCL_MurShell& S, const SYCL_MurZFaces& M)
 {
 	const bool c = d->coeff_mode>0;
 	float* volt = d->volt;
@@ -865,15 +959,22 @@ static void launch_update_voltages_inner(GPU_Backend_SYCL::Impl* d, unsigned int
 	const SYCL_GridDim N = d->dim;
 	const SYCL_GridDim Bk = B, Ek = E;
 	const SYCL_ZSlabs Z = d->zslabs;
-	const SYCL_MurShell S = d->mur_shell;
-	SYCL_Launch(d, "update_voltages_inner", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
-	{
-		update_voltages_inner<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z, S);
-	});
+	const SYCL_MurShell Sk = S;
+	const SYCL_MurZFaces Mk = M;
+	if constexpr (ZF)
+		SYCL_Launch(d, "update_voltages_inner", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG)]]
+		{
+			update_voltages_inner<I, FACTOR, true>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z, Sk, Mk);
+		});
+	else
+		SYCL_Launch(d, "update_voltages_inner", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
+		{
+			update_voltages_inner<I, FACTOR, false>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z, Sk, Mk);
+		});
 }
 
 template<typename I, bool FACTOR>
-static void launch_mur_shell(GPU_Backend_SYCL::Impl* d)
+static void launch_mur_shell(GPU_Backend_SYCL::Impl* d, const SYCL_MurShell& S)
 {
 	const bool c = d->coeff_mode>0;
 	float* volt = d->volt;
@@ -883,21 +984,36 @@ static void launch_mur_shell(GPU_Backend_SYCL::Impl* d)
 	const float* cb = c ? d->coeff : d->vi;
 	const unsigned int mode = d->coeff_mode;
 	const SYCL_GridDim N = d->dim;
-	const SYCL_MurShell S = d->mur_shell;
+	const SYCL_MurShell Sk = S;
 	const SYCL_MurFace* F = d->mur_dev;
 	const unsigned int active = d->mur.active;
 	SYCL_Launch(d, "mur_shell", d->mur_shell_count, 1, 1, [=](sycl::nd_item<3> it)
 	{
-		mur_shell<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, S, F, active);
+		mur_shell<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, Sk, F, active);
 	});
 }
 
-// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component)
 template<typename I, bool FACTOR>
 static void launch_mur_volt(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
 {
-	launch_update_voltages_inner<I, FACTOR>(d, threads_z, B, E);
-	launch_mur_shell<I, FACTOR>(d);
+	// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component); mode 2: the interior
+	// of the z faces in the first kernel (see mur_zface_lanes), the box spans all z lines, so mur_shell has no
+	// z-face slabs (its work-items past the count would otherwise run into them)
+	SYCL_MurShell S = d->mur_shell;
+	SYCL_MurZFaces M = d->mur_zf;
+	if (d->mur_zf_on)
+	{
+		S.L.nz = d->main_start.nz;
+		S.H.nz = d->main_stop.nz;
+		M.active = (d->mur.active>>4) & 3u;
+		if (d->mur_zf_sg==16)
+			launch_update_voltages_inner<I, FACTOR, true, 16>(d, threads_z, B, E, S, M);
+		else
+			launch_update_voltages_inner<I, FACTOR, true, 32>(d, threads_z, B, E, S, M);
+	}
+	else
+		launch_update_voltages_inner<I, FACTOR, false, 32>(d, threads_z, B, E, S, M);
+	launch_mur_shell<I, FACTOR>(d, S);
 }
 
 template<typename I, bool FACTOR>
@@ -1056,6 +1172,9 @@ GPU_Backend_SYCL::Impl::Impl()
 	memset(&mur_shell, 0, sizeof(mur_shell));
 	mur_shell_count = 0;
 	mur_released = false;
+	mur_zf_on = false;
+	memset(&mur_zf, 0, sizeof(mur_zf));
+	mur_zf_sg = 32;
 }
 
 GPU_Backend_SYCL::Impl::~Impl()
@@ -1340,6 +1459,61 @@ std::string GPU_Backend_SYCL::Impl::MurRefusal() const
 	return std::string();
 }
 
+// true if the work-items of the z positions tz_a and tz_b (the work-item index along z, dimension 2 of work-groups
+// of \a block, see MainRange()) are in the same sub-group of \a w work-items, for every y row of the work-group
+// (DPC++ forms the sub-groups of consecutive local linear ids, z the fastest dimension)
+static bool SYCL_SameSubGroupZ(unsigned int tz_a, unsigned int tz_b, const SYCL_Dim3& block, unsigned int w)
+{
+	if (tz_a/block.x != tz_b/block.x)
+		return false;   // different work-groups
+	const unsigned int a = tz_a%block.x, b = tz_b%block.x;
+	for (unsigned int k=0; k<block.y*block.z; ++k)
+		if ((k*block.x + a)/w != (k*block.x + b)/w)
+			return false;
+	return true;
+}
+
+std::string GPU_Backend_SYCL::Impl::MurZFaceRefusal()
+{
+	memset(&mur_zf, 0, sizeof(mur_zf));
+	if (dim.nz<6)
+		return "fewer than 6 z lines";
+	bool any = false;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+	{
+		const SYCL_MurPlane& P = mur_planes[k];
+		if (P.ny!=2)
+			continue;
+		const unsigned int f = (P.line>0) ? 1 : 0;
+		if ((P.shift+1!=P.line) && (P.line+1!=P.shift))
+			return "the shift line of a z plane is not next to its line";
+		mur_zf.c_x[f] = P.c_nyP;
+		mur_zf.c_y[f] = P.c_nyPP;
+		mur_zf.line[f] = P.line;
+		mur_zf.shift[f] = P.shift;
+		any = true;
+	}
+	if (!any)
+		return "no Mur plane on a z face";
+	// the launch of update_voltages_inner (UpdateVoltages()): the work-item index along z of a main node, and the work-group
+	SYCL_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	const SYCL_Dim3 block = Block(threads_z, E.ny-B.ny);
+	// OPENEMS_SYCL_MUR_SG=16: sub-groups of 16 (development; default 32, see SYCL_Context::sub_group_size)
+	mur_zf_sg = (getenv("OPENEMS_SYCL_MUR_SG") && (atoi(getenv("OPENEMS_SYCL_MUR_SG"))==16)) ? 16 : 32;
+	bool offered = false;
+	for (size_t s : ctx->device.get_info<sycl::info::device::sub_group_sizes>())
+		offered = offered || (s==mur_zf_sg);
+	if (!offered)
+		return "no sub-groups of " + std::to_string(mur_zf_sg) + " on this device";
+	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+	for (unsigned int f=0; f<2; ++f)
+		if ((mur_zf.c_x[f]!=NULL) && !SYCL_SameSubGroupZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, mur_zf_sg))
+			return std::string("the line and the shift line of the z-") + (f ? "high" : "low") + " plane are in different sub-groups";
+	return std::string();
+}
+
 void GPU_Backend_SYCL::Impl::DecideMurFused()
 {
 	if (mur_mode>=0)
@@ -1352,7 +1526,10 @@ void GPU_Backend_SYCL::Impl::DecideMurFused()
 		if (reason.empty())
 			mur_mode = 1;
 		else if (verbose)
+		{
+			std::cout << "GPU_Backend_SYCL: Mur fused: 2 unavailable: " << reason << std::endl;
 			std::cout << "GPU_Backend_SYCL: Mur fused: 1 unavailable: " << reason << std::endl;
+		}
 	}
 	if (mur_mode==1)
 	{
@@ -1399,10 +1576,24 @@ void GPU_Backend_SYCL::Impl::DecideMurFused()
 		mur_shell.L.nx = l[0]; mur_shell.L.ny = l[1]; mur_shell.L.nz = l[2];
 		mur_shell.H.nx = h[0]; mur_shell.H.ny = h[1]; mur_shell.H.nz = h[2];
 		mur_shell_count = (size_t)(e[0]-b[0])*(e[1]-b[1])*(e[2]-b[2]) - inner;
+		const std::string reason = MurZFaceRefusal();
+		if (reason.empty())
+		{
+			// the z faces' interior moves to update_voltages_inner: mur_shell keeps its x- and y-face slabs
+			mur_zf_on = true;
+			mur_shell_count = (size_t)(e[0]-b[0] - (h[0]-l[0]))*(e[1]-b[1])*(e[2]-b[2])
+			                + (size_t)(h[0]-l[0])*(e[1]-b[1] - (h[1]-l[1]))*(e[2]-b[2]);
+		}
+		else if (verbose)
+			std::cout << "GPU_Backend_SYCL: Mur fused: 2 unavailable: " << reason << std::endl;
 	}
 	if (verbose)
 	{
-		std::cout << "GPU_Backend_SYCL: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
+		if (mur_zf_on)
+			std::cout << "GPU_Backend_SYCL: Mur fused: 2 (" << mur_planes.size() << " planes, z faces in the kernel, sub-groups of "
+			          << mur_zf_sg << ")" << std::endl;
+		else
+			std::cout << "GPU_Backend_SYCL: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
 		if (mur_mode==1)
 		{
 			static const char* const faces[6] = {"x-low", "x-high", "y-low", "y-high", "z-low", "z-high"};
