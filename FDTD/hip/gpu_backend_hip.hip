@@ -25,15 +25,17 @@
  * OPENEMS_HIP_WINDOW = auto (default) | 0 | rule | T,W[,B]
  *     The timesteps as blocks of T steps marched along x in windows of W x planes that stay in the L2 cache, each
  *     block captured once as a graph and replayed; the voltage and current frontiers step back one plane per step,
- *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (2T+1)), then the tuner
- *     times up to 12 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2) and refines the three best with W -/+25 %
- *     on the first timesteps of the run (real timesteps: every candidate is bit-identical) and keeps the fastest;
- *     every run tunes. rule: the rule without the tuner.
+ *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where that leaves fewer
+ *     than T planes a window, T = 4, then 2: on a small L2 the halo of T = 8 alone takes most of it), then the
+ *     tuner times up to 12 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2) and refines the three best with
+ *     W -/+25 % on the first timesteps of the run (real timesteps: every candidate is bit-identical) and keeps the
+ *     fastest; every run tunes. rule: the rule without the tuner.
  *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
  *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
  *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
- *     covers all of x (bench pml S: 23839 MC/s fused against 19406 windowed). PCB: 22944 MC/s with the rule (T 8, W 34) against 13877 single-step (+65 %); small PCB: 21806
- *     against 13901 (+57 %), tuned (T 16, W 193) 23906 against the rule's 21870 (+9.3 %).
+ *     covers all of x (bench pml S: 23839 MC/s fused against 19406 windowed). PCB: 22944 MC/s at T 8, W 34 (the
+ *     rule's window while its halo was 2T+1) against 13877 single-step (+65 %); small PCB: 21806 against 13901
+ *     (+57 %), tuned (T 16, W 193) 23906 against 21870 with that rule (+9.3 %).
  * OPENEMS_HIP_ZPAD = auto (default) | 0
  *     The z stride of the device layout rounded up to 64, so that every z line starts on the same alignment. auto: on
  *     grids where the fused step is blocked, unless that more than doubles the z lines or the padded fields and
@@ -898,7 +900,7 @@ GPU_Backend_HIP::Impl::Impl()
 	window_logged = false;
 	window_steps = window_blocks = window_chunks = window_block_launches = 0;
 	tune_state = 0;
-	tune_chunks = tune_rule_W = 0;
+	tune_chunks = tune_rule_T = tune_rule_W = 0;
 	tune_steps = 0;
 	tune_ms = 0;
 	tune_plane_bytes = 0;
@@ -1885,9 +1887,21 @@ unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T,
 	double budget = margin*(double)l2_bytes;
 	if ((double)table_bytes<budget/3)
 		budget -= (double)table_bytes;
-	const double w = std::floor(budget/(double)plane_bytes) - (halo ? (double)halo : (2.0*T + 1));
+	const double w = std::floor(budget/(double)plane_bytes) - (halo ? (double)halo : (T + 1.0));
 	const unsigned int W = (w<1) ? 1u : (unsigned int)std::min(w, (double)nx);
 	return std::max(1u, std::min(W, nx));
+}
+
+unsigned int HIP_WindowRuleTW(size_t l2_bytes, size_t plane_bytes, unsigned int& T, unsigned int nx, size_t table_bytes)
+{
+	// fewer than T planes a window: the next smaller T has a shorter halo and leaves more of the budget to the window
+	while (true)
+	{
+		const unsigned int W = HIP_WindowRule(l2_bytes, plane_bytes, T, nx, table_bytes);
+		if ((W>=T) || (W>=nx) || (T<=2))
+			return W;
+		T = (T>8) ? 8 : (T>4) ? 4 : 2;
+	}
 }
 
 unsigned int GPU_Backend_HIP::Impl::MurActive(unsigned int ts) const
@@ -1994,7 +2008,8 @@ bool GPU_Backend_HIP::Impl::WindowPrepare()
 	if (window.automatic)
 	{
 		win_T = window.T;
-		win_W = HIP_WindowRule(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+		win_W = HIP_WindowRuleTW(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+		tune_rule_T = win_T;
 		tune_rule_W = win_W;
 		win_source = "rule";
 		if (window.tune)
@@ -2263,8 +2278,8 @@ void GPU_Backend_HIP::Impl::WindowTunePrepare()
 	const bool verbose = g_settings.GetVerboseLevel()>1;
 	tune_cands.clear();
 	tune_state = 0;
-	// the candidates: the rule as G6 has it (T 8, 0.65 of L2, a halo of 2T+1), then T in {8, 16, 4, 2} with the true
-	// halo of T+1 planes and 0.65, 0.45 and 0.85 of L2; equal pairs once, at most HIP_TUNE_MAX_CANDIDATES
+	// the candidates: the rule (its T and W), then T in {8, 16, 4, 2} with the halo of T+1 planes at 0.65, 0.45 and
+	// 0.85 of L2; equal pairs once, at most HIP_TUNE_MAX_CANDIDATES
 	auto add = [&](unsigned int T, unsigned int W)
 	{
 		for (size_t k=0; k<tune_cands.size(); ++k)
@@ -2276,7 +2291,7 @@ void GPU_Backend_HIP::Impl::WindowTunePrepare()
 			tune_cands.push_back(c);
 		}
 	};
-	add(8, tune_rule_W);
+	add(tune_rule_T, tune_rule_W);
 	static const unsigned int Ts[] = {8, 16, 4, 2};
 	static const double margins[] = {0.65, 0.45, 0.85};
 	for (unsigned int t=0; t<4; ++t)
@@ -2375,7 +2390,7 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 	if (tune_state>0)
 	{
 		// the rest of this chunk: the best so far once the rule (the first candidate) is measured, the rule until then
-		win_T = 8;
+		win_T = tune_rule_T;
 		win_W = tune_rule_W;
 		double best = -1;
 		for (size_t k=0; (k<tune_cands.size()) && (tune_cands[0].mcs>=0); ++k)
@@ -2407,7 +2422,7 @@ void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
 	const bool rule_timed = !tune_cands.empty() && (tune_cands[0].mcs>=0);
 	if ((best<0) || (!complete && !rule_timed))
 	{
-		win_T = 8;
+		win_T = tune_rule_T;
 		win_W = tune_rule_W;
 		win_source = "rule";
 		if (verbose)
@@ -2488,7 +2503,8 @@ bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& ext
 	if (fused && d->window.tune && !d->upml.empty() && !(upml_env && (atoi(upml_env)==0)))
 	{
 		const size_t plane_bytes = (size_t)d->dim.ny*d->dim.nzd*(24 + d->CoeffBytesPerNode());
-		const unsigned int W = HIP_WindowRule(d->l2_bytes, plane_bytes, d->window.T, d->dim.nx, d->coeff_table_bytes);
+		unsigned int T = d->window.T;
+		const unsigned int W = HIP_WindowRuleTW(d->l2_bytes, plane_bytes, T, d->dim.nx, d->coeff_table_bytes);
 		if (W>=d->dim.nx)
 		{
 			if (verbose)

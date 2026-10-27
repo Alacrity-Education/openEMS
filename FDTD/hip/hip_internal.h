@@ -343,7 +343,8 @@ struct GPU_Backend_HIP::Impl
 	std::vector<WindowCandidate> tune_cands;
 	int tune_state;                 //!< 0 not tuning (forced, rule or done), 1 the candidate list, 2 the refinement
 	unsigned int tune_chunks;       //!< chunks the tune has run in so far
-	unsigned int tune_rule_W;       //!< W of the rule (T = 8), the schedule while nothing is measured
+	unsigned int tune_rule_T;       //!< T and W of the rule (HIP_WindowRuleTW()), the schedule while nothing is measured
+	unsigned int tune_rule_W;
 	unsigned long long tune_steps;  //!< timesteps the candidates ran (warm-up and timed blocks)
 	double tune_ms;                 //!< device time of the timed blocks
 	size_t tune_plane_bytes;        //!< plane bytes of the window rule (WindowPrepare())
@@ -520,10 +521,14 @@ void HIP_Launch(GPU_Backend_HIP::Impl* d, const char* name, Kernel kernel, size_
 //! at a time)
 GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx);
 //! The window rule: W = (margin * L2 - table) / plane_bytes - halo, at least 1, at most nx; the coefficient table (read
-//! by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway. auto starts
-//! from margin 0.65 and halo 0, which means 2T + 1 planes; the schedule's true halo is T + 1 planes
+//! by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway. halo 0
+//! means the schedule's halo of T + 1 planes (the frontiers step back one plane per timestep)
 unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
                             double margin = 0.65, unsigned int halo = 0);
+//! The rule of auto and rule: HIP_WindowRule() at 0.65 of the L2 for \a T (8); where that leaves fewer than T planes a
+//! window, T steps down to 4, then to 2 (on a small L2 the halo of T = 8 alone takes most of the budget). Returns W and
+//! leaves the T it settled on in \a T
+unsigned int HIP_WindowRuleTW(size_t l2_bytes, size_t plane_bytes, unsigned int& T, unsigned int nx, size_t table_bytes);
 
 //! What the windowed schedule needs of a window-capable HIP extension besides GPU_Extension::LaunchInWindow()
 class HIP_WindowHooks
