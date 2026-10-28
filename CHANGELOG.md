@@ -92,6 +92,10 @@ there are unreleased changes. It becomes the next release entry.
   `0` the former 32x8, `TZxTY` forced); the results are bit-identical. On an
   Arc B580 the PCB models take 16x16 or 16x8: a model of 28.7 Mcells runs at
   6349 MC/s instead of 5923, one of 3.06 Mcells at 6588 instead of 5980.
+  The candidates include a compact layout (`cN`: one-dimensional work-groups
+  over the rows of the z lines, so a line of 44 nodes takes 44 work-items),
+  which the B580 takes on both models: 6670 instead of 6345 and 6695
+  instead of 6478 MC/s.
   `OPENEMS_SYCL_ZPAD=M` stores the z lines of the device layout with a stride
   rounded up to a multiple of M (bit-identical as well); it is off by
   default, as the padded runs were slower on the B580.

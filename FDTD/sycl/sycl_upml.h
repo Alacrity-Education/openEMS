@@ -216,6 +216,9 @@ struct SYCL_ZSlabs
 {
 	unsigned int z_lo, z_hi;       //!< main update nodes: z_lo <= z < z_hi, below: slab lo, above: slab hi
 	unsigned int t_lo, t_int;      //!< separate updates: threads along z of slab lo and of the main update nodes, whole sub-groups (0: no padding)
+	//! the compact layout of the separate main kernels (see main_thread()): rows of compact work-items one after the
+	//! other in one-dimensional work-groups, compact_m = 2^32/compact rounded up (0: two-dimensional work-groups)
+	unsigned int compact, compact_m;
 	UPMLRegion R_lo, R_hi;
 	//! the fused step reads the voltage flux from flux and writes the new one into flux_out (two
 	//! buffers, the UPML hooks swap them every step), the separate updates in place

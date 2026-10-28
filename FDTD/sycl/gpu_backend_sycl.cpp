@@ -43,11 +43,15 @@
  *     an extension without the padded layout is present (TF/SF, absorbing sheets, cylinder). Off by default: the
  *     separate kernels gain (PCB pair of updates 2439 us padded to 48, 2666 unpadded), the windowed runs lose (PCB
  *     6128 MC/s against 6349, small PCB 5511 against 6588).
- * OPENEMS_SYCL_SHAPE = auto (default) | 0 | TZxTY
- *     The work-group of the separate main kernels: auto times candidates (32x8, 64x4, 16x16, 32x4, 16x8, 128x2) on
- *     copies of the fields at the first timestep; a candidate within 0.5 % of the fastest ties with it, and a tie goes
- *     to the first listed (32x8, the former work-group); 0 the former work-group, TZxTY forced. The B580 takes 16x16
- *     or 16x8 on both PCB models: PCB 6349 MC/s against 5923 with 32x8 (windowed), small PCB 6588 against 5980.
+ * OPENEMS_SYCL_SHAPE = auto (default) | 0 | cN | TZxTY
+ *     The work-group of the separate main kernels: auto times candidates (32x8, 64x4, 16x16, 32x4, 16x8, 128x2, c128,
+ *     c256) on copies of the fields at the first timestep; a candidate within 0.5 % of the fastest ties with it, and a
+ *     tie goes to the first listed (32x8, the former work-group); 0 the former work-group, TZxTY or cN forced. cN is the
+ *     compact layout: one-dimensional work-groups of N work-items over the y rows of the z lines, row after row, so a
+ *     z line of 44 nodes takes 44 work-items (offered where the Mur z faces' line and shift line stay in one sub-group
+ *     in every row). Without the compact layout the B580 takes 16x16 or 16x8 on both PCB models (PCB 6349 MC/s
+ *     against 5923 with 32x8, small PCB 6588 against 5980), with it c128 or c256 (PCB 6670 against 6345, small PCB
+ *     6695 against 6478).
  * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
  *     Development: the sub-group size of the voltage kernel that updates the Mur z faces inside the main update
  *     (Mur mode 2, the line and shift line of a z line exchange their values by sub-group shifts). small PCB:
@@ -117,13 +121,31 @@
 // Nodes below Z.z_lo or from Z.z_hi on belong to UPML regions along z (see SYCL_ZSlabs).
 // The index type I is unsigned int if the fields fit (see GPU_Backend_SYCL::Impl::index32), else size_t.
 // FACTOR: the factorized coefficients (coeff_mode 3/4), else modes 0-2 (see main_coeff()).
+// The work-item of a main kernel: its index tz along z (see GPU_Backend_SYCL::Impl::MainRange()) and its y row ty.
+// Two-dimensional work-groups (Z.compact 0): tz along dimension 2, ty along dimension 1; the compact layout: the rows of
+// Z.compact work-items one after the other in one-dimensional work-groups (a z line of 44 nodes then takes 44 lanes, not
+// 48 or 64), the row by a multiply-high with the reciprocal (exact for the ranges MainRange() allows)
+inline void main_thread(const sycl::nd_item<3>& it, const SYCL_ZSlabs& Z, unsigned int& tz, unsigned int& ty)
+{
+	if (Z.compact)
+	{
+		const unsigned int t = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+		ty = sycl::mul_hi(t, Z.compact_m);
+		tz = t - ty*Z.compact;
+		return;
+	}
+	tz = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	ty = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+}
+
 template<typename I, bool FACTOR>
 inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt, const float* __restrict__ curr,
                             const void* index, const float* ca, const float* cb, unsigned int mode,
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
 {
 	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each (no divergence)
-	const unsigned int tz = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	unsigned int tz, ty;
+	main_thread(it, Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -141,7 +163,7 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + it.get_group(0);
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -353,7 +375,8 @@ inline void update_voltages_inner(const sycl::nd_item<3>& it, float* __restrict_
                                   const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z,
                                   const SYCL_MurShell& S, const SYCL_MurZFaces& M)
 {
-	const unsigned int tz = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	unsigned int tz, ty;
+	main_thread(it, Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	bool live = true;
 	if (Z.t_int)
@@ -372,7 +395,7 @@ inline void update_voltages_inner(const sycl::nd_item<3>& it, float* __restrict_
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + it.get_group(0);
 	live = live && (z<E.nz) && (y<E.ny) && (x<E.nx);
 	if (live && (z<Z.z_lo))
@@ -470,7 +493,8 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
 {
 	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each (no divergence)
-	const unsigned int tz = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	unsigned int tz, ty;
+	main_thread(it, Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -488,7 +512,7 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + it.get_group(0);
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -1535,6 +1559,9 @@ std::string GPU_Backend_SYCL::Impl::MurRefusal() const
 	return std::string();
 }
 
+static unsigned int SYCL_CompactM(unsigned int R);
+static bool SYCL_SameSubGroupZCompact(unsigned int tz_a, unsigned int tz_b, unsigned int R, unsigned int rows, unsigned int w);
+
 // true if the work-items of the z positions tz_a and tz_b (the work-item index along z, dimension 2 of work-groups
 // of \a block, see MainRange()) are in the same sub-group of \a w work-items, for every y row of the work-group
 // (DPC++ forms the sub-groups of consecutive local linear ids, z the fastest dimension)
@@ -1586,7 +1613,8 @@ std::string GPU_Backend_SYCL::Impl::MurZFaceRefusal()
 		return "no sub-groups of " + std::to_string(mur_zf_sg) + " on this device";
 	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
 	for (unsigned int f=0; f<2; ++f)
-		if ((mur_zf.c_x[f]!=NULL) && !SYCL_SameSubGroupZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, mur_zf_sg))
+		if ((mur_zf.c_x[f]!=NULL) && !(MainCompact() ? SYCL_SameSubGroupZCompact(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), threads_z, E.ny-B.ny, mur_zf_sg)
+		                                             : SYCL_SameSubGroupZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, mur_zf_sg)))
 			return std::string("the line and the shift line of the z-") + (f ? "high" : "low") + " plane are in different sub-groups";
 	return std::string();
 }
@@ -1693,6 +1721,23 @@ void GPU_Backend_SYCL::Impl::ResetZSlabs()
 	zslabs.z_hi = main_stop.nz;
 }
 
+// SYCL_ZSlabs::compact_m of rows of \a R work-items: 2^32 / R rounded up; mul_hi(t, m) = t / R exactly for t < 2^32 / R
+// (the error of m is below 1, so t*m/2^32 stays below the next multiple of 1/R)
+static unsigned int SYCL_CompactM(unsigned int R)
+{
+	return (unsigned int)((0x100000000ULL + R - 1)/R);
+}
+
+// true if the work-items of the z positions tz_a and tz_b are in the same sub-group of \a w work-items in every one of
+// \a rows rows of \a R work-items of the compact layout (work-groups of a multiple of w work-items)
+static bool SYCL_SameSubGroupZCompact(unsigned int tz_a, unsigned int tz_b, unsigned int R, unsigned int rows, unsigned int w)
+{
+	for (unsigned int r=0; r<rows; ++r)
+		if (((size_t)r*R + tz_a)/w != ((size_t)r*R + tz_b)/w)
+			return false;
+	return true;
+}
+
 void GPU_Backend_SYCL::Impl::MainRange(SYCL_GridDim& B, SYCL_GridDim& E, unsigned int& threads_z)
 {
 	B = main_start;
@@ -1713,6 +1758,8 @@ void GPU_Backend_SYCL::Impl::MainRange(SYCL_GridDim& B, SYCL_GridDim& E, unsigne
 		zslabs.t_int = groups(zslabs.z_hi - zslabs.z_lo);
 		threads_z = zslabs.t_lo + zslabs.t_int + groups(E.nz - zslabs.z_hi);
 	}
+	zslabs.compact = MainCompact() ? threads_z : 0;
+	zslabs.compact_m = MainCompact() ? SYCL_CompactM(threads_z) : 0;
 }
 
 // n pairs of update_voltages and update_currents with work-groups of \a block on the fields v, i (copies), for the shape
@@ -1731,7 +1778,8 @@ static void shape_pairs(GPU_Backend_SYCL::Impl* d, float* v, float* i, const SYC
 	const SYCL_GridDim N = d->dim;
 	const SYCL_GridDim Bk = B, Ek = E;
 	const SYCL_ZSlabs Zk = Z;
-	const SYCL_Dim3 grid = GPU_Backend_SYCL::Impl::Grid(block, E.nz-B.nz, E.ny-B.ny, E.nx-B.nx);
+	const SYCL_Dim3 grid = Z.compact ? SYCL_Dim3{((size_t)(E.nz-B.nz)*(E.ny-B.ny) + block.x - 1)/block.x, 1, E.nx-B.nx}
+	                                 : GPU_Backend_SYCL::Impl::Grid(block, E.nz-B.nz, E.ny-B.ny, E.nx-B.nx);
 	const sycl::nd_range<3> range(sycl::range<3>(grid.z*block.z, grid.y*block.y, grid.x*block.x), sycl::range<3>(block.z, block.y, block.x));
 	for (unsigned int p=0; p<n; ++p)
 	{
@@ -1777,10 +1825,24 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 		// place: the timed launches take every node of the range as a main node instead (the same lines and reads,
 		// without the flux). The candidates in the order of preference (TZ x TY work-items, TZ along z): a tie within
 		// 0.5 % of the fastest goes to the first listed, the former work-group of the main kernels first.
-		static const unsigned int listed[][2] = {{32, 8}, {64, 4}, {16, 16}, {32, 4}, {16, 8}, {128, 2}};
+		// TZ x 1: the compact layout (work-groups of TZ work-items over the rows of threads_z work-items, see
+		// main_thread()), offered only where the Mur z faces' line and shift line stay in one sub-group in every row
+		static const unsigned int all[][2] = {{32, 8}, {64, 4}, {16, 16}, {32, 4}, {16, 8}, {128, 2}, {128, 1}, {256, 1}};
 		const double tie = 1.005;
-		const unsigned int n_cand = sizeof(listed)/sizeof(listed[0]);
-		auto name = [&](unsigned int k) {return std::to_string(listed[k][0]) + "x" + std::to_string(listed[k][1]);};
+		bool compact_ok = (threads_z*(unsigned long long)(E.ny-B.ny)*threads_z < 0x100000000ULL);
+		auto tzof = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((mur_planes[k].ny==2) && !SYCL_SameSubGroupZCompact(tzof(mur_planes[k].line), tzof(mur_planes[k].shift), threads_z, E.ny-B.ny, mur_zf_sg))
+				compact_ok = false;
+		std::vector<std::pair<unsigned int, unsigned int> > listed;
+		for (size_t k=0; k<sizeof(all)/sizeof(all[0]); ++k)
+			if (compact_ok || (all[k][1]>1))
+				listed.push_back(std::make_pair(all[k][0], all[k][1]));
+		const unsigned int n_cand = listed.size();
+		auto name = [&](unsigned int k)
+		{
+			return (listed[k].second==1) ? "c" + std::to_string(listed[k].first) : std::to_string(listed[k].first) + "x" + std::to_string(listed[k].second);
+		};
 		const unsigned int pairs = 20, rounds = 2;
 		const unsigned int nt = E.nz - B.nz, nj = E.ny - B.ny, nk = E.nx - B.nx;
 		float* v = (nt && nj && nk) ? TryAlloc<float>(3*numCellsD) : NULL;
@@ -1795,7 +1857,10 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 			const bool factor = coeff_mode>=3;
 			auto run = [&](unsigned int k, unsigned int n)
 			{
-				const SYCL_Dim3 block = {listed[k][0], listed[k][1], 1};
+				const SYCL_Dim3 block = {listed[k].first, listed[k].second, 1};
+				const bool compact = listed[k].second==1;
+				Z.compact = compact ? nt : 0;
+				Z.compact_m = compact ? SYCL_CompactM(nt) : 0;
 				if (index32 && factor)
 					shape_pairs<unsigned int, true>(this, v, i, B, E, Z, block, n);
 				else if (index32)
@@ -1825,15 +1890,17 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 			unsigned int b = 0;
 			while (best[b]>tie*best[fastest])
 				++b;
-			shape_mode = 1;
-			shape_tz = listed[b][0];
-			shape_ty = listed[b][1];
+			shape_mode = (listed[b].second==1) ? 3 : 1;
+			shape_tz = listed[b].first;
+			shape_ty = listed[b].second;
 			reason << "timed:";
 			for (unsigned int k=0; k<n_cand; ++k)
 				reason << " " << name(k) << " " << std::fixed << std::setprecision(1) << best[k] << " us";
 			reason << " per voltage and current update, best " << name(b);
 			if (b!=fastest)
 				reason << " (" << name(fastest) << " within 0.5 %: the first listed wins)";
+			if (!compact_ok)
+				reason << " (compact layouts refused: a Mur z face's line and shift line in different sub-groups)";
 		}
 		else
 		{
@@ -1843,9 +1910,11 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 		Free(v);
 		Free(i);
 	}
+	MainRange(B, E, threads_z);   // the compact layout's row length
 	const SYCL_Dim3 block = MainBlock(threads_z, E.ny-B.ny);
 	if (verbose)
-		std::cout << "GPU_Backend_SYCL: shape: " << block.x << "x" << block.y << " (" << reason.str() << ")" << std::endl;
+		std::cout << "GPU_Backend_SYCL: shape: " << (MainCompact() ? "c" : "") << block.x
+		          << (MainCompact() ? std::string() : "x" + std::to_string(block.y)) << " (" << reason.str() << ")" << std::endl;
 }
 
 void GPU_Backend_SYCL::Impl::FreeSnapshots()
@@ -2519,8 +2588,16 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		const std::string shape = env;
 		unsigned int tz = 0, ty = 0;
 		char x = 0;
+		unsigned int cn = 0;
 		if (shape=="0")
 			d->shape_mode = 0;
+		else if ((shape.size()>1) && (shape[0]=='c') && (sscanf(env+1, "%u", &cn)==1) && cn && (cn%16==0) && (cn<=1024))
+		{
+			d->shape_mode = 3;
+			d->shape_forced = true;
+			d->shape_tz = cn;
+			d->shape_ty = 1;
+		}
 		else if ((shape!="auto") && (sscanf(env, "%u%c%u", &tz, &x, &ty)==3) && (x=='x') && tz && ty && (tz*ty<=1024))
 		{
 			d->shape_mode = 1;
@@ -2529,7 +2606,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 			d->shape_ty = ty;
 		}
 		else if (shape!="auto")
-			std::cerr << "GPU_Backend_SYCL: OPENEMS_SYCL_SHAPE=" << shape << " is not auto, 0 or TZxTY, using auto" << std::endl;
+			std::cerr << "GPU_Backend_SYCL: OPENEMS_SYCL_SHAPE=" << shape << " is not auto, 0, cN or TZxTY, using auto" << std::endl;
 	}
 	d->window = SYCL_ParseWindowKnob(getenv("OPENEMS_SYCL_WINDOW"), d->dim.nx);
 	d->l2_bytes = d->ctx->device.get_info<sycl::info::device::global_mem_cache_size>();
