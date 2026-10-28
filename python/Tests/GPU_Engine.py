@@ -32,6 +32,11 @@
      the device (DEVICE_DFT_BACKENDS)
    device backend, cases coeff_index32 and coeff_full: the update coefficients as sets with
      a 32 bit index, and as full arrays (FULL_DEVICE_BACKENDS)
+   HIP and SYCL backends, case windowed (Mur ABC, a conducting sheet, a lumped RLC element and a
+     lumped port): the windowed blocks (OPENEMS_HIP_WINDOW / OPENEMS_SYCL_WINDOW=auto) and forced
+     small windows (=4,5) are bit-identical to the single step (=0); the UPML update messages
+     above are checked only where the windowed blocks do not run (they run the separate
+     kernels, not the fused step)
    reference backend: all probe data and field dumps bit-identical
    device backend: max. deviation < 1e-4 of the peak value, per probe file and per field dump
      (skipped without a GPU device)
@@ -455,6 +460,33 @@ def case_multigrid_snapshot():
     return FDTD, CSX
 
 
+def case_windowed():
+    """ Mur ABC on all faces, a conducting sheet, a lumped RLC element and a lumped port, all in the
+        interior: every extension can run in the windowed blocks of the HIP and SYCL backends """
+    FDTD = openEMS(NrTS=600, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['MUR'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('x', np.arange(-15, 15.5, 1))
+    mesh.AddLine('y', np.arange(-12, 12.5, 1))
+    mesh.AddLine('z', np.arange(-8, 10.5, 1))
+    LumpedPort(CSX, 1, 50, [-6, 0, 0], [-6, 0, 2], 'z', excite=1)
+    rlc = CSX.AddLumpedElement('rlc', ny='z', caps=False, R=10, L=1e-9, C=1e-12, LEtype=1)
+    rlc.AddBox([6, 0, 0], [6, 0, 2], priority=10)
+    wire = CSX.AddMetal('wire')
+    wire.AddCurve([[-6, 6], [0, 0], [0, 0]])
+    wire.AddCurve([[-6, 6], [0, 0], [2, 2]])
+    sheet = CSX.AddConductingSheet('sheet', conductivity=5.8e7, thickness=1e-6)
+    sheet.AddBox([-8, -8, 5], [8, 8, 5], priority=10)
+    CSX.AddProbe('et', p_type=2).AddPoint([0, 5, 1])
+    CSX.AddProbe('ht', p_type=3).AddPoint([3, -4, 1])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-15, -12, 1], [15, 12, 1])
+    return FDTD, CSX
+
+
 def case_steady_state():
     FDTD = openEMS(NrTS=100000, EndCriteria=1e-6)
     CSX = ContinuousStructure()
@@ -614,7 +646,8 @@ cases = [('excitation',     case_excitation,     True),
          ('coeff_index32',  case_coeff_index32,  True),
          ('coeff_full',     case_coeff_full,     True),
          ('dumps_snapshot_host_dft', case_dumps_snapshot, True),
-         ('sar',            case_sar,            True)]
+         ('sar',            case_sar,            True),
+         ('windowed',       case_windowed,       True)]
 
 # environment of a case: the frequency domain dumps of dumps_snapshot without device sums,
 # summed on the host from the snapshots; the pml case with each of the three UPML updates of
@@ -623,7 +656,30 @@ CASE_ENV = {'dumps_snapshot_host_dft': {'OPENEMS_GPU_DUMPS': 'snapshot'},
             'pml_upml_regions': {'OPENEMS_HIP_FUSED_STEP': '0'},
             'pml_upml_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
             'pml_index32': {'OPENEMS_HIP_INDEX': '32'},
-            'pml_full_separate': {'OPENEMS_HIP_UPML_FUSION': '0'}}
+            'pml_full_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
+            'windowed': {'OPENEMS_HIP_WINDOW': 'auto', 'OPENEMS_SYCL_WINDOW': 'auto'}}
+# the windowed blocks of the HIP and SYCL backends: the case runs again with these values of
+# OPENEMS_<backend>_WINDOW, each compared bit-exactly with the first (0, the single step); the case's
+# own run (auto) as well
+WINDOW_BACKENDS = ('HIP', 'SYCL')
+WINDOW_RUNS = {'windowed': ('0', '4,5')}
+WINDOW_ON = re.compile(r'GPU_Backend_(HIP|SYCL): window: (T=|tuning)')
+
+
+def run_with_env(env, case, Sim_Path, engine):
+    """ run_captured() with the variables of env set, the environment restored afterwards """
+    saved = {var: os.environ.get(var) for var in env}
+    os.environ.update(env)
+    try:
+        return run_captured(case, Sim_Path, engine)
+    finally:
+        for var, value in saved.items():
+            if value is None:
+                del os.environ[var]
+            else:
+                os.environ[var] = value
+
+
 # the messages of the HIP backend for these UPML updates: (expected, not expected)
 UPML_MODES = {'pml': ('UPML regions in the kernel', None),
               'pml_index32': ('fused voltage and current updates, 32 bit indices', None),
@@ -641,12 +697,7 @@ engines = ('basic', 'gpu-reference', 'gpu')
 for name, case, on_device in cases:
     print(f'Testing case: {name}')
     paths = {engine: os.path.join(tempfile.gettempdir(), f'GPU_Engine_{name}_{engine}') for engine in engines}
-    os.environ.update(CASE_ENV.get(name, {}))
-    try:
-        logs = {engine: run_captured(case, paths[engine], engine) for engine in engines}
-    finally:
-        for var in CASE_ENV.get(name, {}):
-            del os.environ[var]
+    logs = {engine: run_with_env(CASE_ENV.get(name, {}), case, paths[engine], engine) for engine in engines}
 
     assert 'Create FDTD engine (GPU' not in logs['basic'], \
         f'FAIL [{name}]: engine=basic created the GPU engine'
@@ -685,7 +736,7 @@ for name, case, on_device in cases:
         if name=='coeff_full' and backend in FULL_DEVICE_BACKENDS:
             assert 'compressed update coefficients' not in logs['gpu'], \
                 f'FAIL [{name}]: the {backend} backend did not use the full coefficient arrays'
-        if name in UPML_MODES and backend=='HIP':
+        if name in UPML_MODES and backend=='HIP' and not WINDOW_ON.search(logs['gpu']):
             expected, unexpected = UPML_MODES[name]
             assert (expected is None or expected in logs['gpu']) and (unexpected is None or unexpected not in logs['gpu']), \
                 f'FAIL [{name}]: the HIP backend did not take the intended UPML update'
@@ -695,6 +746,26 @@ for name, case, on_device in cases:
             ', '.join(f'{n} ({d:.1e})' for n, d in diff)
         if name in UPML_MODES and backend=='HIP':
             assert worst==0, f'FAIL [{name}]: the HIP UPML update is not bit-identical ({worst:.1e})'
+        if name in WINDOW_RUNS and backend in WINDOW_BACKENDS:
+            knob_var = f'OPENEMS_{backend}_WINDOW'
+            assert WINDOW_ON.search(logs['gpu']) and 'window: refused' not in logs['gpu'], \
+                f'FAIL [{name}]: the {backend} backend did not run the windowed blocks'
+            ref = None
+            for knob in WINDOW_RUNS[name]:
+                path = paths['gpu'] + '_window_' + knob.replace(',', '_')
+                log = run_with_env(dict(CASE_ENV.get(name, {}), **{knob_var: knob}), case, path, 'gpu')
+                if knob=='0':
+                    assert f'GPU_Backend_{backend}: window: off' in log, f'FAIL [{name}]: {knob_var}=0 did not keep the single step'
+                    ref = path
+                    _, _, _, worst = compare_outputs(ref, paths['gpu'])
+                    assert worst==0, f'FAIL [{name}]: the windowed blocks (auto) are not bit-identical to the single step ({worst:.1e})'
+                    print(f'  {backend} backend: windowed blocks (auto) bit-identical to the single step')
+                else:
+                    T, W = knob.split(',')
+                    assert f'GPU_Backend_{backend}: window: T={T} W={W} ' in log, f'FAIL [{name}]: {knob_var}={knob} did not run'
+                    _, _, _, worst = compare_outputs(ref, path)
+                    assert worst==0, f'FAIL [{name}]: the windowed blocks ({knob}) are not bit-identical to the single step ({worst:.1e})'
+                    print(f'  {backend} backend: windowed blocks ({knob}) bit-identical to the single step')
     else:
         # no silent fallback to the (slow) reference backend
         assert 'Running FDTD engine' not in logs['gpu'], \

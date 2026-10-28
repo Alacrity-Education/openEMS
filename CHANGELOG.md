@@ -65,6 +65,18 @@ there are unreleased changes. It becomes the next release entry.
   from it (a PCB model of 3.06 Mcells with four copper layers: 88 us per
   sheet kernel and step either way, 3095 MC/s); the windowed blocks below
   launch the sheets on the cells of a window only.
+- The SYCL backend can run the time stepping as windowed blocks inside the L2
+  cache (`OPENEMS_SYCL_WINDOW=rule` or `T,W`; off by default until the tuner
+  below): blocks of T timesteps marched along x in windows of W planes, each
+  kind of block recorded once as a SYCL command graph and replayed. The main
+  updates and every extension's launch are restricted to the planes a
+  half-step newly covers, and the voltage and current frontiers step back
+  one plane per timestep, so every cell is updated once per step from the
+  values the single step would give it: the results are bit-identical. TF/SF,
+  Debye materials, absorbing sheets, cylindrical coordinates, multi-grids and
+  Mur planes outside the voltage update keep the single step. On an Arc B580
+  a PCB model of 3.06 Mcells runs at 5757 MC/s with the rule's schedule
+  (T = 8, W = 39) instead of 3095.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

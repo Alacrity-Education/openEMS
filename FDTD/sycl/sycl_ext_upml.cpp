@@ -36,9 +36,9 @@
 	const unsigned int y = t / R.lz;
 
 // before the main update: store the scaled old field in the flux, hand the old flux to the engine
-static inline void upml_pre(const sycl::nd_item<3>& it, float* field, UPMLFusedArgs A, unsigned int set_offset, SYCL_GridDim N, UPMLRegion R)
+static inline void upml_pre_node(float* field, const UPMLFusedArgs& A, unsigned int set_offset, const SYCL_GridDim& N, const UPMLRegion& R,
+                                 unsigned int x, unsigned int y, unsigned int z)
 {
-	UPML_THREAD
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, (size_t)R.lx*R.ly*R.lz, set_offset);
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -51,9 +51,9 @@ static inline void upml_pre(const sycl::nd_item<3>& it, float* field, UPMLFusedA
 }
 
 // after the main update: keep the updated flux, combine it with the stored field
-static inline void upml_post(const sycl::nd_item<3>& it, float* field, UPMLFusedArgs A, unsigned int set_offset, SYCL_GridDim N, UPMLRegion R)
+static inline void upml_post_node(float* field, const UPMLFusedArgs& A, unsigned int set_offset, const SYCL_GridDim& N, const UPMLRegion& R,
+                                  unsigned int x, unsigned int y, unsigned int z)
 {
-	UPML_THREAD
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, (size_t)R.lx*R.ly*R.lz, set_offset);
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -64,6 +64,30 @@ static inline void upml_post(const sycl::nd_item<3>& it, float* field, UPMLFused
 		field[g] = f_help + U.fn[n*U.s]*A.flux[l];
 	}
 }
+
+static inline void upml_pre(const sycl::nd_item<3>& it, float* field, UPMLFusedArgs A, unsigned int set_offset, SYCL_GridDim N, UPMLRegion R)
+{
+	UPML_THREAD
+	upml_pre_node(field, A, set_offset, N, R, x, y, z);
+}
+
+static inline void upml_post(const sycl::nd_item<3>& it, float* field, UPMLFusedArgs A, unsigned int set_offset, SYCL_GridDim N, UPMLRegion R)
+{
+	UPML_THREAD
+	upml_post_node(field, A, set_offset, N, R, x, y, z);
+}
+
+// Windowed blocks (OPENEMS_SYCL_WINDOW): the nodes of the region inside the window, local x in [W.x, W.x + W.lx) and
+// local y in [W.y, W.y + W.ly), all z; the statements of the kernels of the region, in place
+struct UPMLWindow { unsigned int x, y, lx, ly; };
+
+#define UPML_WINDOW_THREAD \
+	const unsigned int t = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
+	if (t>=R.lz*W.ly || it.get_group(0)>=W.lx) \
+		return; \
+	const unsigned int x = W.x + (unsigned int)it.get_group(0); \
+	const unsigned int z = t % R.lz; \
+	const unsigned int y = W.y + t / R.lz;
 
 // the fused kernels of a whole region, in place or from one buffer of the fused step into the other
 // (FACTOR: coefficient modes 3/4, see main_coeff())
@@ -128,7 +152,7 @@ static inline void upml_group_curr(const sycl::nd_item<3>& it, float* curr_out, 
 	upml_fused_curr_node<FACTOR>(curr_out, curr_in, volt, A, N, R, x, y, z);
 }
 
-class SYCL_Ext_UPML : public GPU_Extension
+class SYCL_Ext_UPML : public GPU_Extension, public SYCL_WindowHooks
 {
 public:
 	SYCL_Ext_UPML(GPU_Backend_SYCL::Impl* impl, Operator_Ext_UPML* op_ext, Engine* eng);
@@ -178,6 +202,86 @@ public:
 			FuseCurr(d->curr);
 		else if (!Fused())
 			Post(d->curr, CurrArgs(), 9);
+	}
+
+	// Windowed blocks (the fused step is never used there): the hooks above restricted to the region's nodes inside the window
+	virtual bool WindowCapable() const {return true;}
+	virtual void WindowPrepare() {Fused();}
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+	{
+		(void)step_in_block;
+		UPMLWindow W;
+		W.x = std::max(x0, m_Region.sx) - m_Region.sx;
+		W.y = std::max(y0, m_Region.sy) - m_Region.sy;
+		const unsigned int ex = std::min(x1, m_Region.sx + m_Region.lx), ey = std::min(y1, m_Region.sy + m_Region.ly);
+		if ((ex<=m_Region.sx + W.x) || (ey<=m_Region.sy + W.y))
+			return;
+		W.lx = ex - m_Region.sx - W.x;
+		W.ly = ey - m_Region.sy - W.y;
+		const unsigned int threads = m_Region.lz*W.ly;
+		const SYCL_GridDim N = d->dim;
+		const UPMLRegion R = m_Region;
+		const bool factor = d->coeff_mode>=3;
+		float* volt = d->volt;
+		float* curr = d->curr;
+		if (Fused())
+		{
+			if (m_InMain)
+				return;   // the main kernels update it
+			if (phase==GPU_WindowPostVoltage)
+			{
+				const UPMLFusedArgs A = VoltArgs();
+				if (factor)
+					SYCL_Launch(d, "upml_fused_volt_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+					{
+						UPML_WINDOW_THREAD
+						upml_fused_volt_node<true>(volt, volt, curr, A, N, R, x, y, z);
+					});
+				else
+					SYCL_Launch(d, "upml_fused_volt_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+					{
+						UPML_WINDOW_THREAD
+						upml_fused_volt_node<false>(volt, volt, curr, A, N, R, x, y, z);
+					});
+			}
+			else if (phase==GPU_WindowPostCurrent)
+			{
+				const UPMLFusedArgs A = CurrArgs();
+				if (factor)
+					SYCL_Launch(d, "upml_fused_curr_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+					{
+						UPML_WINDOW_THREAD
+						upml_fused_curr_node<true>(curr, curr, volt, A, N, R, x, y, z);
+					});
+				else
+					SYCL_Launch(d, "upml_fused_curr_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+					{
+						UPML_WINDOW_THREAD
+						upml_fused_curr_node<false>(curr, curr, volt, A, N, R, x, y, z);
+					});
+			}
+			return;
+		}
+		const bool pre = (phase==GPU_WindowPreVoltage) || (phase==GPU_WindowPreCurrent);
+		const bool post = (phase==GPU_WindowPostVoltage) || (phase==GPU_WindowPostCurrent);
+		if (!pre && !post)
+			return;
+		const bool currents = (phase==GPU_WindowPreCurrent) || (phase==GPU_WindowPostCurrent);
+		float* field = currents ? curr : volt;
+		const UPMLFusedArgs A = currents ? CurrArgs() : VoltArgs();
+		const unsigned int set_offset = currents ? 9 : 0;
+		if (pre)
+			SYCL_Launch(d, "upml_pre_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+			{
+				UPML_WINDOW_THREAD
+				upml_pre_node(field, A, set_offset, N, R, x, y, z);
+			});
+		else
+			SYCL_Launch(d, "upml_post_window", threads, 1, W.lx, [=](sycl::nd_item<3> it)
+			{
+				UPML_WINDOW_THREAD
+				upml_post_node(field, A, set_offset, N, R, x, y, z);
+			});
 	}
 
 protected:

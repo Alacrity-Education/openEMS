@@ -22,6 +22,13 @@
  * bit-identical to each other. Speeds are from an Arc B580: "small PCB" is a PCB model of 3.06 Mcells (337 x 227
  * x 40, Mur on six faces, four copper sheet planes).
  *
+ * OPENEMS_SYCL_WINDOW = 0 (default) | auto | rule | T,W
+ *     The timesteps as blocks of T steps marched along x in windows of W x planes that stay in the L2 cache, each
+ *     kind of block recorded once as a SYCL command graph and replayed; the voltage and current frontiers step back
+ *     one plane per step, so the halo is T+1 planes. rule (and auto): T = 8, W = 0.65 L2 / plane bytes - (T+1);
+ *     where that leaves fewer than T planes a window, T = 4, then 2 (on the 18 MiB L2 of the B580 the halo of T = 8
+ *     takes most of it). T,W: forced (W may be NX). 0: one timestep at a time. Grids with TF/SF, Debye, absorbing
+ *     sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single step.
  * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
  *     Development: the sub-group size of the voltage kernel that updates the Mur z faces inside the main update
  *     (Mur mode 2, the line and shift line of a z line exchange their values by sub-group shifts). small PCB:
@@ -974,7 +981,7 @@ static void launch_update_voltages_inner(GPU_Backend_SYCL::Impl* d, unsigned int
 }
 
 template<typename I, bool FACTOR>
-static void launch_mur_shell(GPU_Backend_SYCL::Impl* d, const SYCL_MurShell& S)
+static void launch_mur_shell(GPU_Backend_SYCL::Impl* d, const SYCL_MurShell& S, size_t count, unsigned int active)
 {
 	const bool c = d->coeff_mode>0;
 	float* volt = d->volt;
@@ -986,15 +993,17 @@ static void launch_mur_shell(GPU_Backend_SYCL::Impl* d, const SYCL_MurShell& S)
 	const SYCL_GridDim N = d->dim;
 	const SYCL_MurShell Sk = S;
 	const SYCL_MurFace* F = d->mur_dev;
-	const unsigned int active = d->mur.active;
-	SYCL_Launch(d, "mur_shell", d->mur_shell_count, 1, 1, [=](sycl::nd_item<3> it)
+	SYCL_Launch(d, "mur_shell", count, 1, 1, [=](sycl::nd_item<3> it)
 	{
 		mur_shell<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, Sk, F, active);
 	});
 }
 
+// The voltage update of Mur modes 1 and 2 on the main nodes [B, E) with the Mur planes of \a active, and the shell
+// nodes inside [x0,x1) x [y0,y1) (the whole grid for the single step, a window for the windowed blocks)
 template<typename I, bool FACTOR>
-static void launch_mur_volt(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
+static void launch_mur_volt(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E,
+                            unsigned int active, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
 {
 	// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component); mode 2: the interior
 	// of the z faces in the first kernel (see mur_zface_lanes), the box spans all z lines, so mur_shell has no
@@ -1005,7 +1014,7 @@ static void launch_mur_volt(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, c
 	{
 		S.L.nz = d->main_start.nz;
 		S.H.nz = d->main_stop.nz;
-		M.active = (d->mur.active>>4) & 3u;
+		M.active = (active>>4) & 3u;
 		if (d->mur_zf_sg==16)
 			launch_update_voltages_inner<I, FACTOR, true, 16>(d, threads_z, B, E, S, M);
 		else
@@ -1013,7 +1022,16 @@ static void launch_mur_volt(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, c
 	}
 	else
 		launch_update_voltages_inner<I, FACTOR, false, 32>(d, threads_z, B, E, S, M);
-	launch_mur_shell<I, FACTOR>(d, S);
+	// the shell nodes inside the window: the box [S.B, S.E) and the inner box cut to it (the same shell, intersected)
+	SYCL_MurShell W = S;
+	W.B.nx = std::max(S.B.nx, x0); W.E.nx = std::min(S.E.nx, x1);
+	W.B.ny = std::max(S.B.ny, y0); W.E.ny = std::min(S.E.ny, y1);
+	if ((W.E.nx<=W.B.nx) || (W.E.ny<=W.B.ny))
+		return;
+	W.L.nx = std::min(std::max(S.L.nx, W.B.nx), W.E.nx); W.H.nx = std::min(std::max(S.H.nx, W.L.nx), W.E.nx);
+	W.L.ny = std::min(std::max(S.L.ny, W.B.ny), W.E.ny); W.H.ny = std::min(std::max(S.H.ny, W.L.ny), W.E.ny);
+	const size_t count = (size_t)(W.E.nx-W.B.nx)*(W.E.ny-W.B.ny)*(W.E.nz-W.B.nz) - (size_t)(W.H.nx-W.L.nx)*(W.H.ny-W.L.ny)*(W.H.nz-W.L.nz);
+	launch_mur_shell<I, FACTOR>(d, W, count, active);
 }
 
 template<typename I, bool FACTOR>
@@ -1175,6 +1193,17 @@ GPU_Backend_SYCL::Impl::Impl()
 	mur_zf_on = false;
 	memset(&mur_zf, 0, sizeof(mur_zf));
 	mur_zf_sg = 32;
+	window = SYCL_ParseWindowKnob(NULL, 0);
+	window_used = false;
+	step_base = NULL;
+	window_ready = -1;
+	win_T = win_W = 0;
+	l2_bytes = 0;
+	coeff_table_bytes = 0;
+	launches = 0;
+	window_graphs_on = false;
+	window_logged = false;
+	window_steps = window_blocks = window_chunks = window_block_launches = 0;
 }
 
 GPU_Backend_SYCL::Impl::~Impl()
@@ -2221,6 +2250,8 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		          << " compute units, L2 cache " << dev.get_info<sycl::info::device::global_mem_cache_size>()/(1024*1024)
 		          << " MiB, sub-group size " << d->ctx->sub_group_size << std::endl;
 	}
+	d->window = SYCL_ParseWindowKnob(getenv("OPENEMS_SYCL_WINDOW"), d->dim.nx);
+	d->l2_bytes = d->ctx->device.get_info<sycl::info::device::global_mem_cache_size>();
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
@@ -2254,6 +2285,8 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	if (d->window.on)
+		d->step_base = d->Alloc<int>(1);
 
 	const char* index_bits = d->index32 ? ", 32 bit indices" : ", 64 bit indices";
 
@@ -2286,6 +2319,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 				d->coeff_mode = 2 + F.index.mode;
 				d->index = d->AllocIndex(F.index);
 				d->coeff = d->Alloc<float>(F.buffer.size(), F.buffer.data());
+				d->coeff_table_bytes = F.buffer.size()*sizeof(float);
 				if (g_settings.GetVerboseLevel()>1)
 				{
 					const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
@@ -2311,6 +2345,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		d->coeff_table_bytes = sets.table.size()*sizeof(float);
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_SYCL: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << index_bits << std::endl;
@@ -2333,6 +2368,48 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		std::cout << CoefficientStatistics(d->numCells, 0, 0, 0) << std::endl;
 	}
 	return true;
+}
+
+// The separate main voltage update of the nodes [B, E) (all of them for the single step, those of a window for the
+// windowed blocks), with the Mur planes of \a active in it (Mur modes 1 and 2), the index type and coefficient form of
+// the grid
+static void MainVoltages(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E,
+                         unsigned int active, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	const bool factor = d->coeff_mode>=3;
+	if ((d->mur_mode==1) && active)
+	{
+		if (d->index32 && factor)
+			launch_mur_volt<unsigned int, true>(d, threads_z, B, E, active, x0, x1, y0, y1);
+		else if (d->index32)
+			launch_mur_volt<unsigned int, false>(d, threads_z, B, E, active, x0, x1, y0, y1);
+		else if (factor)
+			launch_mur_volt<size_t, true>(d, threads_z, B, E, active, x0, x1, y0, y1);
+		else
+			launch_mur_volt<size_t, false>(d, threads_z, B, E, active, x0, x1, y0, y1);
+		return;
+	}
+	if (d->index32 && factor)
+		launch_update_voltages<unsigned int, true>(d, threads_z, B, E);
+	else if (d->index32)
+		launch_update_voltages<unsigned int, false>(d, threads_z, B, E);
+	else if (factor)
+		launch_update_voltages<size_t, true>(d, threads_z, B, E);
+	else
+		launch_update_voltages<size_t, false>(d, threads_z, B, E);
+}
+
+static void MainCurrents(GPU_Backend_SYCL::Impl* d, unsigned int threads_z, const SYCL_GridDim& B, const SYCL_GridDim& E)
+{
+	const bool factor = d->coeff_mode>=3;
+	if (d->index32 && factor)
+		launch_update_currents<unsigned int, true>(d, threads_z, B, E);
+	else if (d->index32)
+		launch_update_currents<unsigned int, false>(d, threads_z, B, E);
+	else if (factor)
+		launch_update_currents<size_t, true>(d, threads_z, B, E);
+	else
+		launch_update_currents<size_t, false>(d, threads_z, B, E);
 }
 
 void GPU_Backend_SYCL::UpdateVoltages()
@@ -2388,27 +2465,7 @@ void GPU_Backend_SYCL::UpdateVoltages()
 	SYCL_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	const bool factor = d->coeff_mode>=3;
-	if ((d->mur_mode==1) && d->mur.active)
-	{
-		if (d->index32 && factor)
-			launch_mur_volt<unsigned int, true>(d, threads_z, B, E);
-		else if (d->index32)
-			launch_mur_volt<unsigned int, false>(d, threads_z, B, E);
-		else if (factor)
-			launch_mur_volt<size_t, true>(d, threads_z, B, E);
-		else
-			launch_mur_volt<size_t, false>(d, threads_z, B, E);
-		return;
-	}
-	if (d->index32 && factor)
-		launch_update_voltages<unsigned int, true>(d, threads_z, B, E);
-	else if (d->index32)
-		launch_update_voltages<unsigned int, false>(d, threads_z, B, E);
-	else if (factor)
-		launch_update_voltages<size_t, true>(d, threads_z, B, E);
-	else
-		launch_update_voltages<size_t, false>(d, threads_z, B, E);
+	MainVoltages(d, threads_z, B, E, d->mur.active, 0, d->dim.nx, 0, d->dim.ny);
 }
 
 void GPU_Backend_SYCL::UpdateCurrents()
@@ -2446,15 +2503,476 @@ void GPU_Backend_SYCL::UpdateCurrents()
 	SYCL_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	const bool factor = d->coeff_mode>=3;
-	if (d->index32 && factor)
-		launch_update_currents<unsigned int, true>(d, threads_z, B, E);
-	else if (d->index32)
-		launch_update_currents<unsigned int, false>(d, threads_z, B, E);
-	else if (factor)
-		launch_update_currents<size_t, true>(d, threads_z, B, E);
+	MainCurrents(d, threads_z, B, E);
+}
+
+/************************** windowed blocks (OPENEMS_SYCL_WINDOW) **************************/
+
+// OPENEMS_SYCL_WINDOW when it is not set
+static const char* const SYCL_WINDOW_DEFAULT = "0";
+
+GPU_Backend_SYCL::Impl::WindowKnob SYCL_ParseWindowKnob(const char* text, unsigned int nx)
+{
+	GPU_Backend_SYCL::Impl::WindowKnob k;
+	k.on = k.valid = k.automatic = k.tune = false;
+	k.T = k.W = 0;
+	k.text = text ? text : SYCL_WINDOW_DEFAULT;
+	if (k.text.empty() || (k.text=="0"))
+		return k;
+	k.on = true;
+	if ((k.text=="auto") || (k.text=="rule"))
+	{
+		k.valid = k.automatic = true;
+		k.tune = (k.text=="auto");
+		k.T = 8;
+		return k;
+	}
+	// T,W
+	const std::string::size_type comma = k.text.find(',');
+	if (comma==std::string::npos)
+		return k;
+	const std::string t = k.text.substr(0, comma), w = k.text.substr(comma+1);
+	auto number = [](const std::string& v, unsigned int& out)
+	{
+		if (v.empty() || (v.size()>9) || (v.find_first_not_of("0123456789")!=std::string::npos))
+			return false;
+		out = (unsigned int)atoi(v.c_str());
+		return true;
+	};
+	if (!number(t, k.T))
+		return k;
+	if (w=="NX")
+		k.W = nx;
+	else if (!number(w, k.W))
+		return k;
+	k.valid = (k.T>0) && (k.T<=256) && (k.W>0);
+	return k;
+}
+
+unsigned int SYCL_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
+                             double margin, unsigned int halo)
+{
+	if ((plane_bytes==0) || (nx==0))
+		return std::max(nx, 1u);
+	double budget = margin*(double)l2_bytes;
+	if ((double)table_bytes<budget/3)
+		budget -= (double)table_bytes;
+	const double w = std::floor(budget/(double)plane_bytes) - (halo ? (double)halo : (T + 1.0));
+	const unsigned int W = (w<1) ? 1u : (unsigned int)std::min(w, (double)nx);
+	return std::max(1u, std::min(W, nx));
+}
+
+unsigned int SYCL_WindowRuleTW(size_t l2_bytes, size_t plane_bytes, unsigned int& T, unsigned int nx, size_t table_bytes)
+{
+	// fewer than T planes a window: the next smaller T has a shorter halo and leaves more of the budget to the window
+	while (true)
+	{
+		const unsigned int W = SYCL_WindowRule(l2_bytes, plane_bytes, T, nx, table_bytes);
+		if ((W>=T) || (W>=nx) || (T<=2))
+			return W;
+		T = (T>8) ? 8 : (T>4) ? 4 : 2;
+	}
+}
+
+unsigned int GPU_Backend_SYCL::Impl::MurActive(unsigned int ts) const
+{
+	unsigned int active = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (ts>=mur_planes[k].start_ts)
+			active |= 1u<<(2*mur_planes[k].ny + (mur_planes[k].line>0 ? 1 : 0));
+	return active;
+}
+
+unsigned int GPU_Backend_SYCL::Impl::MurNextChange(unsigned int ts) const
+{
+	unsigned int next = UINT_MAX;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].start_ts>ts)
+			next = std::min(next, mur_planes[k].start_ts);
+	return next;
+}
+
+void GPU_Backend_SYCL::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int mur_active)
+{
+	// the launches of UpdateVoltages() on the main range cut to the window; with the Mur planes in the update,
+	// update_voltages_inner skips the nodes outside the box [S.L, S.H) as before and mur_shell covers the shell
+	// nodes inside the window
+	SYCL_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	MainVoltages(this, threads_z, B, E, (mur_mode==1) ? mur_active : 0, x0, x1, y0, y1);
+}
+
+void GPU_Backend_SYCL::Impl::WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	SYCL_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	MainCurrents(this, threads_z, B, E);
+}
+
+bool GPU_Backend_SYCL::Impl::WindowPrepare()
+{
+	if (window_ready>=0)
+		return window_ready>0;
+	window_ready = 0;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// the decisions the single step makes in the hooks and the first voltage update, before anything is recorded
+	for (size_t k=0; k<window_exts.size(); ++k)
+		if (SYCL_WindowHooks* h = dynamic_cast<SYCL_WindowHooks*>(window_exts[k]))
+			h->WindowPrepare();
+	DecideMurFused();
+	if (!mur_planes.empty() && (mur_mode!=1))
+	{
+		// the three launches per plane of mode 0 work on whole planes: not in the windows
+		if (verbose)
+			std::cout << "GPU_Backend_SYCL: window: refused: the Mur planes are not in the voltage update (Mur fused: 0)" << std::endl;
+		window_used = false;
+		return false;
+	}
+	// plane bytes: the fields and the coefficient index (or the full coefficient arrays) of one x plane
+	const size_t plane_bytes = (size_t)dim.ny*dim.nz*(24 + CoeffBytesPerNode());
+	if (window.automatic)
+	{
+		win_T = window.T;
+		win_W = SYCL_WindowRuleTW(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+		win_source = "rule";
+	}
 	else
-		launch_update_currents<size_t, false>(d, threads_z, B, E);
+	{
+		win_T = window.T;
+		win_W = std::min(window.W, dim.nx);
+		win_source = "forced";
+	}
+	// a V frontier must not fall between the line and the shift line of a Mur plane on an x face (the work-item of
+	// the shift line writes the line, mur_volt_component): snapped down below both (see WindowFrontiers())
+	win_forbidden.clear();
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].ny==0)
+			for (unsigned int e=std::min(mur_planes[k].line, mur_planes[k].shift)+1; e<=std::max(mur_planes[k].line, mur_planes[k].shift); ++e)
+				win_forbidden.push_back(e);
+	// the blocks are recorded as SYCL command graphs (sycl_ext_oneapi_graph) where the device has them; not with
+	// the kernel times, which wait after every launch
+	window_graphs_on = !SYCL_KernelTimes::Enabled()
+	                   && (ctx->device.has(sycl::aspect::ext_oneapi_graph) || ctx->device.has(sycl::aspect::ext_oneapi_limited_graph));
+	if (verbose && !window_graphs_on && !SYCL_KernelTimes::Enabled())
+		std::cout << "GPU_Backend_SYCL: window: the device has no SYCL command graphs, plain launches" << std::endl;
+	window_ready = 1;
+	return true;
+}
+
+void GPU_Backend_SYCL::Impl::WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const
+{
+	// Frontiers along x of a window: after its launches of step b the voltages of the planes below eV[b] and the
+	// currents of the planes below eI[b] are at step b of the block. The voltage update of plane x reads the currents
+	// of x-1 and x, the current update of x the voltages of x and x+1 (none on the last plane): so eI[b] = eV[b] - 1
+	// (all planes once eV[b] = nx), and eV[b+1] = eI[b] (the voltages of b+1 need the currents of b of x-1 and x; the
+	// currents of b that read a voltage are done before it changes). The window's front F (eV[0]) steps back one plane
+	// per timestep; a frontier that would split a Mur pair (win_forbidden) is snapped down, which keeps both rules.
+	const long long nx = dim.nx;
+	auto snap = [&](long long e)
+	{
+		e = std::max(0LL, std::min(e, nx));
+		while ((e>0) && (std::find(win_forbidden.begin(), win_forbidden.end(), (unsigned int)e)!=win_forbidden.end()))
+			--e;
+		return (unsigned int)e;
+	};
+	eV.assign(L, 0);
+	eI.assign(L, 0);
+	for (unsigned int b=0; b<L; ++b)
+	{
+		const long long cand = (b==0) ? (long long)F : std::min((long long)F - b, (long long)eI[b-1]);
+		eV[b] = snap(cand);
+		eI[b] = (eV[b]>=nx) ? (unsigned int)nx : (eV[b]>0 ? eV[b]-1 : 0);
+	}
+}
+
+void GPU_Backend_SYCL::Impl::WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host)
+{
+	// The windows march along x: window k covers the planes up to (k+1)*W at step 0 of the block, the last one all.
+	// Per window and step, the voltage half-step on the planes its V frontier newly covers, then the current half-step on
+	// those of its I frontier; each half-step in the hook order of Engine_GPU::VoltageHalfStep()/CurrentHalfStep() (pre
+	// in reverse, the update, post, apply), every hook restricted to the half-step's planes. A cell sees the operations
+	// of the single step in the same order; only the order across cells changes (see WindowFrontiers()).
+	const std::vector<GPU_Extension*>& X = window_exts;
+	const int count = (int)X.size();
+	const unsigned int nx = dim.nx, ny = dim.ny;
+	const unsigned int mur_active = (mur_mode==1) ? MurActive(ts) : 0;
+	SYCL_WindowHooks* host_hooks = host ? dynamic_cast<SYCL_WindowHooks*>(host) : NULL;
+	std::vector<unsigned int> pV(L, 0), pI(L, 0), eV, eI;
+	for (unsigned int k=0; ; ++k)
+	{
+		const unsigned long long Fk = (unsigned long long)(k+1)*W;
+		const bool last = Fk>=nx;
+		WindowFrontiers(last ? nx + L : (unsigned int)Fk, L, eV, eI);
+		for (unsigned int b=0; b<L; ++b)
+		{
+			if (eV[b]>pV[b])
+			{
+				const unsigned int x0 = pV[b], x1 = eV[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreVoltage, b, x0, x1, 0, ny);
+				WindowVoltages(x0, x1, 0, ny, mur_active);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostVoltage, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+				{
+					X[n]->LaunchInWindow(GPU_WindowApplyVoltage, b, x0, x1, 0, ny);
+					if (host_hooks && (X[n]==host))
+						host_hooks->HostStep(ts + b);
+				}
+			}
+			if (eI[b]>pI[b])
+			{
+				const unsigned int x0 = pI[b], x1 = eI[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreCurrent, b, x0, x1, 0, ny);
+				WindowCurrents(x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostCurrent, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowApplyCurrent, b, x0, x1, 0, ny);
+			}
+		}
+		pV = eV;
+		pI = eI;
+		if (last)
+			break;
+	}
+}
+
+void GPU_Backend_SYCL::Impl::WindowDropGraphs(unsigned int keep_W)
+{
+	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); )
+		if (it->first[1]!=keep_W)
+			window_graphs.erase(it++);
+		else
+			++it;
+}
+
+void GPU_Backend_SYCL::Impl::WindowRun(unsigned int start_ts, unsigned int n)
+{
+	if (n==0)
+		return;
+	namespace sx = sycl::ext::oneapi::experimental;
+	const std::vector<GPU_Extension*>& X = window_exts;
+	std::vector<SYCL_WindowHooks*> hooks(X.size(), NULL);
+	for (size_t k=0; k<X.size(); ++k)
+		hooks[k] = dynamic_cast<SYCL_WindowHooks*>(X[k]);
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// record a block of L timesteps from ts into a graph (its launches are recorded, not run); false if that fails
+	auto record = [&](unsigned int ts, unsigned int L, WindowGraph& g)
+	{
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		const unsigned long long l0 = launches;
+		std::string what;
+		try
+		{
+			sx::command_graph<sx::graph_state::modifiable> graph(Queue().get_context(), Queue().get_device());
+			graph.begin_recording(Queue());
+			try
+			{
+				WindowBlock(ts, L, win_W, NULL);
+			}
+			catch (const std::exception& e)
+			{
+				what = e.what();
+			}
+			graph.end_recording(Queue());
+			if (what.empty())
+				g.exec = std::make_shared<SYCL_ExecGraph>(graph.finalize());
+		}
+		catch (const std::exception& e)
+		{
+			if (what.empty())
+				what = e.what();
+		}
+		if (!what.empty())
+		{
+			std::cout << "GPU_Backend_SYCL: window: graph recording failed (" << what << "), the same launches without graphs" << std::endl;
+			window_graphs_on = false;
+			return false;
+		}
+		g.launches = launches - l0;
+		g.capture_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if (verbose && window_logged)
+		{
+			std::ostringstream line;
+			line << "GPU_Backend_SYCL: window: graph " << window_graphs.size()+1 << " for blocks of " << L << " steps (" << g.launches
+			     << " launches, recorded in " << std::fixed << std::setprecision(1) << g.capture_ms << " ms)";
+			std::cout << line.str() << std::endl;
+		}
+		return true;
+	};
+	unsigned int ts = start_ts;
+	const unsigned int end = start_ts + n;
+	while (ts<end)
+	{
+		// the next timestep an extension needs the host in (run alone, over the whole grid)
+		unsigned int host_ts = UINT_MAX;
+		GPU_Extension* host = NULL;
+		for (size_t k=0; k<X.size(); ++k)
+			if (hooks[k])
+			{
+				const unsigned int h = hooks[k]->NextHostStep(ts);
+				if (h<host_ts)
+				{
+					host_ts = h;
+					host = X[k];
+				}
+			}
+		// the timestep of the block, read by the window launches of the extensions (outside a graph, whose
+		// arguments are frozen)
+		int* base = step_base;
+		const int step = (int)ts;
+		SYCL_Check("set_step", [&] {Queue().single_task([=]() {*base = step;}); ++launches;});
+		unsigned int L = 1;
+		if (host_ts==ts)
+			WindowBlock(ts, 1, dim.nx, host);
+		else
+		{
+			L = std::min(win_T, end - ts);
+			if (host_ts!=UINT_MAX)
+				L = std::min(L, host_ts - ts);
+			if (mur_mode==1)
+			{
+				const unsigned int change = MurNextChange(ts);
+				if (change!=UINT_MAX)
+					L = std::min(L, change - ts);   // the active Mur planes are an argument of the launches
+			}
+			bool done = false;
+			if (window_graphs_on)
+			{
+				std::vector<unsigned int> key(3);
+				key[0] = L;
+				key[1] = win_W;
+				key[2] = (mur_mode==1) ? MurActive(ts) : 0;
+				std::map<std::vector<unsigned int>, WindowGraph>::iterator it = window_graphs.find(key);
+				if ((it==window_graphs.end()) && (window_graphs.size()<32))
+				{
+					WindowGraph g;
+					if (record(ts, L, g))
+						it = window_graphs.insert(std::make_pair(key, g)).first;
+				}
+				if (it!=window_graphs.end())
+				{
+					SYCL_Check("graph replay", [&] {Queue().ext_oneapi_graph(*it->second.exec);});
+					done = true;
+				}
+			}
+			if (!done)
+			{
+				const unsigned long long l0 = launches;
+				WindowBlock(ts, L, win_W, NULL);
+				if (L==win_T)
+					window_block_launches = launches - l0;
+			}
+		}
+		for (size_t k=0; k<X.size(); ++k)
+			X[k]->EndOfBlock(ts + L - 1);
+		ts += L;
+		++window_blocks;
+	}
+	window_steps += n;
+}
+
+bool GPU_Backend_SYCL::SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal)
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	d->window_used = false;
+	d->window_exts.clear();
+	if (!d->window.on)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_SYCL: window: off" << std::endl;
+		return false;
+	}
+	if (!refusal.empty())
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_SYCL: window: refused: " << refusal << std::endl;
+		return false;
+	}
+	if (!d->window.valid || (d->step_base==NULL))
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_SYCL: window: invalid value " << d->window.text << " (0, auto, rule or T,W), single-step" << std::endl;
+		return false;
+	}
+	for (size_t n=0; n<exts.size(); ++n)
+		if (!exts[n]->WindowCapable())
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_SYCL: window: refused: an extension is not window-capable" << std::endl;
+			return false;
+		}
+	// the windowed blocks run the separate kernels; whether the single step would fuse (see DecideFusedStep())
+	const char* fused_env = getenv("OPENEMS_SYCL_FUSED_STEP");
+	const bool fused_on = fused_env && (atoi(fused_env)==1);
+	const bool fused = (d->fused_step>0) || ((d->fused_step<0) && (d->fused_blockers==0) && !(fused_env && (atoi(fused_env)==0))
+	                                         && (fused_on || (d->upml.empty() && (d->fused_optin==0))));
+	d->window_exts = exts;
+	d->window_used = true;
+	if (d->fused_step<0)
+		d->fused_step = 0;
+	if (verbose && fused)
+		std::cout << "GPU_Backend_SYCL: window: separate updates, the fused step is not used on the windowed path" << std::endl;
+	return true;
+}
+
+bool GPU_Backend_SYCL::IterateWindowed(unsigned int start_ts, unsigned int n)
+{
+	if (!d->window_used)
+		return false;
+	if (d->fused_step>0)
+		return false;   // decided before the windowed blocks: the fields are in its double buffers
+	if (!d->WindowPrepare())
+		return false;
+	++d->window_chunks;
+	d->WindowRun(start_ts, n);
+	if (!d->window_logged && (g_settings.GetVerboseLevel()>1))
+	{
+		// after the first chunk: the launches of a block of T steps (with its set_step), the graphs so far
+		d->window_logged = true;
+		// the launches per step of the longest block (a graph's, or the last block of T steps without one)
+		unsigned long long per_block = d->window_block_launches;
+		unsigned int per_len = d->win_T;
+		double capture_ms = 0;
+		for (std::map<std::vector<unsigned int>, Impl::WindowGraph>::const_iterator it=d->window_graphs.begin(); it!=d->window_graphs.end(); ++it)
+		{
+			if ((per_block==0) || (it->first[0]>per_len) || ((it->first[0]==per_len) && (it->second.launches>0)))
+			{
+				per_block = it->second.launches;
+				per_len = it->first[0];
+			}
+			capture_ms += it->second.capture_ms;
+		}
+		const unsigned int nx = d->dim.nx;
+		std::ostringstream line;
+		line << "GPU_Backend_SYCL: window: T=" << d->win_T << " W=" << d->win_W << " planes=" << nx
+		     << " halo=" << d->win_T+1 << " windows=" << (nx + d->win_W - 1)/d->win_W << " launches/step=";
+		if (per_block)
+			line << std::fixed << std::setprecision(1) << (per_block + 1.0)/per_len;
+		else
+			line << "?";
+		line << " graphs=" << d->window_graphs.size();
+		if (!d->window_graphs.empty())
+			line << " (recorded in " << std::fixed << std::setprecision(1) << capture_ms << " ms)";
+		else if (SYCL_KernelTimes::Enabled())
+			line << " (kernel times: plain launches)";
+		line << " (" << d->win_source << ", " << d->dim.ny*(size_t)d->dim.nz*(24 + d->CoeffBytesPerNode())
+		     << " bytes per plane, coefficient table " << d->coeff_table_bytes << " bytes, L2 " << d->l2_bytes/(1024*1024) << " MiB, " << d->window_exts.size() << " window-capable extensions)";
+		std::cout << line.str() << std::endl;
+	}
+	return true;
 }
 
 static void CheckSize(size_t host_count, size_t device_count)

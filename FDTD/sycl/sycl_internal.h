@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -241,7 +243,11 @@ struct SYCL_MurPlane
 	unsigned int line, shift;
 	const float *c_nyP, *c_nyPP;
 	size_t seq;   //!< position of its extension in the extension order (see GPU_Backend_SYCL::Impl::ext_log)
+	unsigned int start_ts;   //!< the first timestep the plane is active in (see GPU_Backend_SYCL::Impl::MurActive())
 };
+
+//! An executable SYCL command graph (sycl_ext_oneapi_graph), see GPU_Backend_SYCL::Impl::window_graphs
+typedef sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable> SYCL_ExecGraph;
 
 #include "sycl_upml.h"
 
@@ -375,6 +381,65 @@ struct GPU_Backend_SYCL::Impl
 	std::string MurRefusal() const;
 	//! Why the z faces of mode 2 cannot run in update_voltages_inner, empty if they can (call after MurRefusal())
 	std::string MurZFaceRefusal();
+	//! The faces (bits as SYCL_MurFaces::active) of the Mur planes active at timestep \a ts (their start timesteps)
+	unsigned int MurActive(unsigned int ts) const;
+	//! The first timestep after \a ts at which the active Mur planes change, UINT_MAX if never
+	unsigned int MurNextChange(unsigned int ts) const;
+
+	//! OPENEMS_SYCL_WINDOW (read in Init(), see SYCL_ParseWindowKnob()): windowed blocks of T timesteps and windows of W x planes
+	struct WindowKnob
+	{
+		bool on;              //!< set and not 0
+		bool valid;           //!< auto, rule, or T,W with T, W > 0
+		bool automatic;       //!< auto or rule: T = 8 and W from the L2 rule (see SYCL_WindowRule())
+		bool tune;            //!< auto: the tuner times candidates on the first timesteps (not yet: the rule); rule: not
+		unsigned int T, W;    //!< forced; W: the grid's nx for "NX"
+		std::string text;     //!< the value as set
+	};
+	WindowKnob window;
+	//! the windowed blocks run (see GPU_Backend_SYCL::SetWindowExtensions()), with these extensions in the engine's order
+	bool window_used;
+	std::vector<GPU_Extension*> window_exts;
+	//! the timestep of the windowed block that runs (one int, device memory): the base the window-capable
+	//! extensions read their step from (see GPU_Extension::LaunchInWindow()); allocated in Init()
+	int* step_base;
+	//! WindowPrepare() ran: 1 the schedule runs, 0 refused at the first block, -1 not yet
+	int window_ready;
+	//! the schedule: blocks of at most win_T timesteps, windows of win_W x planes
+	unsigned int win_T, win_W;
+	//! V frontiers that would split the line and the shift line of a Mur plane on an x face (see WindowFrontiers())
+	std::vector<unsigned int> win_forbidden;
+	size_t l2_bytes;                //!< L2 cache of the device (Init())
+	size_t coeff_table_bytes;       //!< the coefficient table shared by all nodes (sets or factorized), 0 with full arrays
+	//! bytes per node of the main update coefficients the kernels read besides the table: the set index, or the
+	//! four full arrays (see coeff_mode); for the window rule
+	size_t CoeffBytesPerNode() const {return (coeff_mode==0) ? 48 : (((coeff_mode==2) || (coeff_mode==4)) ? 4 : 2);}
+	unsigned long long launches;    //!< kernel launches issued by SYCL_Launch() (recorded ones included)
+	//! graphs: one per (block length, W, active Mur planes), recorded at the first block of its kind and replayed
+	struct WindowGraph { std::shared_ptr<SYCL_ExecGraph> exec; unsigned long long launches; double capture_ms; };
+	std::map<std::vector<unsigned int>, WindowGraph> window_graphs;
+	bool window_graphs_on;          //!< not with OPENEMS_SYCL_KERNEL_TIMES, without graph support, or after a failed recording
+	bool window_logged;             //!< the schedule's line is printed (after the first chunk)
+	unsigned long long window_steps, window_blocks, window_chunks;
+	unsigned long long window_block_launches;   //!< the launches of the last block of T steps launched without a graph
+	//! where win_T, win_W come from, for the schedule's line: forced, rule, tuned, untuned
+	std::string win_source;
+	//! The main voltage / current update of the nodes [x0,x1) x [y0,y1) (all z) for the windowed blocks:
+	//! the separate kernels of UpdateVoltages()/UpdateCurrents() on the main range cut to the window, the Mur
+	//! planes of \a mur_active in the voltage update as UpdateVoltages() has them (mode 1 and 2)
+	void WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int mur_active);
+	void WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
+	//! The decisions of the first timestep (UPML, Mur), the schedule's T and W; false: refused
+	bool WindowPrepare();
+	//! The frontiers of the window whose V frontier of step 0 is \a F, for a block of \a L timesteps
+	void WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const;
+	//! The launches of a block of \a L timesteps from timestep \a ts with windows of \a W planes (the step base is
+	//! written before); \a host: the extension whose HostStep() runs after its apply-voltage launch (L = 1, W = nx)
+	void WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host);
+	//! n timesteps from \a start_ts as blocks (graphs when possible)
+	void WindowRun(unsigned int start_ts, unsigned int n);
+	//! Destroy the graphs of every W but \a keep_W (UINT_MAX: all)
+	void WindowDropGraphs(unsigned int keep_W);
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer
@@ -525,6 +590,7 @@ void SYCL_Launch(GPU_Backend_SYCL::Impl* d, const char* name, size_t ni, size_t 
 	try
 	{
 		d->Queue().parallel_for(sycl::nd_range<3>(global, local), kernel);
+		++d->launches;
 	}
 	catch (const sycl::exception& e)
 	{
@@ -536,6 +602,34 @@ void SYCL_Launch(GPU_Backend_SYCL::Impl* d, const char* name, size_t ni, size_t 
 		SYCL_KernelTimes::Add(name, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count());
 	}
 }
+
+//! Parse OPENEMS_SYCL_WINDOW (\a text, NULL if unset: off): 0 off; auto (the rule; the tuner is not there yet); rule (the rule
+//! alone); T,W with T, W > 0 (W may be the string NX: the grid's nx). Anything else is on but not valid (the backend
+//! then steps one timestep at a time)
+GPU_Backend_SYCL::Impl::WindowKnob SYCL_ParseWindowKnob(const char* text, unsigned int nx);
+//! The window rule: W = (margin * L2 - table) / plane_bytes - halo, at least 1, at most nx; the coefficient table (read
+//! by every window) counts when it is below a third of that budget, a larger one cannot stay in L2 anyway. halo 0
+//! means the schedule's halo of T + 1 planes (the frontiers step back one plane per timestep)
+unsigned int SYCL_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
+                             double margin = 0.65, unsigned int halo = 0);
+//! The rule of auto and rule: SYCL_WindowRule() at 0.65 of the L2 for \a T (8); where that leaves fewer than T planes a
+//! window, T steps down to 4, then to 2 (on a small L2 the halo of T = 8 alone takes most of the budget). Returns W and
+//! leaves the T it settled on in \a T
+unsigned int SYCL_WindowRuleTW(size_t l2_bytes, size_t plane_bytes, unsigned int& T, unsigned int nx, size_t table_bytes);
+
+//! What the windowed schedule needs of a window-capable SYCL extension besides GPU_Extension::LaunchInWindow()
+class SYCL_WindowHooks
+{
+public:
+	virtual ~SYCL_WindowHooks() {}
+	//! The decisions the extension makes in its first hook, before the first block (nothing may wait in a recording)
+	virtual void WindowPrepare() {}
+	//! The first timestep >= \a ts at which HostStep() must run, UINT_MAX if none: the schedule runs that timestep alone,
+	//! over the whole grid, and calls HostStep() right after this extension's apply-voltage launch (where the single
+	//! step does its host work)
+	virtual unsigned int NextHostStep(unsigned int ts) const {(void)ts; return UINT_MAX;}
+	virtual void HostStep(unsigned int ts) {(void)ts;}
+};
 
 //! Factory of a SYCL extension: the device implementation of \a eng_ext, or NULL if \a eng_ext is not of its type
 typedef GPU_Extension* (*SYCL_ExtensionFactory)(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng);

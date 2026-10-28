@@ -75,6 +75,9 @@ public:
 
 	virtual GPU_Extension* CreateExtension(Engine_Extension* eng_ext, Engine* eng);
 
+	virtual bool SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal);
+	virtual bool IterateWindowed(unsigned int start_ts, unsigned int n);
+
 	struct Impl;
 	Impl* GetImpl() const {return d;}
 

@@ -56,15 +56,13 @@ struct ADEGroup
 	const size_t* pos;     //!< flat NIJK index of direction 0, in memory order
 	unsigned int orders;
 	unsigned int dirs;     //!< union of the directions of the orders
+	unsigned int x_min, x_max;   //!< the x lines of the positions (windowed blocks)
 	ADEOrder o[ADE_MAX_ORDERS];
 };
 
-// ADE update before the main update, reads the field
-static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, const ADEGroup& G)
+// ADE update before the main update, reads the field (position i of the group)
+static inline void lorentz_pre_pos(const float* field, const ADEGroup& G, size_t i)
 {
-	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
-	if (i>=G.count)
-		return;
 	const size_t p = G.pos[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -93,12 +91,9 @@ static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, c
 	}
 }
 
-// subtract the ADE currents of the orders from the field
-static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, const ADEGroup& G)
+// subtract the ADE currents of the orders from the field (position i of the group)
+static inline void dispersive_apply_pos(float* field, const ADEGroup& G, size_t i)
 {
-	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
-	if (i>=G.count)
-		return;
 	const size_t p = G.pos[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
@@ -112,6 +107,44 @@ static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, co
 				f = f - G.o[q].ade[n*G.count + i];
 		field[g] = f;
 	}
+}
+
+static inline void lorentz_pre(const sycl::nd_item<3>& it, const float* field, const ADEGroup& G)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (i<G.count)
+		lorentz_pre_pos(field, G, i);
+}
+
+static inline void dispersive_apply(const sycl::nd_item<3>& it, float* field, const ADEGroup& G)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (i<G.count)
+		dispersive_apply_pos(field, G, i);
+}
+
+// Windowed blocks (OPENEMS_SYCL_WINDOW): the positions inside [x0,x1) x [y0,y1), from their flat index
+struct ADEWindow { unsigned int x0, x1, y0, y1; SYCL_GridDim N; };
+
+inline bool ade_in_window(const ADEWindow& W, size_t p)
+{
+	const size_t line = p / W.N.nz;   // x*ny + y
+	const unsigned int x = (unsigned int)(line / W.N.ny), y = (unsigned int)(line % W.N.ny);
+	return (x>=W.x0) && (x<W.x1) && (y>=W.y0) && (y<W.y1);
+}
+
+static inline void lorentz_pre_window(const sycl::nd_item<3>& it, const float* field, const ADEGroup& G, const ADEWindow& W)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if ((i<G.count) && ade_in_window(W, G.pos[i]))
+		lorentz_pre_pos(field, G, i);
+}
+
+static inline void dispersive_apply_window(const sycl::nd_item<3>& it, float* field, const ADEGroup& G, const ADEWindow& W)
+{
+	const size_t i = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if ((i<G.count) && ade_in_window(W, G.pos[i]))
+		dispersive_apply_pos(field, G, i);
 }
 
 // Conducting sheets on z planes as dense per-plane state.
@@ -145,11 +178,8 @@ struct SheetArgs
 	SYCL_GridDim N;
 };
 
-// one work-item per cell c of the dense blocks; m its mask, g its field index of component 0
-#define SHEET_THREAD \
-	const size_t c = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2); \
-	if (c>=A.cells) \
-		return; \
+// cell c of the dense blocks: m its mask, g its field index of component 0
+#define SHEET_CELL \
 	const unsigned int m = A.mask[c]; \
 	if (m==0) \
 		return; \
@@ -157,9 +187,9 @@ struct SheetArgs
 	const size_t g = nijk(A.N, 0, A.x0 + (unsigned int)(xy / A.ny), A.y0 + (unsigned int)(xy % A.ny), A.plane_z[c % A.planes]);
 
 // ADE update of both orders before the main update, reads the field (see lorentz_pre)
-static inline void sheet_pre(const sycl::nd_item<3>& it, const float* field, const SheetArgs& A)
+static inline void sheet_pre_cell(const float* field, const SheetArgs& A, size_t c)
 {
-	SHEET_THREAD
+	SHEET_CELL
 	for (unsigned int n=0; n<2; ++n)
 	{
 		if ((m & ((1u|(1u<<2))<<n))==0)
@@ -177,9 +207,9 @@ static inline void sheet_pre(const sycl::nd_item<3>& it, const float* field, con
 }
 
 // subtract the ADE currents of order 0, then of order 1, from the field (see dispersive_apply)
-static inline void sheet_apply(const sycl::nd_item<3>& it, float* field, const SheetArgs& A)
+static inline void sheet_apply_cell(float* field, const SheetArgs& A, size_t c)
 {
-	SHEET_THREAD
+	SHEET_CELL
 	for (unsigned int n=0; n<2; ++n)
 	{
 		if ((m & ((1u|(1u<<2))<<n))==0)
@@ -190,6 +220,33 @@ static inline void sheet_apply(const sycl::nd_item<3>& it, float* field, const S
 				v = v - A.ade[(2*o+n)*A.cells + c];
 		field[n*A.sn + g] = v;
 	}
+}
+
+// one work-item per cell c of the dense blocks
+static inline void sheet_pre(const sycl::nd_item<3>& it, const float* field, const SheetArgs& A)
+{
+	const size_t c = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (c<A.cells)
+		sheet_pre_cell(field, A, c);
+}
+
+static inline void sheet_apply(const sycl::nd_item<3>& it, float* field, const SheetArgs& A)
+{
+	const size_t c = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (c<A.cells)
+		sheet_apply_cell(field, A, c);
+}
+
+// Windowed blocks (OPENEMS_SYCL_WINDOW): the cells [c0, c0 + count) (the x lines of the window, adjacent in this
+// order), those whose y is outside [y0, y1) skipped
+inline bool sheet_window_cell(const sycl::nd_item<3>& it, const SheetArgs& A, size_t c0, size_t count, unsigned int y0, unsigned int y1, size_t& c)
+{
+	const size_t t = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if (t>=count)
+		return false;
+	c = c0 + t;
+	const unsigned int y = A.y0 + (unsigned int)((c / A.planes) % A.ny);
+	return (y>=y0) && (y<y1);
 }
 
 //! Whether a component with these coefficients of a non-Lorentz order is inert: its correction
@@ -240,7 +297,73 @@ public:
 	virtual void DoPreCurrentUpdates() {for (size_t g=0; g<m_Curr.size(); ++g) Pre(m_Curr[g], d->curr);}
 	virtual void Apply2Current()       {for (size_t g=0; g<m_Curr.size(); ++g) Apply(m_Curr[g], d->curr);}
 
+	// Windowed blocks: the hooks above on the cells inside the window (each cell's state and field value only)
+	virtual bool WindowCapable() const {return true;}
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+	{
+		(void)step_in_block;
+		if ((phase==GPU_WindowPreVoltage) || (phase==GPU_WindowApplyVoltage))
+		{
+			const bool pre = phase==GPU_WindowPreVoltage;
+			if (m_Sheet.cells)
+			{
+				// the x lines of the box inside the window
+				const unsigned int bx1 = m_Sheet.x0 + (unsigned int)(m_Sheet.cells/((size_t)m_Sheet.ny*m_Sheet.planes));
+				const unsigned int a = std::max(x0, m_Sheet.x0), b = std::min(x1, bx1);
+				if (a<b)
+				{
+					const size_t line = (size_t)m_Sheet.ny*m_Sheet.planes;
+					const size_t c0 = (a - m_Sheet.x0)*line, count = (b - a)*line;
+					const SheetArgs A = m_Sheet;
+					float* f = d->volt;
+					if (pre)
+						SYCL_Launch(d, "sheet_pre_window", count, 1, 1, [=](sycl::nd_item<3> it)
+						{
+							size_t c;
+							if (sheet_window_cell(it, A, c0, count, y0, y1, c))
+								sheet_pre_cell(f, A, c);
+						});
+					else
+						SYCL_Launch(d, "sheet_apply_window", count, 1, 1, [=](sycl::nd_item<3> it)
+						{
+							size_t c;
+							if (sheet_window_cell(it, A, c0, count, y0, y1, c))
+								sheet_apply_cell(f, A, c);
+						});
+				}
+			}
+			for (size_t g=0; g<m_Volt.size(); ++g)
+				WindowGroup(m_Volt[g], pre, d->volt, x0, x1, y0, y1);
+		}
+		else if (phase==GPU_WindowPreCurrent)
+			for (size_t g=0; g<m_Curr.size(); ++g)
+				WindowGroup(m_Curr[g], true, d->curr, x0, x1, y0, y1);
+		else if (phase==GPU_WindowApplyCurrent)
+			for (size_t g=0; g<m_Curr.size(); ++g)
+				WindowGroup(m_Curr[g], false, d->curr, x0, x1, y0, y1);
+	}
+
 protected:
+	//! Pre (\a pre) or Apply of group \a group on the positions inside the window
+	void WindowGroup(const ADEGroup& group, bool pre, float* field, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+	{
+		if ((group.dirs==0) || (x1<=group.x_min) || (x0>group.x_max))
+			return;
+		const ADEWindow W = {x0, x1, y0, y1, d->dim};
+		const ADEGroup G = group;
+		float* f = field;
+		if (pre)
+			SYCL_Launch(d, "lorentz_pre_window", G.count, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				lorentz_pre_window(it, f, G, W);
+			});
+		else
+			SYCL_Launch(d, "dispersive_apply_window", G.count, 1, 1, [=](sycl::nd_item<3> it)
+			{
+				dispersive_apply_window(it, f, G, W);
+			});
+	}
+
 	void Setup(std::vector<ADEGroup>& groups, std::vector<std::vector<size_t>>& group_pos, size_t count, unsigned int** pos,
 	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
 	float* Coefficients(size_t count, FDTD_FLOAT** c);
@@ -368,6 +491,13 @@ void SYCL_Ext_LorentzMaterial::Setup(std::vector<ADEGroup>& groups, std::vector<
 	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_SYCL::Impl::MurRefusal()
 	G.orders = 1;
 	G.dirs = ord.dirs;
+	G.x_min = UINT_MAX;
+	G.x_max = 0;
+	for (size_t i=0; i<count; ++i)
+	{
+		G.x_min = std::min(G.x_min, pos[0][i]);
+		G.x_max = std::max(G.x_max, pos[0][i]);
+	}
 	G.o[0] = ord;
 	groups.push_back(G);
 	group_pos.push_back(flat);

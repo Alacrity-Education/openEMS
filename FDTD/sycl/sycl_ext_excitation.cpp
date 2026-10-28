@@ -16,6 +16,8 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
+#include <climits>
 #include <set>
 
 #include "sycl_internal.h"
@@ -57,6 +59,39 @@ static inline void excitation_apply_serial(const sycl::nd_item<3>& it, float* fi
 		excite(field, index, amp, delay, signal, P, n);
 }
 
+// Windowed blocks (see GPU_Extension::LaunchInWindow()): the step is *step_base + step_in_block, the period
+// (P.period < 0: none) and the points outside the window [x0,x1) x [y0,y1) skipped; excite() as above
+struct ExcitationWindow { const int* step_base; unsigned int step_in_block; unsigned int x0, x1, y0, y1; const unsigned int* x; const unsigned int* y; };
+
+inline bool excitation_in_window(const ExcitationWindow& Win, ExcitationParam& P, unsigned int n)
+{
+	P.numTS = *Win.step_base + (int)Win.step_in_block;
+	if (P.period<0)
+		P.period = P.numTS+1;
+	return (Win.x[n]>=Win.x0) && (Win.x[n]<Win.x1) && (Win.y[n]>=Win.y0) && (Win.y[n]<Win.y1);
+}
+
+static inline void excitation_apply_window(const sycl::nd_item<3>& it, float* field, const size_t* index, const float* amp,
+                                           const unsigned int* delay, const float* signal, ExcitationParam P, const ExcitationWindow& Win)
+{
+	const unsigned int n = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+	if ((n<P.count) && excitation_in_window(Win, P, n))
+		excite(field, index, amp, delay, signal, P, n);
+}
+
+static inline void excitation_apply_serial_window(const sycl::nd_item<3>& it, float* field, const size_t* index, const float* amp,
+                                                  const unsigned int* delay, const float* signal, ExcitationParam P, const ExcitationWindow& Win)
+{
+	if (it.get_group(2)*it.get_local_range(2) + it.get_local_id(2) != 0)
+		return;
+	for (unsigned int n=0; n<P.count; ++n)
+	{
+		ExcitationParam Q = P;
+		if (excitation_in_window(Win, Q, n))
+			excite(field, index, amp, delay, signal, Q, n);
+	}
+}
+
 class SYCL_Ext_Excitation : public GPU_Extension
 {
 public:
@@ -64,6 +99,9 @@ public:
 
 	virtual void Apply2Voltages() {Apply(m_Volt, d->volt);}
 	virtual void Apply2Current() {Apply(m_Curr, d->curr);}
+
+	virtual bool WindowCapable() const {return true;}
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
 
 protected:
 	struct Sources
@@ -74,11 +112,17 @@ protected:
 		float* amp;
 		unsigned int* delay;
 		float* signal;
+		unsigned int* x;        //!< x and y line of the points, for the windows (OPENEMS_SYCL_WINDOW only)
+		unsigned int* y;
+		unsigned int x_min, x_max;   //!< the x lines of the points: windows outside skip the launch
 	};
 
 	void Setup(Sources& s, unsigned int count, unsigned int* const index[3], const unsigned short* dir,
 	           const FDTD_FLOAT* amp, const unsigned int* delay, const FDTD_FLOAT* signal);
 	void Apply(Sources& s, float* field);
+	//! the parameters of Apply() but the timestep, which the kernels read
+	ExcitationParam Param(const Sources& s) const;
+	void ApplyInWindow(Sources& s, float* field, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1);
 
 	GPU_Backend_SYCL::Impl* d;
 	Operator_Ext_Excitation* m_Op_Exc;
@@ -110,8 +154,16 @@ void SYCL_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* co
 {
 	s.count = count;
 	s.serial = false;
+	s.x = s.y = NULL;
+	s.x_min = UINT_MAX;
+	s.x_max = 0;
 	if (count==0)
 		return;
+	for (unsigned int n=0; n<count; ++n)
+	{
+		s.x_min = std::min(s.x_min, index[0][n]);
+		s.x_max = std::max(s.x_max, index[0][n]);
+	}
 
 	std::vector<size_t> flat(count);
 	std::set<size_t> edges;
@@ -125,6 +177,11 @@ void SYCL_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* co
 	s.amp = d->Alloc<float>(count, amp);
 	s.delay = d->Alloc<unsigned int>(count, delay);
 	s.signal = d->Alloc<float>(m_Op_Exc->m_Exc->GetLength(), signal);
+	if (d->window.on)
+	{
+		s.x = d->Alloc<unsigned int>(count, index[0]);
+		s.y = d->Alloc<unsigned int>(count, index[1]);
+	}
 }
 
 void SYCL_Ext_Excitation::Apply(Sources& s, float* field)
@@ -155,6 +212,49 @@ void SYCL_Ext_Excitation::Apply(Sources& s, float* field)
 		{
 			excitation_apply(it, f, index, amp, delay, signal, param);
 		});
+}
+
+ExcitationParam SYCL_Ext_Excitation::Param(const Sources& s) const
+{
+	ExcitationParam param;
+	param.numTS = 0;
+	param.period = -1;   // none: the step + 1, as Apply() has it
+	if (m_Op_Exc->m_Exc->GetSignalPeriod()>0)
+		param.period = int(m_Op_Exc->m_Exc->GetSignalPeriod()/m_Op_Exc->m_Exc->GetTimestep());
+	param.length = m_Op_Exc->m_Exc->GetLength();
+	param.count = s.count;
+	return param;
+}
+
+void SYCL_Ext_Excitation::ApplyInWindow(Sources& s, float* field, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	if ((s.count==0) || (x1<=s.x_min) || (x0>s.x_max))
+		return;
+	const ExcitationParam param = Param(s);
+	const ExcitationWindow win = {(const int*)d->step_base, step_in_block, x0, x1, y0, y1, (const unsigned int*)s.x, (const unsigned int*)s.y};
+	float* f = field;
+	const size_t* index = s.index;
+	const float* amp = s.amp;
+	const unsigned int* delay = s.delay;
+	const float* signal = s.signal;
+	if (s.serial)
+		SYCL_Launch(d, "excitation_apply_serial_window", 1, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			excitation_apply_serial_window(it, f, index, amp, delay, signal, param, win);
+		});
+	else
+		SYCL_Launch(d, "excitation_apply_window", s.count, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			excitation_apply_window(it, f, index, amp, delay, signal, param, win);
+		});
+}
+
+void SYCL_Ext_Excitation::LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	if (phase==GPU_WindowApplyVoltage)
+		ApplyInWindow(m_Volt, d->volt, step_in_block, x0, x1, y0, y1);
+	else if (phase==GPU_WindowApplyCurrent)
+		ApplyInWindow(m_Curr, d->curr, step_in_block, x0, x1, y0, y1);
 }
 
 GPU_Extension* SYCL_CreateExt_Excitation(GPU_Backend_SYCL::Impl* d, Engine_Extension* eng_ext, Engine* eng)

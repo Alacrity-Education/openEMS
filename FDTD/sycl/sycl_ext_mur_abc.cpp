@@ -128,6 +128,11 @@ public:
 		});
 	}
 
+	// Windowed blocks: modes 1 and 2 only (the schedule refuses mode 0, whose launches work on whole planes). The
+	// voltage launches of the schedule write the Mur planes active at their timestep (GPU_Backend_SYCL::Impl::MurActive(),
+	// from the start timestep of each plane), so there is nothing to launch here
+	virtual bool WindowCapable() const {return true;}
+
 protected:
 	//! the ABC is off until an excitation on its plane is done
 	bool IsActive() {return m_Eng->GetNumberOfTimesteps()>=m_StartTS;}
@@ -173,7 +178,7 @@ SYCL_Ext_Mur_ABC::SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mu
 
 	// for the Mur mode: CreateExtension() logs this extension at the next position of ext_log
 	m_Face = 2*m_Param.ny + (m_Param.line>0 ? 1 : 0);
-	const SYCL_MurPlane plane = {m_Param.ny, m_Param.line, m_Param.line_shift, m_Coeff_nyP, m_Coeff_nyPP, d->ext_log.size()};
+	const SYCL_MurPlane plane = {m_Param.ny, m_Param.line, m_Param.line_shift, m_Coeff_nyP, m_Coeff_nyPP, d->ext_log.size(), m_StartTS};
 	d->mur_planes.push_back(plane);
 }
 
