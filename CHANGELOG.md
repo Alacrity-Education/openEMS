@@ -87,9 +87,14 @@ there are unreleased changes. It becomes the next release entry.
   5757 with the rule. The tuner also times one window over all of x (the
   single step's work in graphs) and keeps it where it is at least 10 %
   faster than the best windowed candidate.
-- `OPENEMS_SYCL_ZPAD=M` stores the z lines of the SYCL backend's device
-  layout with a stride rounded up to a multiple of M (bit-identical); it is
-  off by default, as the padded runs were slower on the B580.
+- The SYCL backend times the work-group of its separate main kernels on the
+  live grid at the first timestep (`OPENEMS_SYCL_SHAPE=auto`, the default;
+  `0` the former 32x8, `TZxTY` forced); the results are bit-identical. On an
+  Arc B580 the PCB models take 16x16 or 16x8: a model of 28.7 Mcells runs at
+  6349 MC/s instead of 5923, one of 3.06 Mcells at 6588 instead of 5980.
+  `OPENEMS_SYCL_ZPAD=M` stores the z lines of the device layout with a stride
+  rounded up to a multiple of M (bit-identical as well); it is off by
+  default, as the padded runs were slower on the B580.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

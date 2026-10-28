@@ -596,6 +596,15 @@ struct GPU_Backend_SYCL::Impl
 
 	//! Launch geometry: one work-item per (i,j,k), i fastest (HIP order, see SYCL_Launch())
 	static SYCL_Dim3 Block(size_t ni, size_t nj);
+	//! Work-group of the main kernels (update_voltages, update_voltages_inner, update_currents), TZ x TY work-items:
+	//! OPENEMS_SYCL_SHAPE, read in Init(): shape_mode 0 Block(), 2 auto (default: timed at the first voltage update,
+	//! see DecideShape(), which sets 1 and the best shape_tz x shape_ty), 1 forced
+	int shape_mode;
+	unsigned int shape_tz, shape_ty;
+	bool shape_decided, shape_forced;
+	SYCL_Dim3 MainBlock(size_t ni, size_t nj) const {return (shape_mode==1) ? SYCL_Dim3{shape_tz, shape_ty, 1} : Block(ni, nj);}
+	//! Decide the work-group of the main kernels once (log it); auto: time the candidates on copies of the fields
+	void DecideShape();
 	static SYCL_Dim3 Grid(SYCL_Dim3 block, size_t ni, size_t nj, size_t nk);
 
 protected:
@@ -617,11 +626,11 @@ struct SYCL_KernelTimes
   blockIdx.x*blockDim.x is it.get_group(2)*it.get_local_range(2), and blockIdx.z is it.get_group(0).
   */
 template <typename Kernel>
-void SYCL_Launch(GPU_Backend_SYCL::Impl* d, const char* name, size_t ni, size_t nj, size_t nk, const Kernel& kernel)
+void SYCL_Launch(GPU_Backend_SYCL::Impl* d, const char* name, size_t ni, size_t nj, size_t nk, const Kernel& kernel, bool main=false)
 {
 	if (ni==0 || nj==0 || nk==0)
 		return;
-	const SYCL_Dim3 block = GPU_Backend_SYCL::Impl::Block(ni, nj);
+	const SYCL_Dim3 block = main ? d->MainBlock(ni, nj) : GPU_Backend_SYCL::Impl::Block(ni, nj);
 	const SYCL_Dim3 grid = GPU_Backend_SYCL::Impl::Grid(block, ni, nj, nk);
 	const sycl::range<3> local(block.z, block.y, block.x);
 	const sycl::range<3> global(grid.z*block.z, grid.y*block.y, grid.x*block.x);

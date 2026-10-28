@@ -43,6 +43,11 @@
  *     an extension without the padded layout is present (TF/SF, absorbing sheets, cylinder). Off by default: the
  *     separate kernels gain (PCB pair of updates 2439 us padded to 48, 2666 unpadded), the windowed runs lose (PCB
  *     6128 MC/s against 6349, small PCB 5511 against 6588).
+ * OPENEMS_SYCL_SHAPE = auto (default) | 0 | TZxTY
+ *     The work-group of the separate main kernels: auto times candidates (32x8, 64x4, 16x16, 32x4, 16x8, 128x2) on
+ *     copies of the fields at the first timestep; a candidate within 0.5 % of the fastest ties with it, and a tie goes
+ *     to the first listed (32x8, the former work-group); 0 the former work-group, TZxTY forced. The B580 takes 16x16
+ *     or 16x8 on both PCB models: PCB 6349 MC/s against 5923 with 32x8 (windowed), small PCB 6588 against 5980.
  * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
  *     Development: the sub-group size of the voltage kernel that updates the Mur z faces inside the main update
  *     (Mur mode 2, the line and shift line of a z line exchange their values by sub-group shifts). small PCB:
@@ -969,7 +974,7 @@ static void launch_update_voltages(GPU_Backend_SYCL::Impl* d, unsigned int threa
 	SYCL_Launch(d, "update_voltages", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
 	{
 		update_voltages<I, FACTOR>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z);
-	});
+	}, true);
 }
 
 // Mur modes 1 and 2: update_voltages_inner, then mur_shell (see mur_volt_component)
@@ -993,12 +998,12 @@ static void launch_update_voltages_inner(GPU_Backend_SYCL::Impl* d, unsigned int
 		SYCL_Launch(d, "update_voltages_inner", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG)]]
 		{
 			update_voltages_inner<I, FACTOR, true>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z, Sk, Mk);
-		});
+		}, true);
 	else
 		SYCL_Launch(d, "update_voltages_inner", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
 		{
 			update_voltages_inner<I, FACTOR, false>(it, volt, curr, index, ca, cb, mode, N, Bk, Ek, Z, Sk, Mk);
-		});
+		}, true);
 }
 
 template<typename I, bool FACTOR>
@@ -1071,7 +1076,7 @@ static void launch_update_currents(GPU_Backend_SYCL::Impl* d, unsigned int threa
 	SYCL_Launch(d, "update_currents", threads_z, E.ny-B.ny, E.nx-B.nx, [=](sycl::nd_item<3> it)
 	{
 		update_currents<I, FACTOR>(it, curr, volt, index, ca, cb, mode, N, Bk, Ek, Z);
-	});
+	}, true);
 }
 
 /***************************** helpers *****************************/
@@ -1220,6 +1225,9 @@ GPU_Backend_SYCL::Impl::Impl()
 	mur_zf_on = false;
 	memset(&mur_zf, 0, sizeof(mur_zf));
 	mur_zf_sg = 32;
+	shape_mode = 2;
+	shape_tz = shape_ty = 0;
+	shape_decided = shape_forced = false;
 	window = SYCL_ParseWindowKnob(NULL, 0);
 	window_used = false;
 	step_base = NULL;
@@ -1567,7 +1575,8 @@ std::string GPU_Backend_SYCL::Impl::MurZFaceRefusal()
 	SYCL_GridDim B, E;
 	unsigned int threads_z;
 	MainRange(B, E, threads_z);
-	const SYCL_Dim3 block = Block(threads_z, E.ny-B.ny);
+	// the work-group of the launch: DecideShape() ran before this decision
+	const SYCL_Dim3 block = MainBlock(threads_z, E.ny-B.ny);
 	// OPENEMS_SYCL_MUR_SG=16: sub-groups of 16 (development; default 32, see SYCL_Context::sub_group_size)
 	mur_zf_sg = (getenv("OPENEMS_SYCL_MUR_SG") && (atoi(getenv("OPENEMS_SYCL_MUR_SG"))==16)) ? 16 : 32;
 	bool offered = false;
@@ -1704,6 +1713,139 @@ void GPU_Backend_SYCL::Impl::MainRange(SYCL_GridDim& B, SYCL_GridDim& E, unsigne
 		zslabs.t_int = groups(zslabs.z_hi - zslabs.z_lo);
 		threads_z = zslabs.t_lo + zslabs.t_int + groups(E.nz - zslabs.z_hi);
 	}
+}
+
+// n pairs of update_voltages and update_currents with work-groups of \a block on the fields v, i (copies), for the shape
+// timing of DecideShape(): every node of [B, E) as a main node (Z without slabs)
+template<typename I, bool FACTOR>
+static void shape_pairs(GPU_Backend_SYCL::Impl* d, float* v, float* i, const SYCL_GridDim& B, const SYCL_GridDim& E,
+                        const SYCL_ZSlabs& Z, const SYCL_Dim3& block, unsigned int n)
+{
+	const bool c = d->coeff_mode>0;
+	const void* index = d->index;
+	const float* va = c ? d->coeff : d->vv;
+	const float* vb = c ? d->coeff : d->vi;
+	const float* ia = c ? d->coeff : d->ii;
+	const float* ib = c ? d->coeff : d->iv;
+	const unsigned int mode = d->coeff_mode;
+	const SYCL_GridDim N = d->dim;
+	const SYCL_GridDim Bk = B, Ek = E;
+	const SYCL_ZSlabs Zk = Z;
+	const SYCL_Dim3 grid = GPU_Backend_SYCL::Impl::Grid(block, E.nz-B.nz, E.ny-B.ny, E.nx-B.nx);
+	const sycl::nd_range<3> range(sycl::range<3>(grid.z*block.z, grid.y*block.y, grid.x*block.x), sycl::range<3>(block.z, block.y, block.x));
+	for (unsigned int p=0; p<n; ++p)
+	{
+		SYCL_Check("shape timing", [&]
+		{
+			d->Queue().parallel_for(range, [=](sycl::nd_item<3> it)
+			{
+				update_voltages<I, FACTOR>(it, v, i, index, va, vb, mode, N, Bk, Ek, Zk);
+			});
+			d->Queue().parallel_for(range, [=](sycl::nd_item<3> it)
+			{
+				update_currents<I, FACTOR>(it, i, v, index, ia, ib, mode, N, Bk, Ek, Zk);
+			});
+		});
+	}
+}
+
+void GPU_Backend_SYCL::Impl::DecideShape()
+{
+	if (shape_decided)
+		return;
+	shape_decided = true;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (fused_step>0)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_SYCL: shape: unused (fused step)" << std::endl;
+		return;
+	}
+	SYCL_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	std::ostringstream reason;
+	if (shape_mode==0)
+		reason << "default";
+	else if (shape_forced)
+		reason << "OPENEMS_SYCL_SHAPE";
+	else
+	{
+		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
+		// shape, after a warm-up, rounds of update_voltages + update_currents pairs between two waits for the queue,
+		// the best round counts. The UPML regions along z in the main kernels (SYCL_ZSlabs) update their flux in
+		// place: the timed launches take every node of the range as a main node instead (the same lines and reads,
+		// without the flux). The candidates in the order of preference (TZ x TY work-items, TZ along z): a tie within
+		// 0.5 % of the fastest goes to the first listed, the former work-group of the main kernels first.
+		static const unsigned int listed[][2] = {{32, 8}, {64, 4}, {16, 16}, {32, 4}, {16, 8}, {128, 2}};
+		const double tie = 1.005;
+		const unsigned int n_cand = sizeof(listed)/sizeof(listed[0]);
+		auto name = [&](unsigned int k) {return std::to_string(listed[k][0]) + "x" + std::to_string(listed[k][1]);};
+		const unsigned int pairs = 20, rounds = 2;
+		const unsigned int nt = E.nz - B.nz, nj = E.ny - B.ny, nk = E.nx - B.nx;
+		float* v = (nt && nj && nk) ? TryAlloc<float>(3*numCellsD) : NULL;
+		float* i = v ? TryAlloc<float>(3*numCellsD) : NULL;
+		if (i!=NULL)
+		{
+			SYCL_Check("shape timing buffers", [&] {Queue().memcpy(v, volt, 3*numCellsD*sizeof(float)); Queue().memcpy(i, curr, 3*numCellsD*sizeof(float));});
+			SYCL_ZSlabs Z = zslabs;
+			Z.t_lo = Z.t_int = 0;
+			Z.z_lo = B.nz;
+			Z.z_hi = E.nz;
+			const bool factor = coeff_mode>=3;
+			auto run = [&](unsigned int k, unsigned int n)
+			{
+				const SYCL_Dim3 block = {listed[k][0], listed[k][1], 1};
+				if (index32 && factor)
+					shape_pairs<unsigned int, true>(this, v, i, B, E, Z, block, n);
+				else if (index32)
+					shape_pairs<unsigned int, false>(this, v, i, B, E, Z, block, n);
+				else if (factor)
+					shape_pairs<size_t, true>(this, v, i, B, E, Z, block, n);
+				else
+					shape_pairs<size_t, false>(this, v, i, B, E, Z, block, n);
+			};
+			std::vector<double> best(n_cand, std::numeric_limits<double>::max());
+			for (unsigned int k=0; k<n_cand; ++k)
+				run(k, 2);
+			for (unsigned int r=0; r<rounds; ++r)
+				for (unsigned int k=0; k<n_cand; ++k)
+				{
+					Flush();
+					const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+					run(k, pairs);
+					Flush();
+					const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+					best[k] = std::min(best[k], us/pairs);
+				}
+			unsigned int fastest = 0;
+			for (unsigned int k=1; k<n_cand; ++k)
+				if (best[k]<best[fastest])
+					fastest = k;
+			unsigned int b = 0;
+			while (best[b]>tie*best[fastest])
+				++b;
+			shape_mode = 1;
+			shape_tz = listed[b][0];
+			shape_ty = listed[b][1];
+			reason << "timed:";
+			for (unsigned int k=0; k<n_cand; ++k)
+				reason << " " << name(k) << " " << std::fixed << std::setprecision(1) << best[k] << " us";
+			reason << " per voltage and current update, best " << name(b);
+			if (b!=fastest)
+				reason << " (" << name(fastest) << " within 0.5 %: the first listed wins)";
+		}
+		else
+		{
+			shape_mode = 0;
+			reason << "default, no nodes or not enough device memory to time the shapes";
+		}
+		Free(v);
+		Free(i);
+	}
+	const SYCL_Dim3 block = MainBlock(threads_z, E.ny-B.ny);
+	if (verbose)
+		std::cout << "GPU_Backend_SYCL: shape: " << block.x << "x" << block.y << " (" << reason.str() << ")" << std::endl;
 }
 
 void GPU_Backend_SYCL::Impl::FreeSnapshots()
@@ -2370,6 +2512,25 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		else
 			std::cout << "GPU_Backend_SYCL: z padding: off (the fused step is blocked by " << zpad_reason << ", but " << zpad_skip << ")" << std::endl;
 	}
+	// OPENEMS_SYCL_SHAPE: auto (default: timed, see DecideShape()), 0 Block(), or TZxTY forced (at most 1024 work-items)
+	d->shape_mode = 2;
+	if (const char* env = getenv("OPENEMS_SYCL_SHAPE"))
+	{
+		const std::string shape = env;
+		unsigned int tz = 0, ty = 0;
+		char x = 0;
+		if (shape=="0")
+			d->shape_mode = 0;
+		else if ((shape!="auto") && (sscanf(env, "%u%c%u", &tz, &x, &ty)==3) && (x=='x') && tz && ty && (tz*ty<=1024))
+		{
+			d->shape_mode = 1;
+			d->shape_forced = true;
+			d->shape_tz = tz;
+			d->shape_ty = ty;
+		}
+		else if (shape!="auto")
+			std::cerr << "GPU_Backend_SYCL: OPENEMS_SYCL_SHAPE=" << shape << " is not auto, 0 or TZxTY, using auto" << std::endl;
+	}
 	d->window = SYCL_ParseWindowKnob(getenv("OPENEMS_SYCL_WINDOW"), d->dim.nx);
 	d->l2_bytes = d->ctx->device.get_info<sycl::info::device::global_mem_cache_size>();
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
@@ -2542,6 +2703,7 @@ void GPU_Backend_SYCL::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
 	const bool fused = d->DecideFusedStep();
+	d->DecideShape();       // once, after the fused step and before DecideMurFused() (which checks the work-group)
 	d->DecideMurFused();   // once, after the pre hooks of the first timestep (the UPML decides its regions there)
 	if (fused)
 	{
@@ -2755,6 +2917,7 @@ bool GPU_Backend_SYCL::Impl::WindowPrepare()
 	for (size_t k=0; k<window_exts.size(); ++k)
 		if (SYCL_WindowHooks* h = dynamic_cast<SYCL_WindowHooks*>(window_exts[k]))
 			h->WindowPrepare();
+	DecideShape();
 	DecideMurFused();
 	if (!mur_planes.empty() && (mur_mode!=1))
 	{
