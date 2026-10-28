@@ -48,8 +48,9 @@
  *     c256) on copies of the fields at the first timestep; a candidate within 0.5 % of the fastest ties with it, and a
  *     tie goes to the first listed (32x8, the former work-group); 0 the former work-group, TZxTY or cN forced. cN is the
  *     compact layout: one-dimensional work-groups of N work-items over the y rows of the z lines, row after row, so a
- *     z line of 44 nodes takes 44 work-items (offered where the Mur z faces' line and shift line stay in one sub-group
- *     in every row). Without the compact layout the B580 takes 16x16 or 16x8 on both PCB models (PCB 6349 MC/s
+ *     z line of 44 nodes takes 44 work-items (offered, and accepted when forced, where N is a multiple of the
+ *     sub-group size, the rows are short enough for its row arithmetic, and the Mur z faces' line and shift line stay
+ *     in one sub-group in every row; a forced cN that fails falls back to 0). Without the compact layout the B580 takes 16x16 or 16x8 on both PCB models (PCB 6349 MC/s
  *     against 5923 with 32x8, small PCB 6588 against 5980), with it c128 or c256 (PCB 6670 against 6345, small PCB
  *     6695 against 6478).
  * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
@@ -1604,9 +1605,7 @@ std::string GPU_Backend_SYCL::Impl::MurZFaceRefusal()
 	MainRange(B, E, threads_z);
 	// the work-group of the launch: DecideShape() ran before this decision
 	const SYCL_Dim3 block = MainBlock(threads_z, E.ny-B.ny);
-	// OPENEMS_SYCL_MUR_SG=16: sub-groups of 16 (development; default 32, see SYCL_Context::sub_group_size)
-	mur_zf_sg = (getenv("OPENEMS_SYCL_MUR_SG") && (atoi(getenv("OPENEMS_SYCL_MUR_SG"))==16)) ? 16 : 32;
-	bool offered = false;
+	bool offered = false;   // sub-groups of mur_zf_sg (OPENEMS_SYCL_MUR_SG, read in Init()) on this device
 	for (size_t s : ctx->device.get_info<sycl::info::device::sub_group_sizes>())
 		offered = offered || (s==mur_zf_sg);
 	if (!offered)
@@ -1813,10 +1812,35 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 	unsigned int threads_z;
 	MainRange(B, E, threads_z);
 	std::ostringstream reason;
+	// The compact layout (shape_mode 3, see main_thread()): its row arithmetic (a multiply-high with the reciprocal
+	// of the row length) is exact while threads_z^2 * rows < 2^32, and the Mur z faces' line and shift line must stay
+	// in one sub-group in every row, with work-groups a multiple of the sub-group size (SYCL_SameSubGroupZCompact()
+	// assumes it). The timed choice offers the compact candidates only then; a forced cN falls back to the former
+	// work-group otherwise.
+	auto compact_refusal = [&](unsigned int group) -> std::string
+	{
+		if (group%mur_zf_sg)
+			return "N is not a multiple of the sub-group size " + std::to_string(mur_zf_sg);
+		if (!(threads_z*(unsigned long long)(E.ny-B.ny)*threads_z < 0x100000000ULL))
+			return "the rows are too long for the row arithmetic";
+		auto tzof = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((mur_planes[k].ny==2) && !SYCL_SameSubGroupZCompact(tzof(mur_planes[k].line), tzof(mur_planes[k].shift), threads_z, E.ny-B.ny, mur_zf_sg))
+				return "a Mur z face's line and shift line in different sub-groups";
+		return std::string();
+	};
 	if (shape_mode==0)
 		reason << "default";
 	else if (shape_forced)
+	{
 		reason << "OPENEMS_SYCL_SHAPE";
+		const std::string why = (shape_mode==3) ? compact_refusal(shape_tz) : std::string();
+		if (!why.empty())
+		{
+			shape_mode = 0;
+			reason << " refused (" << why << "): default";
+		}
+	}
 	else
 	{
 		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
@@ -1829,11 +1853,8 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 		// main_thread()), offered only where the Mur z faces' line and shift line stay in one sub-group in every row
 		static const unsigned int all[][2] = {{32, 8}, {64, 4}, {16, 16}, {32, 4}, {16, 8}, {128, 2}, {128, 1}, {256, 1}};
 		const double tie = 1.005;
-		bool compact_ok = (threads_z*(unsigned long long)(E.ny-B.ny)*threads_z < 0x100000000ULL);
-		auto tzof = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
-		for (size_t k=0; k<mur_planes.size(); ++k)
-			if ((mur_planes[k].ny==2) && !SYCL_SameSubGroupZCompact(tzof(mur_planes[k].line), tzof(mur_planes[k].shift), threads_z, E.ny-B.ny, mur_zf_sg))
-				compact_ok = false;
+		const std::string compact_why = compact_refusal(128);   // c128 and c256 alike
+		const bool compact_ok = compact_why.empty();
 		std::vector<std::pair<unsigned int, unsigned int> > listed;
 		for (size_t k=0; k<sizeof(all)/sizeof(all[0]); ++k)
 			if (compact_ok || (all[k][1]>1))
@@ -1900,7 +1921,7 @@ void GPU_Backend_SYCL::Impl::DecideShape()
 			if (b!=fastest)
 				reason << " (" << name(fastest) << " within 0.5 %: the first listed wins)";
 			if (!compact_ok)
-				reason << " (compact layouts refused: a Mur z face's line and shift line in different sub-groups)";
+				reason << " (compact layouts refused: " << compact_why << ")";
 		}
 		else
 		{
@@ -2581,24 +2602,26 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		else
 			std::cout << "GPU_Backend_SYCL: z padding: off (the fused step is blocked by " << zpad_reason << ", but " << zpad_skip << ")" << std::endl;
 	}
-	// OPENEMS_SYCL_SHAPE: auto (default: timed, see DecideShape()), 0 Block(), or TZxTY forced (at most 1024 work-items)
+	// OPENEMS_SYCL_SHAPE: auto (default: timed, see DecideShape()), 0 Block(), cN or TZxTY forced (at most the device's
+	// work-group size; a cN that fails the compact layout's checks falls back to Block(), see DecideShape())
 	d->shape_mode = 2;
 	if (const char* env = getenv("OPENEMS_SYCL_SHAPE"))
 	{
 		const std::string shape = env;
+		const size_t max_wg = d->ctx->device.get_info<sycl::info::device::max_work_group_size>();
 		unsigned int tz = 0, ty = 0;
 		char x = 0;
 		unsigned int cn = 0;
 		if (shape=="0")
 			d->shape_mode = 0;
-		else if ((shape.size()>1) && (shape[0]=='c') && (sscanf(env+1, "%u", &cn)==1) && cn && (cn%16==0) && (cn<=1024))
+		else if ((shape.size()>1) && (shape[0]=='c') && (sscanf(env+1, "%u", &cn)==1) && cn && (cn%16==0) && (cn<=max_wg))
 		{
 			d->shape_mode = 3;
 			d->shape_forced = true;
 			d->shape_tz = cn;
 			d->shape_ty = 1;
 		}
-		else if ((shape!="auto") && (sscanf(env, "%u%c%u", &tz, &x, &ty)==3) && (x=='x') && tz && ty && (tz*ty<=1024))
+		else if ((shape!="auto") && (sscanf(env, "%u%c%u", &tz, &x, &ty)==3) && (x=='x') && tz && ty && ((size_t)tz*ty<=max_wg))
 		{
 			d->shape_mode = 1;
 			d->shape_forced = true;
@@ -2608,6 +2631,9 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		else if (shape!="auto")
 			std::cerr << "GPU_Backend_SYCL: OPENEMS_SYCL_SHAPE=" << shape << " is not auto, 0, cN or TZxTY, using auto" << std::endl;
 	}
+	// OPENEMS_SYCL_MUR_SG=16: sub-groups of 16 for the Mur z faces in the voltage update (development; default 32, see
+	// SYCL_Context::sub_group_size); DecideShape() and MurZFaceRefusal() check the work-groups against it
+	d->mur_zf_sg = (getenv("OPENEMS_SYCL_MUR_SG") && (atoi(getenv("OPENEMS_SYCL_MUR_SG"))==16)) ? 16 : 32;
 	d->window = SYCL_ParseWindowKnob(getenv("OPENEMS_SYCL_WINDOW"), d->dim.nx);
 	d->l2_bytes = d->ctx->device.get_info<sycl::info::device::global_mem_cache_size>();
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
