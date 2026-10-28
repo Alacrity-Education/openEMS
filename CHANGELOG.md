@@ -55,6 +55,16 @@ there are unreleased changes. It becomes the next release entry.
   or the two lines in different sub-groups keeps them in the shell launch).
   On an Arc B580 the 3.06 Mcell model settles at 3095 MC/s with the z faces
   in the kernel instead of 2384.
+- The SYCL backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, over the cells of the
+  sheets' bounding box instead of a position list. The results are
+  bit-identical; a sheet that does not fit (positions off the z planes, more
+  than 32 planes, orders on different positions) keeps the position list,
+  which `--verbose=2` prints. On an Arc B580 the single step does not gain
+  from it (a PCB model of 3.06 Mcells with four copper layers: 88 us per
+  sheet kernel and step either way, 3095 MC/s); the windowed blocks below
+  launch the sheets on the cells of a window only.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
