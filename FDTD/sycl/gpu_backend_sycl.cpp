@@ -27,9 +27,12 @@
  *     kind of block recorded once as a SYCL command graph and replayed; the voltage and current frontiers step back
  *     one plane per step, so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where
  *     that leaves fewer than T planes a window, T = 4, then 2: on the 18 MiB L2 of the B580 the halo of T = 8 takes
- *     most of it), then the tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2) and refines the
- *     three best with W -/+25 % on the first timesteps of the run (real timesteps: every candidate is bit-identical;
- *     the host clock between two waits for the queue), and keeps the fastest; every run tunes. rule: the rule without
+ *     most of it), then the tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of
+ *     all x planes with the rule's T) and refines the three best windowed ones with W -/+25 % on the first timesteps
+ *     of the run (real timesteps: every candidate is bit-identical; the host clock between two waits for the queue),
+ *     and keeps the fastest, one window only if 10 % faster than the best windowed one; every run tunes. Bench (fields
+ *     near zero, compressed by the B580) against 0: inhomogeneous S/M +43/+24 %, pml S/M -6/-8 %, ideal and
+ *     dispersive unchanged (fused step, single step). rule: the rule without
  *     the tuner. T,W: forced (W may be NX). 0: one timestep at a time. Grids with TF/SF, Debye, absorbing sheets,
  *     cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single step; auto also
  *     keeps the fused step where the single step takes it (bench ideal M: 16207 MC/s fused, 15386 windowed).
@@ -2917,14 +2920,18 @@ double GPU_Backend_SYCL::Impl::WindowTimedRun(unsigned int start_ts, unsigned in
 // tune does not change the result and costs only the slower candidates' time; nothing is copied or restored.
 static const unsigned int SYCL_TUNE_MAX_CANDIDATES = 13;   // the first list (the refinement adds up to 6)
 static const unsigned int SYCL_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
+// one window over all of x must be this much faster (WindowTuneFinish()), as on HIP: the tune runs at the start of
+// the run, where the B580 compresses the near-zero fields and the timed blocks favour the single step's traffic (bench
+// inhomogeneous M: one window chosen with a margin of 3 % ran 4639 MC/s, the windows chosen with 10 % 6256)
+static const double SYCL_TUNE_ONE_WINDOW_MARGIN = 1.10;
 
 void GPU_Backend_SYCL::Impl::WindowTunePrepare()
 {
 	const bool verbose = g_settings.GetVerboseLevel()>1;
 	tune_cands.clear();
 	tune_state = 0;
-	// the candidates: the rule (its T and W), then T in {8, 16, 4, 2} with the halo of T+1 planes at 0.65, 0.45 and
-	// 0.85 of L2; equal pairs once, at most SYCL_TUNE_MAX_CANDIDATES
+	// the candidates: the rule (its T and W), one window over all of x, then T in {8, 16, 4, 2} with the halo of T+1
+	// planes at 0.65, 0.45 and 0.85 of L2; equal pairs once, at most SYCL_TUNE_MAX_CANDIDATES
 	auto add = [&](unsigned int T, unsigned int W)
 	{
 		for (size_t k=0; k<tune_cands.size(); ++k)
@@ -2937,6 +2944,10 @@ void GPU_Backend_SYCL::Impl::WindowTunePrepare()
 		}
 	};
 	add(tune_rule_T, tune_rule_W);
+	// one window over all of x, the single step's work in graphs: the fastest where the L2 gains less than the small
+	// extension kernels of many windows cost (each window runs them again); with the rule's T (HIP: 16), which fits
+	// the short chunks of grids with frequent probes (bench pml M: chunks of 12 to 47 timesteps)
+	add(tune_rule_T, dim.nx);
 	static const unsigned int Ts[] = {8, 16, 4, 2};
 	static const double margins[] = {0.65, 0.45, 0.85};
 	for (unsigned int t=0; t<4; ++t)
@@ -2986,6 +2997,8 @@ unsigned int GPU_Backend_SYCL::Impl::WindowTune(unsigned int start_ts, unsigned 
 			for (size_t k=0; (k<3) && (k<best.size()); ++k)
 			{
 				const unsigned int W = best[k].W;
+				if (W>=dim.nx)
+					continue;   // one window over all of x is not refined (W -25 % is two windows, not a better one)
 				const unsigned int lo = std::max(1u, std::min(W - 1, (unsigned int)std::lround(0.75*W)));
 				const unsigned int hi = std::min(dim.nx, std::max(W + 1, (unsigned int)std::lround(1.25*W)));
 				const unsigned int ws[2] = {lo, hi};
@@ -3066,6 +3079,17 @@ void GPU_Backend_SYCL::Impl::WindowTuneFinish(bool complete)
 		}
 		WindowDropGraphs(win_W);
 		return;
+	}
+	// one window over all of x only when it beats the best windowed candidate clearly (SYCL_TUNE_ONE_WINDOW_MARGIN):
+	// a near tie of the timed blocks must not drop the run to the single step's work
+	if (tune_cands[best].W>=dim.nx)
+	{
+		int windowed = -1;
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if ((tune_cands[k].mcs>=0) && (tune_cands[k].W<dim.nx) && ((windowed<0) || (tune_cands[k].mcs>tune_cands[windowed].mcs)))
+				windowed = (int)k;
+		if ((windowed>=0) && (tune_cands[best].mcs<SYCL_TUNE_ONE_WINDOW_MARGIN*tune_cands[windowed].mcs))
+			best = windowed;
 	}
 	win_T = tune_cands[best].T;
 	win_W = tune_cands[best].W;

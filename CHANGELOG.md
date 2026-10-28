@@ -84,7 +84,9 @@ there are unreleased changes. It becomes the next release entry.
   fastest; `rule` skips the tuner, `0` turns the windows off. auto keeps the
   fused step on grids where the single step takes it. On an Arc B580 the PCB
   model of 3.06 Mcells runs at 5971 MC/s tuned (T = 16, W = 39) instead of
-  5757 with the rule.
+  5757 with the rule. The tuner also times one window over all of x (the
+  single step's work in graphs) and keeps it where it is at least 10 %
+  faster than the best windowed candidate.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
