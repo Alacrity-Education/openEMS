@@ -131,7 +131,8 @@ unless its description says otherwise. The SYCL backend's knobs
 (`OPENEMS_SYCL_*`: the windowed blocks `WINDOW`; `FUSED_STEP`, `FUSED_TZ/TY/XC`,
 `FUSED_REGIONS`, `INDEX`, `UPML_FUSION`, `COEFF`, `MUR_SG`, `KERNEL_TIMES`) are
 listed with their defaults and measured effects at the top of
-`FDTD/sycl/gpu_backend_sycl.cpp`.
+`FDTD/sycl/gpu_backend_sycl.cpp`. The tuner of `OPENEMS_SYCL_WINDOW=auto`
+runs at the start of every run; `rule` or a forced `T,W` skip it.
 
 ## Testing
 

@@ -77,6 +77,14 @@ there are unreleased changes. It becomes the next release entry.
   Mur planes outside the voltage update keep the single step. On an Arc B580
   a PCB model of 3.06 Mcells runs at 5757 MC/s with the rule's schedule
   (T = 8, W = 39) instead of 3095.
+- The windowed blocks of the SYCL backend are on by default
+  (`OPENEMS_SYCL_WINDOW=auto`), with a tuner that times up to 13 (T, W)
+  candidates on the first timesteps of the run (real timesteps: every
+  candidate gives the same bits), refines the three best and keeps the
+  fastest; `rule` skips the tuner, `0` turns the windows off. auto keeps the
+  fused step on grids where the single step takes it. On an Arc B580 the PCB
+  model of 3.06 Mcells runs at 5971 MC/s tuned (T = 16, W = 39) instead of
+  5757 with the rule.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

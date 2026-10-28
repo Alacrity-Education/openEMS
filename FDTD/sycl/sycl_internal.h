@@ -392,7 +392,7 @@ struct GPU_Backend_SYCL::Impl
 		bool on;              //!< set and not 0
 		bool valid;           //!< auto, rule, or T,W with T, W > 0
 		bool automatic;       //!< auto or rule: T = 8 and W from the L2 rule (see SYCL_WindowRule())
-		bool tune;            //!< auto: the tuner times candidates on the first timesteps (not yet: the rule); rule: not
+		bool tune;            //!< auto: the tuner times candidates on the first timesteps (see WindowTune()); rule: not
 		unsigned int T, W;    //!< forced; W: the grid's nx for "NX"
 		std::string text;     //!< the value as set
 	};
@@ -440,6 +440,26 @@ struct GPU_Backend_SYCL::Impl
 	void WindowRun(unsigned int start_ts, unsigned int n);
 	//! Destroy the graphs of every W but \a keep_W (UINT_MAX: all)
 	void WindowDropGraphs(unsigned int keep_W);
+	//! WindowRun() with the current win_T, win_W, timed by the host clock between two waits for the queue, in ms
+	double WindowTimedRun(unsigned int start_ts, unsigned int n);
+	//! The tuner of auto: candidates (T, W) timed on the live grid, on real timesteps (every candidate is
+	//! bit-identical, so the tune does not change the result); mcs < 0: not measured yet
+	struct WindowCandidate { unsigned int T, W; double mcs; };
+	std::vector<WindowCandidate> tune_cands;
+	int tune_state;                 //!< 0 not tuning (forced, rule or done), 1 the candidate list, 2 the refinement
+	unsigned int tune_chunks;       //!< chunks the tune has run in so far
+	unsigned int tune_rule_T;       //!< T and W of the rule (SYCL_WindowRuleTW()), the schedule while nothing is measured
+	unsigned int tune_rule_W;
+	unsigned long long tune_steps;  //!< timesteps the candidates ran (warm-up and timed blocks)
+	double tune_ms;                 //!< time of the timed blocks
+	size_t tune_plane_bytes;        //!< plane bytes of the window rule (WindowPrepare())
+	//! The tuner's candidate list; in WindowPrepare() for auto
+	void WindowTunePrepare();
+	//! Run the tuner's candidates that fit into the chunk [start_ts, start_ts+n), each one warm-up block and two
+	//! timed blocks of its T; returns the timesteps used, the rest of the chunk runs with the best (T, W) so far
+	unsigned int WindowTune(unsigned int start_ts, unsigned int n);
+	//! The end of the tune: the best measured candidate (or the rule), logged
+	void WindowTuneFinish(bool complete);
 
 	//! Field snapshots (see GPU_Backend_SYCL::SnapshotFields()): the raw values the dumps read, copied on
 	//! the device (gather_region) and downloaded on the copy queue into a host buffer
@@ -603,7 +623,7 @@ void SYCL_Launch(GPU_Backend_SYCL::Impl* d, const char* name, size_t ni, size_t 
 	}
 }
 
-//! Parse OPENEMS_SYCL_WINDOW (\a text, NULL if unset: off): 0 off; auto (the rule; the tuner is not there yet); rule (the rule
+//! Parse OPENEMS_SYCL_WINDOW (\a text, NULL if unset: auto): 0 off; auto (the rule, then the tuner); rule (the rule
 //! alone); T,W with T, W > 0 (W may be the string NX: the grid's nx). Anything else is on but not valid (the backend
 //! then steps one timestep at a time)
 GPU_Backend_SYCL::Impl::WindowKnob SYCL_ParseWindowKnob(const char* text, unsigned int nx);
