@@ -19,6 +19,7 @@
 #include <stdexcept>
 
 #include "engine_gpu.h"
+#include "engine_gpu_cylindermultigrid.h"
 #include "gpu_backend.h"
 #include "extensions/engine_extension.h"
 #include "extensions/operator_extension.h"
@@ -57,6 +58,7 @@ Engine_GPU::Engine_GPU(const Operator* op, GPU_Backend* backend, GPU_Backend* pa
 	m_SnapshotGatherSize[0] = m_SnapshotGatherSize[1] = 0;
 	m_FieldDFTUsed = false;
 	m_DumpPath = 0;
+	m_Windowed = -1;
 	m_StaleVolt.stale = m_StaleCurr.stale = false;
 	m_StaleVolt.full_this_batch = m_StaleCurr.full_this_batch = false;
 	m_StaleVolt.full_last_batch = m_StaleCurr.full_last_batch = false;
@@ -320,8 +322,38 @@ void Engine_GPU::CurrentsToDevice()
 		m_Backend->UploadCurrents(*curr_ptr);
 }
 
+void Engine_GPU::DecideWindowed()
+{
+	// the windowed blocks run the hooks of the device extensions by themselves (see
+	// GPU_Extension::LaunchInWindow()); the multi-grid adds its sub-grids to every half-step
+	std::string refusal;
+	if (m_FieldsOnHost)
+		refusal = "host fallback";
+	else if (m_ParentBackend || dynamic_cast<Engine_GPU_CylinderMultiGrid*>(this))
+		refusal = "multigrid";
+	else
+	{
+		// without host fallback m_GPU_exts has one entry per engine extension, in the same order
+		for (size_t n=0; n<m_GPU_exts.size(); ++n)
+			if (!m_GPU_exts.at(n)->WindowCapable())
+			{
+				refusal = m_Eng_exts.at(n)->GetExtensionName() + " is not window-capable";
+				break;
+			}
+	}
+	m_Windowed = m_Backend->SetWindowExtensions(m_GPU_exts, refusal) ? 1 : 0;
+}
+
 bool Engine_GPU::IterateTS(unsigned int iterTS)
 {
+	if (m_Windowed<0)
+		DecideWindowed();
+	if ((m_Windowed>0) && !m_FieldsOnHost && m_Backend->IterateWindowed(numTS, iterTS))
+	{
+		numTS += iterTS;
+		FinishBatch();
+		return true;
+	}
 	for (unsigned int iter=0; iter<iterTS; ++iter)
 	{
 		VoltageHalfStep();
