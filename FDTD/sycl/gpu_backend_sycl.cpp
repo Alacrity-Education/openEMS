@@ -36,6 +36,13 @@
  *     the tuner. T,W: forced (W may be NX). 0: one timestep at a time. Grids with TF/SF, Debye, absorbing sheets,
  *     cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single step; auto also
  *     keeps the fused step where the single step takes it (bench ideal M: 16207 MC/s fused, 15386 windowed).
+ * OPENEMS_SYCL_ZPAD = 0 (default) | M
+ *     The z stride of the device layout rounded up to a multiple of M, so that every z line starts on the same
+ *     alignment: on grids where the fused step is blocked (Mur, sheets, UPML, dispersive materials), unless that more
+ *     than doubles the z lines, the padded fields and coefficients would take more than half of the device memory, or
+ *     an extension without the padded layout is present (TF/SF, absorbing sheets, cylinder). Off by default: the
+ *     separate kernels gain (PCB pair of updates 2439 us padded to 48, 2666 unpadded), the windowed runs lose (PCB
+ *     6128 MC/s against 6349, small PCB 5511 against 6588).
  * OPENEMS_SYCL_MUR_SG = 32 (default) | 16
  *     Development: the sub-group size of the voltage kernel that updates the Mur z faces inside the main update
  *     (Mur mode 2, the line and shift line of a z line exchange their values by sub-group shifts). small PCB:
@@ -90,6 +97,13 @@
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
 #include "FDTD/extensions/engine_ext_debyematerial.h"
 #include "FDTD/extensions/engine_ext_dispersive.h"
+#include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/operator_ext_excitation.h"
+#include "FDTD/extensions/operator_ext_lumpedRLC.h"
+#include "FDTD/extensions/operator_ext_steadystate.h"
+#include "FDTD/extensions/operator_ext_mur_abc.h"
+#include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/operator_cylinder.h"
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
@@ -136,10 +150,10 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
 		upml_fused_volt_node<FACTOR>(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	const float* vv = C.a;
@@ -272,10 +286,10 @@ inline void mur_volt_node(float* volt, const float* curr, const void* index, con
                           unsigned int mode, const SYCL_GridDim& N, const SYCL_MurFace* F, unsigned int active,
                           unsigned int x, unsigned int y, unsigned int z)
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 	mur_volt_component<0, I, FACTOR>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
@@ -374,13 +388,13 @@ inline void update_voltages_inner(const sycl::nd_item<3>& it, float* __restrict_
 		if (!node)
 			return;
 	}
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = node ? nijk<I>(N, 0, x, y, z) : 0;
 	float o_x = 0, o_y = 0, v_x = 0, v_y = 0;
 	if (node)
 	{
-		const I xm = (x>0) ? (I)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-		const I ym = (y>0) ? N.nz : 0;
+		const I xm = (x>0) ? (I)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+		const I ym = (y>0) ? N.nzd : 0;
 		const I zm = (z>0) ? 1 : 0;
 		const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z);
 		o_x = volt[i];
@@ -485,10 +499,10 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
 	}
 	if (z+1>=N.nz || y+1>=N.ny || x+1>=N.nx)
 		return;
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xp = (I)N.ny*N.nz;
-	const I yp = N.nz;
+	const I xp = (I)N.ny*N.nzd;
+	const I yp = N.nzd;
 	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 6, N, x, y, z);
 	const float* ii = C.a;
 	const float* iv = C.b;
@@ -519,10 +533,10 @@ inline void fused_volt(const float* __restrict__ volt, const float* __restrict__
                        const void* index, const float* va, const float* vb, unsigned int mode,
                        const SYCL_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(index, va, vb, mode, sn, i, 0, N, x, y, z);
 	float t;
@@ -650,7 +664,7 @@ inline void update_fused(const sycl::nd_item<3>& it, const sycl::local_accessor<
 	const bool owner = (z<z_end) && (y<E.ny) && (col<rowlen-1) && (row<rows-1);   // written by this work-group
 	const bool read_yz = live && (y<=E.ny) && (z<N.nz) && (y<N.ny);   // a border line outside [B, E): from volt_out
 	const bool slab = SLABS && ((z<a.z_lo) || (z>=a.z_hi));   // a node of a UPML z slab
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	auto sv = [&](unsigned int c, unsigned int p) -> float& {return sV[c*TY*TZ + p];};
 
 	// the UPML z slab of the slab nodes of the work-item (by value: see upml_pick())
@@ -862,11 +876,11 @@ inline void update_currents_nodes(const sycl::nd_item<3>& it, const float* __res
 	const unsigned int k = it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
 	if (k>=count)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nodes[k];
-	const size_t xp = (size_t)N.ny*N.nz;
-	const size_t yp = N.nz;
-	const unsigned int x = i/xp, y = (i/yp)%N.ny, z = i%N.nz;
+	const size_t xp = (size_t)N.ny*N.nzd;
+	const size_t yp = N.nzd;
+	const unsigned int x = i/xp, y = (i/yp)%N.ny, z = i%N.nzd;
 	const SYCL_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(index, ia, ib, mode, sn, i, 6, N, x, y, z);
 	float c;
 	c  = curr_in[i] * C.a[0];
@@ -920,7 +934,7 @@ inline void energy_lines(const sycl::nd_item<3>& it, const float* __restrict__ v
 	const unsigned int y = it.get_group(1)*it.get_local_range(1) + it.get_local_id(1);
 	if (z>=L.nz || y>=L.ny)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	float E = 0, H = 0;
 	for (unsigned int x=0; x<L.nx; ++x)
 	{
@@ -1062,6 +1076,12 @@ static void launch_update_currents(GPU_Backend_SYCL::Impl* d, unsigned int threa
 
 /***************************** helpers *****************************/
 
+// OPENEMS_SYCL_ZPAD when it is not set: no padding. The padded layout makes the separate main kernels faster on the
+// B580 (the PCB model's pair of updates 2439 us a step padded to 48 against 2666 unpadded, small PCB 64: the same),
+// but the runs lose (windowed, with the timed work-group: PCB 6128 MC/s padded to 48 against 6349; small PCB
+// 5511 against 6588), as the windows hold fewer planes and the host copies of the fields move every line apart
+static const unsigned int SYCL_ZPAD_DEFAULT = 0;
+
 namespace
 {
 struct KernelTimeTable
@@ -1168,8 +1188,8 @@ void SYCL_Context::ThrowAsyncError()
 
 GPU_Backend_SYCL::Impl::Impl()
 {
-	dim.nx = dim.ny = dim.nz = 0;
-	numCells = 0;
+	dim.nx = dim.ny = dim.nz = dim.nzd = 0;
+	numCells = numCellsD = 0;
 	volt = curr = vv = vi = ii = iv = NULL;
 	coeff_mode = 0;
 	index = NULL;
@@ -1255,6 +1275,12 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	{
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (OPENEMS_SYCL_FUSED_STEP=0)" << std::endl;
+		return false;
+	}
+	if (dim.nzd!=dim.nz)
+	{
+		if (g_settings.GetVerboseLevel()>1)
+			std::cout << "GPU_Backend_SYCL: separate voltage and current update kernels (padded z stride, OPENEMS_SYCL_ZPAD)" << std::endl;
 		return false;
 	}
 	if (fused_blockers>0)
@@ -1379,8 +1405,8 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	std::sort(list.begin(), list.end());
 	list.erase(std::unique(list.begin(), list.end()), list.end());
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
-	volt_next = TryAlloc<float>(3*numCells);
-	curr_next = TryAlloc<float>(3*numCells);
+	volt_next = TryAlloc<float>(3*numCellsD);
+	curr_next = TryAlloc<float>(3*numCellsD);
 	if ((volt_next==NULL) || (curr_next==NULL))
 	{
 		Free(volt_next);
@@ -1401,8 +1427,8 @@ bool GPU_Backend_SYCL::Impl::DecideFusedStep()
 	fixup = Alloc<size_t>(fixup_count, list.data());
 
 	// both buffers start with the current fields
-	SYCL_Check("fused step buffers", [&] {Queue().memcpy(volt_next, volt, 3*numCells*sizeof(float));});
-	SYCL_Check("fused step buffers", [&] {Queue().memcpy(curr_next, curr, 3*numCells*sizeof(float));});
+	SYCL_Check("fused step buffers", [&] {Queue().memcpy(volt_next, volt, 3*numCellsD*sizeof(float));});
+	SYCL_Check("fused step buffers", [&] {Queue().memcpy(curr_next, curr, 3*numCellsD*sizeof(float));});
 	Flush();
 	fused_step = 1;
 	if (g_settings.GetVerboseLevel()>1)
@@ -2255,6 +2281,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	d->dim.nx = numLines[0];
 	d->dim.ny = numLines[1];
 	d->dim.nz = numLines[2];
+	d->dim.nzd = numLines[2];
 	d->numCells = (size_t)numLines[0]*numLines[1]*numLines[2];
 	if (g_settings.GetVerboseLevel()>1)
 	{
@@ -2262,6 +2289,86 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		std::cout << "GPU_Backend_SYCL: " << d->ctx->name << ": " << dev.get_info<sycl::info::device::max_compute_units>()
 		          << " compute units, L2 cache " << dev.get_info<sycl::info::device::global_mem_cache_size>()/(1024*1024)
 		          << " MiB, sub-group size " << d->ctx->sub_group_size << std::endl;
+	}
+	// OPENEMS_SYCL_ZPAD: the z lines of the device layout are stored with a stride rounded up to a multiple of M, so that
+	// every line starts on the same alignment (see nijk()). M (default SYCL_ZPAD_DEFAULT: off): padded if the fused
+	// step will be blocked (the separate main kernels gain from it), unless the padding would more than
+	// double the z lines or the padded fields and full coefficient arrays (24 + 48 bytes a node, the most the main
+	// update allocates) would take more than half of the device memory; 0: off. The prediction of the fused step is the
+	// test of CreateExtension() on the operator extensions (each becomes one engine extension), the sub-grids and
+	// OPENEMS_SYCL_FUSED_STEP; the extensions whose device code does not follow the padded layout (TF/SF, absorbing
+	// sheets, the cylinder extensions) keep the unpadded one.
+	unsigned int zpad = SYCL_ZPAD_DEFAULT;
+	const char* zpad_env = getenv("OPENEMS_SYCL_ZPAD");
+	if (zpad_env)
+	{
+		const int m = atoi(zpad_env);
+		zpad = (m>0) ? (unsigned int)m : 0;
+	}
+	std::string zpad_reason;   // what blocks the fused step (auto pads), empty: nothing
+	std::string zpad_skip;     // why auto does not pad although the fused step is blocked
+	if (zpad>0)
+	{
+		const char* fused_env = getenv("OPENEMS_SYCL_FUSED_STEP");
+		const bool fused_on = fused_env && (atoi(fused_env)==1);
+		if (fused_env && (atoi(fused_env)==0))
+			zpad_reason = "OPENEMS_SYCL_FUSED_STEP=0";
+		else if ((d->fused_blockers>0) || dynamic_cast<const Operator_Cylinder*>(op))
+			zpad_reason = "a sub-grid or a cylindrical mesh";
+		for (size_t n=0; n<op->GetNumberOfExtentions(); ++n)
+		{
+			Operator_Extension* op_ext = op->GetExtension(n);
+			if (dynamic_cast<Operator_Ext_UPML*>(op_ext))
+			{
+				if (!fused_on && zpad_reason.empty())
+					zpad_reason = op_ext->GetExtensionName();   // the default policy (see DecideFusedStep())
+			}
+			else if (dynamic_cast<Operator_Ext_Excitation*>(op_ext) || dynamic_cast<Operator_Ext_LumpedRLC*>(op_ext)
+			         || dynamic_cast<Operator_Ext_SteadyState*>(op_ext))
+				continue;
+			else if (dynamic_cast<Operator_Ext_Mur_ABC*>(op_ext) || dynamic_cast<Operator_Ext_LorentzMaterial*>(op_ext)
+			         || dynamic_cast<Operator_Ext_DebyeMaterial*>(op_ext))
+			{
+				if (!fused_on && zpad_reason.empty())
+					zpad_reason = op_ext->GetExtensionName();   // fused only on request (see fused_optin)
+			}
+			else if (zpad_skip.empty())
+				zpad_skip = op_ext->GetExtensionName() + " keeps the unpadded layout";
+		}
+		if (!zpad_reason.empty() && zpad_skip.empty())
+		{
+			const unsigned int nzd = (numLines[2] + zpad - 1)/zpad*zpad;
+			const size_t padded_bytes = (size_t)numLines[0]*numLines[1]*nzd*(24 + 48);
+			const size_t mem = d->ctx->device.get_info<sycl::info::device::global_mem_size>();
+			std::ostringstream skip;
+			if (nzd - numLines[2] > numLines[2])
+				skip << "the padding would more than double the " << numLines[2] << " z lines";
+			else if (padded_bytes > mem/2)
+				skip << "the padded fields and coefficients (" << (padded_bytes>>20) << " MiB) would take more than half of the device memory ("
+				     << (mem>>20) << " MiB)";
+			else if (3*(size_t)numLines[0]*numLines[1]*nzd*sizeof(float) > d->ctx->max_mem_alloc_size)
+				skip << "a padded field buffer would not fit one allocation";
+			zpad_skip = skip.str();
+			if (zpad_skip.empty())
+				d->dim.nzd = nzd;
+		}
+	}
+	d->numCellsD = (size_t)numLines[0]*numLines[1]*d->dim.nzd;
+	if (g_settings.GetVerboseLevel()>1)
+	{
+		if (d->dim.nzd!=d->dim.nz)
+		{
+			std::ostringstream pct;
+			pct << std::fixed << std::setprecision(1) << 100.0*(d->dim.nzd - d->dim.nz)/d->dim.nz;
+			std::cout << "GPU_Backend_SYCL: z padding: " << d->dim.nz << " lines stored as " << d->dim.nzd << " (the fused step is blocked by "
+			          << zpad_reason << ", " << pct.str() << " % more field memory)" << std::endl;
+		}
+		else if (zpad==0)
+			std::cout << "GPU_Backend_SYCL: z padding: off" << std::endl;
+		else if (zpad_reason.empty())
+			std::cout << "GPU_Backend_SYCL: z padding: off (fused step)" << std::endl;
+		else
+			std::cout << "GPU_Backend_SYCL: z padding: off (the fused step is blocked by " << zpad_reason << ", but " << zpad_skip << ")" << std::endl;
 	}
 	d->window = SYCL_ParseWindowKnob(getenv("OPENEMS_SYCL_WINDOW"), d->dim.nx);
 	d->l2_bytes = d->ctx->device.get_info<sycl::info::device::global_mem_cache_size>();
@@ -2275,7 +2382,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 
 	// SYCL has no limit on the number of work-groups along x (the grid z of HIP), but a field
 	// buffer must fit one allocation of the device
-	const size_t field_bytes = 3*d->numCells*sizeof(float);
+	const size_t field_bytes = 3*d->numCellsD*sizeof(float);
 	if (field_bytes > d->ctx->max_mem_alloc_size)
 	{
 		std::cerr << "GPU_Backend_SYCL::Init: Error: a field buffer of " << field_bytes << " bytes, the device allows at most "
@@ -2285,7 +2392,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 
 	// The kernels index with 32 bit while the fields fit (Intel GPUs emulate 64 bit integer
 	// arithmetic); OPENEMS_SYCL_INDEX=32 or 64 overrides.
-	const bool fits32 = 3*d->numCells <= UINT_MAX;
+	const bool fits32 = 3*d->numCellsD <= UINT_MAX;
 	d->index32 = fits32;
 	if (const char* env = getenv("OPENEMS_SYCL_INDEX"))
 		d->index32 = (atoi(env)==32);
@@ -2295,7 +2402,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 		d->index32 = false;
 	}
 
-	const size_t count = 3*d->numCells;
+	const size_t count = 3*d->numCellsD;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
 	if (d->window.on)
@@ -2330,7 +2437,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 			if (FactorizeCoefficients(op, numLines, max_ulp, F))
 			{
 				d->coeff_mode = 2 + F.index.mode;
-				d->index = d->AllocIndex(F.index);
+				d->index = d->AllocIndex(F.index, d->dim.nzd!=d->dim.nz);   // per node of the device layout
 				d->coeff = d->Alloc<float>(F.buffer.size(), F.buffer.data());
 				d->coeff_table_bytes = F.buffer.size()*sizeof(float);
 				if (g_settings.GetVerboseLevel()>1)
@@ -2356,7 +2463,7 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	if ((coeff_req!="full") && GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
-		d->index = d->AllocIndex(sets);
+		d->index = d->AllocIndex(sets, d->dim.nzd!=d->dim.nz);   // per node of the device layout
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		d->coeff_table_bytes = sets.table.size()*sizeof(float);
 		if (g_settings.GetVerboseLevel()>1)
@@ -2370,7 +2477,13 @@ bool GPU_Backend_SYCL::Init(const Operator* op)
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
 	std::vector<float> values;
-	auto upload = [&](int c) {GPU_CoefficientArray(op, numLines, c, values); return d->Alloc<float>(count, values.data());};
+	auto upload = [&](int c)
+	{
+		GPU_CoefficientArray(op, numLines, c, values);
+		if (d->dim.nzd!=d->dim.nz)
+			values = d->Padded(values.data(), values.size());
+		return d->Alloc<float>(count, values.data());
+	};
 	d->vv = upload(0);
 	d->vi = upload(1);
 	d->ii = upload(2);
@@ -2652,7 +2765,7 @@ bool GPU_Backend_SYCL::Impl::WindowPrepare()
 		return false;
 	}
 	// plane bytes: the fields and the coefficient index (or the full coefficient arrays) of one x plane
-	const size_t plane_bytes = (size_t)dim.ny*dim.nz*(24 + CoeffBytesPerNode());
+	const size_t plane_bytes = (size_t)dim.ny*dim.nzd*(24 + CoeffBytesPerNode());
 	tune_plane_bytes = plane_bytes;
 	if (window.automatic)
 	{
@@ -3214,7 +3327,7 @@ bool GPU_Backend_SYCL::IterateWindowed(unsigned int start_ts, unsigned int n)
 			line << " (recorded in " << std::fixed << std::setprecision(1) << capture_ms << " ms)";
 		else if (SYCL_KernelTimes::Enabled())
 			line << " (kernel times: plain launches)";
-		line << " (" << d->win_source << ", " << d->dim.ny*(size_t)d->dim.nz*(24 + d->CoeffBytesPerNode())
+		line << " (" << d->win_source << ", " << d->dim.ny*(size_t)d->dim.nzd*(24 + d->CoeffBytesPerNode())
 		     << " bytes per plane, coefficient table " << d->coeff_table_bytes << " bytes, L2 " << d->l2_bytes/(1024*1024) << " MiB, " << d->window_exts.size() << " window-capable extensions)";
 		std::cout << line.str() << std::endl;
 	}
@@ -3227,11 +3340,59 @@ static void CheckSize(size_t host_count, size_t device_count)
 		throw std::runtime_error("GPU_Backend_SYCL: host and device field size mismatch");
 }
 
+// OPENEMS_SYCL_ZPAD: \a lines z lines of the host layout (stride nz) from or to the device layout (stride nzd), the padding
+// untouched. Through a contiguous device buffer and one kernel that moves the lines: ext_oneapi_memcpy2d of a few
+// hundred thousand short rows took about a millisecond a step on the B580 with the probes and dumps of a PCB model.
+static void CopyLines(GPU_Backend_SYCL::Impl* d, float* dst, const float* src, size_t lines, bool to_host, const char* what)
+{
+	const size_t nz = d->dim.nz, nzd = d->dim.nzd;
+	const size_t count = lines*nz;
+	float* tmp = d->TryAlloc<float>(count);
+	if (tmp==NULL)
+	{
+		const size_t host_pitch = nz*sizeof(float), dev_pitch = nzd*sizeof(float);
+		SYCL_Check(what, [&] {d->Queue().ext_oneapi_memcpy2d(dst, to_host ? host_pitch : dev_pitch, src, to_host ? dev_pitch : host_pitch,
+		                                                     host_pitch, lines);});
+		return;
+	}
+	const unsigned int z_count = (unsigned int)nz;
+	const size_t z_stride = nzd;
+	if (to_host)
+	{
+		const float* in = src;
+		float* out = tmp;
+		SYCL_Launch(d, "copy_lines", count, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			const size_t k = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+			if (k<count)
+				out[k] = in[(k/z_count)*z_stride + k%z_count];
+		});
+		SYCL_Check(what, [&] {d->Queue().memcpy(dst, tmp, count*sizeof(float));});
+	}
+	else
+	{
+		SYCL_Check(what, [&] {d->Queue().memcpy(tmp, src, count*sizeof(float));});
+		const float* in = tmp;
+		float* out = dst;
+		SYCL_Launch(d, "copy_lines", count, 1, 1, [=](sycl::nd_item<3> it)
+		{
+			const size_t k = (size_t)it.get_group(2)*it.get_local_range(2) + it.get_local_id(2);
+			if (k<count)
+				out[(k/z_count)*z_stride + k%z_count] = in[k];
+		});
+	}
+	d->Flush();
+	d->Free(tmp);
+}
+
 void GPU_Backend_SYCL::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	SYCL_Check("download", [&] {d->Queue().memcpy(volt.data(), d->volt, volt.size()*sizeof(float));});
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, volt.data(), d->volt, volt.size()/d->dim.nz, true, "download");
+	else
+		SYCL_Check("download", [&] {d->Queue().memcpy(volt.data(), d->volt, volt.size()*sizeof(float));});
 	d->Flush();
 }
 
@@ -3239,7 +3400,10 @@ void GPU_Backend_SYCL::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	SYCL_Check("download", [&] {d->Queue().memcpy(curr.data(), d->curr, curr.size()*sizeof(float));});
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, curr.data(), d->curr, curr.size()/d->dim.nz, true, "download");
+	else
+		SYCL_Check("download", [&] {d->Queue().memcpy(curr.data(), d->curr, curr.size()*sizeof(float));});
 	d->Flush();
 }
 
@@ -3247,7 +3411,10 @@ void GPU_Backend_SYCL::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& vol
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory((void*)volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	SYCL_Check("upload", [&] {d->Queue().memcpy(d->volt, volt.data(), volt.size()*sizeof(float));});
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->volt, volt.data(), volt.size()/d->dim.nz, false, "upload");
+	else
+		SYCL_Check("upload", [&] {d->Queue().memcpy(d->volt, volt.data(), volt.size()*sizeof(float));});
 	d->Flush();
 }
 
@@ -3255,7 +3422,10 @@ void GPU_Backend_SYCL::UploadCurrents(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cur
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory((void*)curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	SYCL_Check("upload", [&] {d->Queue().memcpy(d->curr, curr.data(), curr.size()*sizeof(float));});
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->curr, curr.data(), curr.size()/d->dim.nz, false, "upload");
+	else
+		SYCL_Check("upload", [&] {d->Queue().memcpy(d->curr, curr.data(), curr.size()*sizeof(float));});
 	d->Flush();
 }
 
@@ -3263,6 +3433,24 @@ bool GPU_Backend_SYCL::DownloadRange(bool currents, size_t offset, size_t count,
 {
 	if (offset+count > 3*d->numCells)
 		return false;
+	if (d->dim.nzd!=d->dim.nz)
+	{
+		// OPENEMS_SYCL_ZPAD: a part of one z line, or whole z lines (the caller, Engine_GPU, asks for one line);
+		// else the host falls back
+		const size_t nz = d->dim.nz;
+		const float* src = (currents ? d->curr : d->volt) + d->Dev(offset);
+		if (offset%nz + count <= nz)
+		{
+			if (count)
+				SYCL_Check("range download", [&] {d->Queue().memcpy(dst, src, count*sizeof(float));});
+		}
+		else if ((offset%nz==0) && (count%nz==0))
+			CopyLines(d, dst, src, count/nz, true, "range download");
+		else
+			return false;
+		d->Flush();
+		return true;
+	}
 	const float* src = (currents ? d->curr : d->volt) + offset;
 	if (count)
 		SYCL_Check("range download", [&] {d->Queue().memcpy(dst, src, count*sizeof(float));});
@@ -3434,7 +3622,7 @@ void GPU_Backend_SYCL::WaitSnapshot()
 bool GPU_Backend_SYCL::CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy)
 {
 	E_energy = H_energy = 0;
-	SYCL_GridDim L = {numNodes[0], numNodes[1], numNodes[2]};
+	SYCL_GridDim L = {numNodes[0], numNodes[1], numNodes[2], numNodes[2]};
 	if ((L.nx>d->dim.nx) || (L.ny>d->dim.ny) || (L.nz>d->dim.nz))
 		return false;
 	const size_t count = (size_t)L.ny*L.nz;

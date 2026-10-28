@@ -36,10 +36,12 @@
 #include "gpu_backend_sycl.h"
 #include "FDTD/gpu_coeff_sets.h"
 
-//! Grid size (number of mesh lines) as passed to the kernels
+//! Grid size (number of mesh lines) as passed to the kernels. nzd: the values stored per (x, y) line of the
+//! device layout, the z stride (OPENEMS_SYCL_ZPAD, see GPU_Backend_SYCL::Impl::dim); nz <= nzd, equal without
+//! padding. nx, ny, nz are the extents (bounds, last lines). A range of nodes (B, E, ...) does not use nzd.
 struct SYCL_GridDim
 {
-	unsigned int nx, ny, nz;
+	unsigned int nx, ny, nz, nzd;
 };
 
 //! The kernels index the fields with the index type I: 32 bit while the fields fit, else size_t,
@@ -47,12 +49,12 @@ struct SYCL_GridDim
 //! parameter, size_t by default.
 template<typename T> struct SYCL_NoDeduce { typedef T type; };
 
-//! Fields and coefficients use the ArrayNIJK layout of the host:
-//! index(n,x,y,z) = n*nx*ny*nz + x*ny*nz + y*nz + z
+//! Fields and coefficients use the ArrayNIJK layout of the host with the z stride nzd (OPENEMS_SYCL_ZPAD):
+//! index(n,x,y,z) = n*nx*ny*nzd + x*ny*nzd + y*nzd + z; the padded values z >= nz are zero and never read for a result
 template<typename I = size_t>
 inline I nijk(const SYCL_GridDim& N, unsigned int n, unsigned int x, unsigned int y, unsigned int z)
 {
-	return (((I)n*N.nx + x)*N.ny + y)*N.nz + z;
+	return (((I)n*N.nx + x)*N.ny + y)*N.nzd + z;
 }
 
 //! The raw values of a dump on the device, see Engine_GatherRegion: value e of component n is
@@ -195,10 +197,10 @@ inline float volt_update_at(unsigned int n, float old, const float* curr, const 
                             const float* cb, unsigned int mode, const SYCL_GridDim& N,
                             unsigned int x, unsigned int y, unsigned int z)
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	return volt_update_node<I, FACTOR>(n, old, curr, main_coeff<I, FACTOR>(index, ca, cb, mode, sn, i, 0, N, x, y, z), sn, i, xm, ym, zm);
 }
@@ -308,7 +310,22 @@ struct GPU_Backend_SYCL::Impl
 	std::shared_ptr<SYCL_Context> ctx;
 
 	SYCL_GridDim dim;
-	size_t numCells;    //!< nx*ny*nz, the field buffers hold 3*numCells values
+	size_t numCells;    //!< nx*ny*nz, the host count of cells
+	//! nx*ny*nzd, the cells of the device layout: the field buffers hold 3*numCellsD values, the full coefficient
+	//! arrays and the set index of the main updates too (OPENEMS_SYCL_ZPAD, see Init(); numCells without padding)
+	size_t numCellsD;
+	//! the device flat index of host flat index \a h (ArrayNIJK of the host, component included): the z lines
+	//! keep their order, each stored with the stride dim.nzd
+	size_t Dev(size_t h) const {return (h/dim.nz)*dim.nzd + h%dim.nz;}
+	//! \a host (\a count values in the host layout, whole z lines) in the device layout, the padding zero
+	template <typename T>
+	std::vector<T> Padded(const T* host, size_t count) const
+	{
+		std::vector<T> dev(count/dim.nz*dim.nzd, T(0));
+		for (size_t l=0; l<count/dim.nz; ++l)
+			std::copy(host + l*dim.nz, host + (l+1)*dim.nz, dev.begin() + l*dim.nzd);
+		return dev;
+	}
 
 	float *volt, *curr;
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_SYCL::CalcFastEnergy()
@@ -546,13 +563,21 @@ struct GPU_Backend_SYCL::Impl
 		}
 	}
 
-	//! Device buffer of the set indices of \a sets (16 or 32 bit)
-	void* AllocIndex(const GPU_CoeffSets& sets)
+	//! Device buffer of the set indices of \a sets (16 or 32 bit); \a padded: the index of the main updates,
+	//! one per node of the device layout (see numCellsD)
+	void* AllocIndex(const GPU_CoeffSets& sets, bool padded=false)
 	{
 		if (sets.mode==1)
 		{
 			std::vector<unsigned short> index16(sets.index.begin(), sets.index.end());
+			if (padded)
+				index16 = Padded(index16.data(), index16.size());
 			return Alloc<unsigned short>(index16.size(), index16.data());
+		}
+		if (padded)
+		{
+			const std::vector<unsigned int> index32 = Padded(sets.index.data(), sets.index.size());
+			return Alloc<unsigned int>(index32.size(), index32.data());
 		}
 		return Alloc<unsigned int>(sets.index.size(), sets.index.data());
 	}

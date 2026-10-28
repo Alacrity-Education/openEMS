@@ -172,6 +172,7 @@ void SYCL_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* co
 		flat[n] = (((size_t)dir[n]*d->dim.nx + index[0][n])*d->dim.ny + index[1][n])*d->dim.nz + index[2][n];
 		if (!edges.insert(flat[n]).second)
 			s.serial = true;
+		flat[n] = d->Dev(flat[n]);   // the device layout (OPENEMS_SYCL_ZPAD)
 	}
 	s.index = d->Alloc<size_t>(count, flat.data());
 	s.amp = d->Alloc<float>(count, amp);

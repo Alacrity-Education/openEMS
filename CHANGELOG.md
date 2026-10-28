@@ -87,6 +87,9 @@ there are unreleased changes. It becomes the next release entry.
   5757 with the rule. The tuner also times one window over all of x (the
   single step's work in graphs) and keeps it where it is at least 10 %
   faster than the best windowed candidate.
+- `OPENEMS_SYCL_ZPAD=M` stores the z lines of the SYCL backend's device
+  layout with a stride rounded up to a multiple of M (bit-identical); it is
+  off by default, as the padded runs were slower on the B580.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

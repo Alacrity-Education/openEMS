@@ -156,7 +156,7 @@ SYCL_Ext_DebyeMaterial::SYCL_Ext_DebyeMaterial(GPU_Backend_SYCL::Impl* impl, Ope
 	const size_t count = op_ext->m_LM_Count.at(0);
 	m_Param.count = count;
 	m_Param.poles = op_ext->m_PoleCount;
-	m_Param.sn = d->numCells;
+	m_Param.sn = d->numCellsD;
 	if (count==0)
 		return;
 
@@ -164,7 +164,12 @@ SYCL_Ext_DebyeMaterial::SYCL_Ext_DebyeMaterial(GPU_Backend_SYCL::Impl* impl, Ope
 	std::vector<size_t> flat(count);
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	m_Pos = d->Alloc<size_t>(count, flat.data());
+	{
+		std::vector<size_t> dev(count);
+		for (size_t i=0; i<count; ++i)
+			dev[i] = d->Dev(flat[i]);   // the device layout (OPENEMS_SYCL_ZPAD)
+		m_Pos = d->Alloc<size_t>(count, dev.data());
+	}
 	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_SYCL::Impl::MurRefusal()
 	// fused step (see update_fused): Apply2Voltages() changes the voltages of these nodes after the
 	// voltage update, the currents next to them are recomputed

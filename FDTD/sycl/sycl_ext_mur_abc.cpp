@@ -169,11 +169,14 @@ SYCL_Ext_Mur_ABC::SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mu
 
 	// fused step (see update_fused): Apply2Voltages() replaces the voltages of the boundary plane
 	// after the voltage update, the currents next to them are recomputed
+	// (flat indices of the host layout, as every extension registers them: not the padded one of OPENEMS_SYCL_ZPAD)
+	SYCL_GridDim host = d->dim;
+	host.nzd = host.nz;
 	for (unsigned int i=0; i<m_Param.ni; ++i)
 		for (unsigned int j=0; j<m_Param.nj; ++j)
 		{
-			d->volt_modified.push_back(mur_index(d->dim, m_Param, m_Param.nyP, m_Param.line, i, j));
-			d->volt_modified.push_back(mur_index(d->dim, m_Param, m_Param.nyPP, m_Param.line, i, j));
+			d->volt_modified.push_back(mur_index(host, m_Param, m_Param.nyP, m_Param.line, i, j));
+			d->volt_modified.push_back(mur_index(host, m_Param, m_Param.nyPP, m_Param.line, i, j));
 		}
 
 	// for the Mur mode: CreateExtension() logs this extension at the next position of ext_log

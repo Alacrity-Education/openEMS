@@ -128,7 +128,7 @@ struct ADEWindow { unsigned int x0, x1, y0, y1; SYCL_GridDim N; };
 
 inline bool ade_in_window(const ADEWindow& W, size_t p)
 {
-	const size_t line = p / W.N.nz;   // x*ny + y
+	const size_t line = p / W.N.nzd;   // x*ny + y
 	const unsigned int x = (unsigned int)(line / W.N.ny), y = (unsigned int)(line % W.N.ny);
 	return (x>=W.x0) && (x<W.x1) && (y>=W.y0) && (y<W.y1);
 }
@@ -486,8 +486,13 @@ void SYCL_Ext_LorentzMaterial::Setup(std::vector<ADEGroup>& groups, std::vector<
 	}
 	ADEGroup G;
 	G.count = count;
-	G.sn = d->numCells;
-	G.pos = d->Alloc<size_t>(count, flat.data());
+	G.sn = d->numCellsD;
+	{
+		std::vector<size_t> dev(count);
+		for (size_t i=0; i<count; ++i)
+			dev[i] = d->Dev(flat[i]);   // the device layout (OPENEMS_SYCL_ZPAD)
+		G.pos = d->Alloc<size_t>(count, dev.data());
+	}
 	d->ext_nodes.insert(d->ext_nodes.end(), flat.begin(), flat.end());   // see GPU_Backend_SYCL::Impl::MurRefusal()
 	G.orders = 1;
 	G.dirs = ord.dirs;
@@ -592,7 +597,7 @@ std::string SYCL_Ext_LorentzMaterial::SetupSheetPlanes(Operator_Ext_LorentzMater
 	A.ny = ny;
 	A.planes = planes;
 	A.cells = cells;
-	A.sn = d->numCells;
+	A.sn = d->numCellsD;
 	A.N = d->dim;
 	bytes = planes*sizeof(unsigned int) + cells + 3*slots*sizeof(float);
 

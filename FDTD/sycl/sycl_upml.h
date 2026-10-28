@@ -72,10 +72,10 @@ inline void upml_fused_volt_node(float* volt_out, const float* volt_in, const fl
                                  unsigned int x, unsigned int y, unsigned int z)
 {
 	const unsigned int gx = R.sx + x, gy = R.sy + y, gz = R.sz + z;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, gx, gy, gz);
-	const size_t xm = (gx>0) ? (size_t)N.ny*N.nz : 0;
-	const size_t ym = (gy>0) ? N.nz : 0;
+	const size_t xm = (gx>0) ? (size_t)N.ny*N.nzd : 0;
+	const size_t ym = (gy>0) ? N.nzd : 0;
 	const size_t zm = (gz>0) ? 1 : 0;
 	const SYCL_MainCoeffT<size_t, FACTOR> C = main_coeff<size_t, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
@@ -104,7 +104,7 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
                                  unsigned int x, unsigned int y, unsigned int z)
 {
 	const unsigned int gx = R.sx + x, gy = R.sy + y, gz = R.sz + z;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, gx, gy, gz);
 	const bool update = (gx+1<N.nx) && (gy+1<N.ny) && (gz+1<N.nz);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
@@ -113,8 +113,8 @@ inline void upml_fused_curr_node(float* curr_out, const float* curr_in, const fl
 	SYCL_MainCoeffT<size_t, FACTOR> C = {};
 	if (update)
 	{
-		const size_t xp = (size_t)N.ny*N.nz;
-		const size_t yp = N.nz;
+		const size_t xp = (size_t)N.ny*N.nzd;
+		const size_t yp = N.nzd;
 		C = main_coeff<size_t, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 6, N, gx, gy, gz);
 		curl[0] = (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
 		curl[1] = (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
@@ -146,10 +146,10 @@ inline void upml_volt_value(const float* __restrict__ volt, const float* __restr
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool write, float out[3])
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
-	const I xm = (gx>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (gy>0) ? N.nz : 0;
+	const I xm = (gx>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (gy>0) ? N.nzd : 0;
 	const I zm = (gz>0) ? 1 : 0;
 	const SYCL_MainCoeffT<I, FACTOR> C = main_coeff<I, FACTOR>(A.index, A.ca, A.cb, A.mode, sn, i, 0, N, gx, gy, gz);
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
@@ -183,7 +183,7 @@ inline void upml_curr_value(const float* __restrict__ curr_in, float* __restrict
                             const SYCL_GridDim& N, const UPMLRegion& R,
                             unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
 	const I l0 = ((I)(gx-R.sx)*R.ly + (gy-R.sy))*R.lz + (gz-R.sz);
 	const I cells = (I)R.lx*R.ly*R.lz;
