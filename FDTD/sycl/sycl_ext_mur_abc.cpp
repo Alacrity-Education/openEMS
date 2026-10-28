@@ -73,9 +73,10 @@ public:
 	SYCL_Ext_Mur_ABC(GPU_Backend_SYCL::Impl* impl, Operator_Ext_Mur_ABC* op_ext, Engine_Ext_Mur_ABC* eng_ext, Engine* eng);
 	virtual ~SYCL_Ext_Mur_ABC();
 
-	// The Mur mode (GPU_Backend_SYCL::Impl::mur_mode): 0 (and the timestep of the decision, which the
-	// first voltage update makes) pre, post and apply; 1 nothing here, the main update does it (mur_shell), the
-	// pre hook only tells it whether this plane is active in the timestep
+	// The Mur mode (GPU_Backend_SYCL::Impl::mur_mode): 0 pre, post and apply; 1 nothing here, the main update
+	// does it (mur_shell), the pre hook only tells it whether this plane is active in the timestep. The first
+	// voltage update decides the mode after its timestep's pre hooks: those run as mode 0 and their stored values
+	// go unused when the kernel takes the Mur planes
 	virtual void DoPreVoltageUpdates()
 	{
 		const bool active = IsActive();

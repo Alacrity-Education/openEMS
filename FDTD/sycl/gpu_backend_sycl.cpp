@@ -60,7 +60,9 @@
  * OPENEMS_SYCL_FUSED_STEP = unset (default) | 0 | 1
  *     The voltage and current updates fused into one pass; unset: on grids without UPML, Mur, absorbing sheets,
  *     TF/SF and dispersive materials; 1: on every Cartesian grid the extensions allow (with a fix-up of the
- *     currents next to the voltages the extensions change); 0: never.
+ *     currents next to the voltages the extensions change); 0: never. The windowed blocks (OPENEMS_SYCL_WINDOW)
+ *     run the separate kernels: where they apply, 1 does not fuse (auto keeps the fused step only where the
+ *     default policy takes it); OPENEMS_SYCL_WINDOW=0 lets 1 fuse every grid the extensions allow.
  * OPENEMS_SYCL_FUSED_XC, OPENEMS_SYCL_FUSED_TY, OPENEMS_SYCL_FUSED_TZ
  *     Development: the tile of the fused step (XC x lines per work-group, default 4; TY rows along y, 4, 8 or 16,
  *     default 8; TZ work-items along z, 16 or 32, default 32).
@@ -144,7 +146,8 @@ inline void update_voltages(const sycl::nd_item<3>& it, float* __restrict__ volt
                             const void* index, const float* ca, const float* cb, unsigned int mode,
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
 {
-	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each (no divergence)
+	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each of a two-dimensional
+	// work-group (no divergence; the rows of the compact layout share sub-groups)
 	unsigned int tz, ty;
 	main_thread(it, Z, tz, ty);
 	unsigned int z = B.nz + tz;
@@ -493,7 +496,8 @@ inline void update_currents(const sycl::nd_item<3>& it, float* __restrict__ curr
                             const void* index, const float* ca, const float* cb, unsigned int mode,
                             const SYCL_GridDim& N, const SYCL_GridDim& B, const SYCL_GridDim& E, const SYCL_ZSlabs& Z)
 {
-	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each (no divergence)
+	// with UPML regions along z: slab lo, main nodes and slab hi in whole sub-groups each of a two-dimensional
+	// work-group (no divergence; the rows of the compact layout share sub-groups)
 	unsigned int tz, ty;
 	main_thread(it, Z, tz, ty);
 	unsigned int z = B.nz + tz;
@@ -1162,7 +1166,8 @@ SYCL_Context::SYCL_Context(const sycl::device& dev)
 	  copy_q(*context, dev, [this](sycl::exception_list errors) {AsyncHandler(errors);}, sycl::property::queue::in_order())
 {
 	name = dev.get_info<sycl::info::device::name>();
-	// no sub-group operations in the kernels: the size only pads the UPML slabs (see MainRange())
+	// the size pads the UPML slabs (see MainRange()); the Mur z faces in the voltage update use sub-groups of
+	// mur_zf_sg (OPENEMS_SYCL_MUR_SG)
 	sub_group_size = 0;
 	for (size_t s : dev.get_info<sycl::info::device::sub_group_sizes>())
 		if ((s==32) || ((sub_group_size!=32) && (s>sub_group_size)))
@@ -1245,7 +1250,6 @@ GPU_Backend_SYCL::Impl::Impl()
 	memset(&mur, 0, sizeof(mur));
 	mur_dev = NULL;
 	memset(&mur_shell, 0, sizeof(mur_shell));
-	mur_shell_count = 0;
 	mur_released = false;
 	mur_zf_on = false;
 	memset(&mur_zf, 0, sizeof(mur_zf));
@@ -1263,7 +1267,7 @@ GPU_Backend_SYCL::Impl::Impl()
 	launches = 0;
 	window_graphs_on = false;
 	window_logged = false;
-	window_steps = window_blocks = window_chunks = window_block_launches = 0;
+	window_block_launches = 0;
 	tune_state = 0;
 	tune_chunks = 0;
 	tune_rule_T = tune_rule_W = 0;
@@ -1631,8 +1635,7 @@ void GPU_Backend_SYCL::Impl::DecideMurFused()
 			mur_mode = 1;
 		else if (verbose)
 		{
-			std::cout << "GPU_Backend_SYCL: Mur fused: 2 unavailable: " << reason << std::endl;
-			std::cout << "GPU_Backend_SYCL: Mur fused: 1 unavailable: " << reason << std::endl;
+			std::cout << "GPU_Backend_SYCL: Mur fused: 1 and 2 unavailable: " << reason << std::endl;
 		}
 	}
 	if (mur_mode==1)
@@ -1679,14 +1682,11 @@ void GPU_Backend_SYCL::Impl::DecideMurFused()
 		mur_shell.E = main_stop;
 		mur_shell.L.nx = l[0]; mur_shell.L.ny = l[1]; mur_shell.L.nz = l[2];
 		mur_shell.H.nx = h[0]; mur_shell.H.ny = h[1]; mur_shell.H.nz = h[2];
-		mur_shell_count = (size_t)(e[0]-b[0])*(e[1]-b[1])*(e[2]-b[2]) - inner;
 		const std::string reason = MurZFaceRefusal();
 		if (reason.empty())
 		{
 			// the z faces' interior moves to update_voltages_inner: mur_shell keeps its x- and y-face slabs
 			mur_zf_on = true;
-			mur_shell_count = (size_t)(e[0]-b[0] - (h[0]-l[0]))*(e[1]-b[1])*(e[2]-b[2])
-			                + (size_t)(h[0]-l[0])*(e[1]-b[1] - (h[1]-l[1]))*(e[2]-b[2]);
 		}
 		else if (verbose)
 			std::cout << "GPU_Backend_SYCL: Mur fused: 2 unavailable: " << reason << std::endl;
@@ -3276,9 +3276,7 @@ void GPU_Backend_SYCL::Impl::WindowRun(unsigned int start_ts, unsigned int n)
 		for (size_t k=0; k<X.size(); ++k)
 			X[k]->EndOfBlock(ts + L - 1);
 		ts += L;
-		++window_blocks;
 	}
-	window_steps += n;
 }
 
 double GPU_Backend_SYCL::Impl::WindowTimedRun(unsigned int start_ts, unsigned int n)
@@ -3558,7 +3556,6 @@ bool GPU_Backend_SYCL::IterateWindowed(unsigned int start_ts, unsigned int n)
 		return false;   // decided before the windowed blocks: the fields are in its double buffers
 	if (!d->WindowPrepare())
 		return false;
-	++d->window_chunks;
 	unsigned int tuned = 0;
 	if (d->tune_state>0)
 		tuned = d->WindowTune(start_ts, n);   // real timesteps: the candidates' blocks

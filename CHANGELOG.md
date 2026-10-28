@@ -43,9 +43,11 @@ there are unreleased changes. It becomes the next release entry.
   bit-identical results: the voltages of the Mur planes (the boundary line and
   the line next to it) are updated in one launch with their Mur values, beside
   the main update of the other nodes (two launches per timestep instead of one
-  plus three per plane). A grid where this does not apply (a Mur plane through
-  a UPML region, TF/SF, steady-state detection, or a material or lumped element
-  on a plane) runs the separate launches, which `--verbose=2` prints. On an
+  plus three per plane). A grid where this does not apply (the fused step, a
+  Mur plane through a UPML region or next to an unfused one, two planes on one
+  face, fewer than four lines between two planes, TF/SF, steady-state
+  detection, or a material, lumped element or sheet node on a plane) runs the
+  separate launches, which `--verbose=2` prints. On an
   Arc B580 a PCB model of 3.06 Mcells with Mur on all six faces settles at
   2384 MC/s instead of 2157 (+10.5 %).
   The interior of the two z faces is updated inside the main voltage update
@@ -89,7 +91,7 @@ there are unreleased changes. It becomes the next release entry.
   faster than the best windowed candidate.
 - The SYCL backend times the work-group of its separate main kernels on the
   live grid at the first timestep (`OPENEMS_SYCL_SHAPE=auto`, the default;
-  `0` the former 32x8, `TZxTY` forced); the results are bit-identical. On an
+  `0` the former work-group, `TZxTY` forced); the results are bit-identical. On an
   Arc B580 the PCB models take 16x16 or 16x8: a model of 28.7 Mcells runs at
   6349 MC/s instead of 5923, one of 3.06 Mcells at 6588 instead of 5980.
   The candidates include a compact layout (`cN`: one-dimensional work-groups

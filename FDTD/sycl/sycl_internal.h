@@ -381,13 +381,14 @@ struct GPU_Backend_SYCL::Impl
 	//! The Mur mode in use, -1 until DecideMurFused() (the first voltage update), which takes the highest one the grid
 	//! allows: 0 the three launches per Mur plane, 1 the Mur planes in the voltage update (update_voltages_inner and
 	//! mur_shell, see mur_volt_component), 2 as 1 with the interior of the z faces in update_voltages_inner
-	//! (mur_zface_lanes()); the Mur hooks of a timestep that started before the decision finish it as mode 0
+	//! (mur_zface_lanes()). The decision falls in the first voltage update, after that timestep's pre hooks ran
+	//! as mode 0 (their stored values go unused): the kernel of that update already applies the mode and the post
+	//! and apply hooks skip
 	int mur_mode;
 	std::vector<SYCL_MurPlane> mur_planes;
 	SYCL_MurFaces mur;                        //!< the planes of mode 1, active bits set by the Mur hooks
 	SYCL_MurFace* mur_dev;                    //!< device copy of mur.f (the kernel indexes it)
 	SYCL_MurShell mur_shell;                  //!< the nodes of the two kernels of mode 1
-	size_t mur_shell_count;                   //!< number of nodes of mur_shell
 	bool mur_released;                        //!< a Mur extension was deleted (host fallback): mode 0
 	bool mur_zf_on;                           //!< mode 1 with the z faces of Mur mode 2
 	SYCL_MurZFaces mur_zf;                    //!< the z planes of mode 2 (active bits set at the launch)
@@ -437,7 +438,6 @@ struct GPU_Backend_SYCL::Impl
 	std::map<std::vector<unsigned int>, WindowGraph> window_graphs;
 	bool window_graphs_on;          //!< not with OPENEMS_SYCL_KERNEL_TIMES, without graph support, or after a failed recording
 	bool window_logged;             //!< the schedule's line is printed (after the first chunk)
-	unsigned long long window_steps, window_blocks, window_chunks;
 	unsigned long long window_block_launches;   //!< the launches of the last block of T steps launched without a graph
 	//! where win_T, win_W come from, for the schedule's line: forced, rule, tuned, untuned
 	std::string win_source;
