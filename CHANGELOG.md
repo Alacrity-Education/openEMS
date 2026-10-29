@@ -39,6 +39,10 @@ there are unreleased changes. It becomes the next release entry.
   from 1-D tables, which shrinks the 59 MB table of a gerber2ems board
   mesh to 1.3 MB at a relative difference below 1e-5 of the peak field.
   `--verbose=2` prints the mode, the set count and the fused-step decision.
+- `OPENEMS_SYCL_CPU=1` makes the SYCL backend list the OpenCL CPU devices of
+  the oneAPI runtime after the Intel GPUs. Its kernels then run on the CPU,
+  far slower than the CPU engines, which tests the backend on a machine
+  without an Intel GPU (`python/Tests/GPU_Engine.py`, as the CI does).
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.

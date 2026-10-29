@@ -1090,7 +1090,9 @@ void* GPU_Backend_SYCL::Impl::UploadRegion(const Engine_GatherRegion& region, SY
 
 namespace
 {
-//! The Level Zero GPUs, found once; empty without a runtime or driver
+//! The Level Zero GPUs, found once; empty without a runtime or driver. With
+//! OPENEMS_SYCL_CPU=1 the OpenCL CPU devices follow them: the kernels then run on the CPU,
+//! far slower than the CPU engines, to test the backend on a machine without an Intel GPU.
 const std::vector<sycl::device>& Devices()
 {
 	// never freed: the SYCL runtime may be torn down before the static destructors run
@@ -1102,6 +1104,10 @@ const std::vector<sycl::device>& Devices()
 			for (const sycl::device& dev : sycl::device::get_devices(sycl::info::device_type::gpu))
 				if (dev.get_backend()==sycl::backend::ext_oneapi_level_zero)
 					list->push_back(dev);
+			if (getenv("OPENEMS_SYCL_CPU") && (atoi(getenv("OPENEMS_SYCL_CPU"))!=0))
+				for (const sycl::device& dev : sycl::device::get_devices(sycl::info::device_type::cpu))
+					if (dev.get_backend()==sycl::backend::opencl)
+						list->push_back(dev);
 		}
 		catch (...)
 		{
