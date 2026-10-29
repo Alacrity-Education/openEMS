@@ -56,6 +56,8 @@ recommended full-stack build.
 
 Required dependencies: CSXCAD, fparser, TinyXML, HDF5, zlib, Boost (≥ 1.46,
 components: thread, date\_time, serialization, chrono, program\_options).
+Optional, for the GPU engine: a HIP (ROCm) or CUDA compiler, Xcode (Metal) or
+the Intel oneAPI DPC++ compiler `icpx` (SYCL, Intel GPUs through Level Zero).
 
 ```bash
 mkdir build && cd build
@@ -119,6 +121,18 @@ After installation, follow the official tutorials to run your first simulation:
 - **Python tutorials:** https://docs.openems.de/en/latest/python/openEMS/Tutorials/index.html — also available locally in `python/Tutorials/`
 
 ---
+
+## GPU engine knobs
+
+The GPU engine (`--engine=gpu`) picks its code paths by itself; environment
+variables override the choices for comparisons and development, and
+`--verbose=2` prints what was decided. Every setting gives the same results
+unless its description says otherwise. The SYCL backend's knobs
+(`OPENEMS_SYCL_*`: the windowed blocks `WINDOW`; `SHAPE`, `ZPAD`, `FUSED_STEP`, `FUSED_TZ/TY/XC`,
+`FUSED_REGIONS`, `INDEX`, `UPML_FUSION`, `COEFF`, `MUR_SG`, `KERNEL_TIMES`) are
+listed with their defaults and measured effects at the top of
+`FDTD/sycl/gpu_backend_sycl.cpp`. The tuner of `OPENEMS_SYCL_WINDOW=auto`
+runs at the start of every run; `rule` or a forced `T,W` skip it.
 
 ## Testing
 

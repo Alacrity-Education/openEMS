@@ -16,15 +16,111 @@ there are unreleased changes. It becomes the next release entry.
 ### Added
 
 - **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
-  backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
-  is selected like the other engines, runs Cartesian and cylindrical meshes
-  (including multi-grid) with the usual extensions on the device, and writes
-  the same probes and dumps. Without a usable GPU the setup fails with an
-  error instead of running something slower. `--engine=gpu-reference` runs it
-  on a CPU reference backend, to check the device backends against. With
+  backend on macOS, a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs and a
+  SYCL backend for Intel GPUs (Level Zero). It is selected like the other
+  engines, runs Cartesian and cylindrical meshes (including multi-grid) with
+  the usual extensions on the device, and writes the same probes and dumps.
+  Without a usable GPU the setup fails with an error instead of running
+  something slower. `--engine=gpu-reference` runs it on a CPU reference
+  backend, to check the device backends against. With
   several GPUs it takes a discrete one before an integrated one, then the one
   with more memory; `--gpu-device=N` (`gpu_device=N`) picks device N of the
   list printed at `--verbose=1`.
+- The SYCL backend fuses the voltage and current updates into one pass
+  over the fields when that is faster: on grids without UPML, Mur ABC,
+  absorbing sheets, TF/SF or dispersive materials. `OPENEMS_SYCL_FUSED_STEP=1`
+  fuses them on every Cartesian grid (the extensions' corrections are
+  followed by a fix-up of the neighbouring currents, bit-identical to the
+  separate kernels but slower on those grids), `=0` never does.
+- `OPENEMS_SYCL_COEFF=sets|full|factor` selects how the SYCL backend stores
+  the update coefficients: deduplicated sets (the default, exact, falling
+  back to full arrays when there are too many), or `factor`, which keeps a
+  material factor per edge and rebuilds the geometry part in the kernel
+  from 1-D tables, which shrinks the 59 MB table of a gerber2ems board
+  mesh to 1.3 MB at a relative difference below 1e-5 of the peak field.
+  `--verbose=2` prints the mode, the set count and the fused-step decision.
+- The SYCL backend runs the Mur ABC inside the voltage update, with
+  bit-identical results: the voltages of the Mur planes (the boundary line and
+  the line next to it) are updated in one launch with their Mur values, beside
+  the main update of the other nodes (two launches per timestep instead of one
+  plus three per plane). A grid where this does not apply (the fused step, a
+  Mur plane through a UPML region or next to an unfused one, two planes on one
+  face, fewer than four lines between two planes, TF/SF, steady-state
+  detection, or a material, lumped element or sheet node on a plane) runs the
+  separate launches, which `--verbose=2` prints. On an
+  Arc B580 a PCB model of 3.06 Mcells with Mur on all six faces settles at
+  2384 MC/s instead of 2157 (+10.5 %).
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are neighbouring work-items
+  of one sub-group and exchange their values through sub-group shifts
+  (bit-identical; a grid with fewer than 6 z lines, no Mur plane on a z face,
+  or the two lines in different sub-groups keeps them in the shell launch).
+  On an Arc B580 the 3.06 Mcell model settles at 3095 MC/s with the z faces
+  in the kernel instead of 2384.
+- The SYCL backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, over the cells of the
+  sheets' bounding box instead of a position list. The results are
+  bit-identical; a sheet that does not fit (positions off the z planes, more
+  than 32 planes, orders on different positions) keeps the position list,
+  which `--verbose=2` prints. On an Arc B580 the single step does not gain
+  from it (a PCB model of 3.06 Mcells with four copper layers: 88 us per
+  sheet kernel and step either way, 3095 MC/s); the windowed blocks below
+  launch the sheets on the cells of a window only.
+- The SYCL backend can run the time stepping as windowed blocks inside the L2
+  cache (`OPENEMS_SYCL_WINDOW=rule` or `T,W`; off by default until the tuner
+  below): blocks of T timesteps marched along x in windows of W planes, each
+  kind of block recorded once as a SYCL command graph and replayed. The main
+  updates and every extension's launch are restricted to the planes a
+  half-step newly covers, and the voltage and current frontiers step back
+  one plane per timestep, so every cell is updated once per step from the
+  values the single step would give it: the results are bit-identical. TF/SF,
+  Debye materials, absorbing sheets, cylindrical coordinates, multi-grids and
+  Mur planes outside the voltage update keep the single step. On an Arc B580
+  a PCB model of 3.06 Mcells runs at 5757 MC/s with the rule's schedule
+  (T = 8, W = 39) instead of 3095.
+- The windowed blocks of the SYCL backend are on by default
+  (`OPENEMS_SYCL_WINDOW=auto`), with a tuner that times up to 13 (T, W)
+  candidates on the first timesteps of the run (real timesteps: every
+  candidate gives the same bits), refines the three best and keeps the
+  fastest; `rule` skips the tuner, `0` turns the windows off. auto keeps the
+  fused step on grids where the single step takes it. On an Arc B580 the PCB
+  model of 3.06 Mcells runs at 5971 MC/s tuned (T = 16, W = 39) instead of
+  5757 with the rule. The tuner also times one window over all of x (the
+  single step's work in graphs) and keeps it where it is at least 10 %
+  faster than the best windowed candidate.
+- The tuner of the SYCL backend's windowed blocks starts once the fields
+  fill the grid, times every candidate three times and counts the fastest,
+  times the three best again in turn, and gives a tie within 1 % to the
+  larger T, then the larger W. The B580 compresses the near-zero fields of
+  the first timesteps (a read of the fields runs 4.3x faster than one of
+  incompressible memory at timestep 0 on a PCB model of 28.7 Mcells, 1.1x
+  from timestep 5400 on), and the timed blocks of that state ranked the
+  candidates differently from the filled grid: T = 2, W = 19 and T = 4,
+  W = 13 timed within 0.5 % and ran at 5.42 and 4.32 ms a timestep, a single
+  slow sample flipped the choice between runs, and one window over all of x
+  timed fastest of all. A probe at the start of each chunk (the fields
+  against a 256 MB buffer of random mantissas; the rule's schedule until the
+  ratio is under 1.1 or stops falling, at most 12 chunks; fields under 64 MB
+  tune at once) starts the tune on the filled grid. On an Arc B580 the PCB
+  model now takes T = 8, W = 11 on both of two cards (7344 and 7335 MC/s
+  timed, samples within 0.3 % on an idle card) and runs its end-criterion
+  run at 4.05 ms a timestep instead of 5.42 and 4.32 (7170 MC/s settled
+  instead of 5310 and 6700); the model of 3.06 Mcells takes T = 16, W = 39
+  from timestep 2400 (18.4 s for 40000 timesteps instead of 19.0 with the
+  compressed state's T = 8). The results are bit-identical.
+- The SYCL backend times the work-group of its separate main kernels on the
+  live grid at the first timestep (`OPENEMS_SYCL_SHAPE=auto`, the default;
+  `0` the former work-group, `TZxTY` forced); the results are bit-identical. On an
+  Arc B580 the PCB models take 16x16 or 16x8: a model of 28.7 Mcells runs at
+  6349 MC/s instead of 5923, one of 3.06 Mcells at 6588 instead of 5980.
+  The candidates include a compact layout (`cN`: one-dimensional work-groups
+  over the rows of the z lines, so a line of 44 nodes takes 44 work-items),
+  which the B580 takes on both models: 6670 instead of 6345 and 6695
+  instead of 6478 MC/s.
+  `OPENEMS_SYCL_ZPAD=M` stores the z lines of the device layout with a stride
+  rounded up to a multiple of M (bit-identical as well); it is off by
+  default, as the padded runs were slower on the B580.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
@@ -127,6 +223,13 @@ there are unreleased changes. It becomes the next release entry.
   combine with MSVC: build all of openEMS with it, or only the plugin in a
   second build with `-DOPENEMS_GPU_BUILD_ID` of the first, as the Windows
   package does.
+- `ENABLE_SYCL` CMake option for the SYCL backend, on when the Intel oneAPI
+  DPC++ compiler `icpx` is found. Either build all of openEMS with it
+  (`-DCMAKE_CXX_COMPILER=icpx`, with `-ffp-model=precise -ffp-contract=off`
+  to keep the results of a GCC build), or keep the usual compiler and build
+  only the plugin `openEMS_gpu_sycl` with `OPENEMS_ICPX`. It is compiled for
+  the Intel Arc B-series (`OPENEMS_SYCL_AOT_DEVICES`, `ocloc` device names,
+  empty for SPIR-V only); other Intel GPUs compile the SPIR-V at start-up.
 - C++17 is now required (was C++11), e.g. GCC 8 or newer, also for the
   Python bindings and the GPU sources (HIP/CUDA, were C++14).
 - VTK is no longer needed: openEMS writes its VTK files (`.vtr`, `.vts`,

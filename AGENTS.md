@@ -64,9 +64,9 @@ current-side equivalents.
 - An extension that touches the engine's fields must work for every engine
   subclass, not just the basic one.
 - For the GPU engine that means a device implementation in every backend (HIP,
-  Metal): one extension without one moves all extensions to the host and copies
-  both fields every half-step, which makes GPU runs slow. A change to an
-  extension's update is made in the host, HIP and Metal versions alike;
+  Metal, SYCL): one extension without one moves all extensions to the host and
+  copies both fields every half-step, which makes GPU runs slow. A change to an
+  extension's update is made in the host, HIP, Metal and SYCL versions alike;
   `python/Tests/GPU_Engine.py` compares them with the CPU, but only on a
   machine with that GPU (CI has none).
 
