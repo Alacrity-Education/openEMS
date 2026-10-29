@@ -68,7 +68,8 @@ current-side equivalents.
   copies both fields every half-step, which makes GPU runs slow. A change to an
   extension's update is made in the host, HIP, Metal and SYCL versions alike;
   `python/Tests/GPU_Engine.py` compares them with the CPU, but only on a
-  machine with that GPU (CI has none).
+  machine with that GPU (CI has none; it runs the SYCL kernels on the CPU,
+  with `OPENEMS_SYCL_CPU=1`).
 
 Modifying `Operator`/`Engine` directly is for changes that genuinely belong to
 the core scheme, and those need discussion first.
