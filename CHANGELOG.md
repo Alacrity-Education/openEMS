@@ -89,6 +89,26 @@ there are unreleased changes. It becomes the next release entry.
   5757 with the rule. The tuner also times one window over all of x (the
   single step's work in graphs) and keeps it where it is at least 10 %
   faster than the best windowed candidate.
+- The tuner of the SYCL backend's windowed blocks starts once the fields
+  fill the grid, times every candidate three times and counts the fastest,
+  times the three best again in turn, and gives a tie within 1 % to the
+  larger T, then the larger W. The B580 compresses the near-zero fields of
+  the first timesteps (a read of the fields runs 4.3x faster than one of
+  incompressible memory at timestep 0 on a PCB model of 28.7 Mcells, 1.1x
+  from timestep 5400 on), and the timed blocks of that state ranked the
+  candidates differently from the filled grid: T = 2, W = 19 and T = 4,
+  W = 13 timed within 0.5 % and ran at 5.42 and 4.32 ms a timestep, a single
+  slow sample flipped the choice between runs, and one window over all of x
+  timed fastest of all. A probe at the start of each chunk (the fields
+  against a 256 MB buffer of random mantissas; the rule's schedule until the
+  ratio is under 1.1 or stops falling, at most 12 chunks; fields under 64 MB
+  tune at once) starts the tune on the filled grid. On an Arc B580 the PCB
+  model now takes T = 8, W = 11 on both of two cards (7344 and 7335 MC/s
+  timed, samples within 0.3 % on an idle card) and runs its end-criterion
+  run at 4.05 ms a timestep instead of 5.42 and 4.32 (7170 MC/s settled
+  instead of 5310 and 6700); the model of 3.06 Mcells takes T = 16, W = 39
+  from timestep 2400 (18.4 s for 40000 timesteps instead of 19.0 with the
+  compressed state's T = 8). The results are bit-identical.
 - The SYCL backend times the work-group of its separate main kernels on the
   live grid at the first timestep (`OPENEMS_SYCL_SHAPE=auto`, the default;
   `0` the former work-group, `TZxTY` forced); the results are bit-identical. On an
