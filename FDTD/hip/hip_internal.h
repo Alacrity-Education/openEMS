@@ -344,19 +344,33 @@ struct GPU_Backend_HIP::Impl
 	std::string win_source;
 	//! The tuner of auto (G7): candidates (T, W) timed on the live grid, on real timesteps (every candidate is
 	//! bit-identical, so the tune does not change the result); mcs < 0: not measured yet
-	struct WindowCandidate { unsigned int T, W; double mcs; };
+	//! mcs: the fastest timed pair's MC/s, mcs_lo: the slowest's (the spread of the samples)
+	struct WindowCandidate { unsigned int T, W; double mcs, mcs_lo; };
 	std::vector<WindowCandidate> tune_cands;
-	int tune_state;                 //!< 0 not tuning (forced, rule or done), 1 the candidate list, 2 the refinement
+	int tune_state;                 //!< 0 not tuning (forced, rule or done), 1 the candidate list, 2 the refinement, 3 the finalists
 	unsigned int tune_chunks;       //!< chunks the tune has run in so far
 	unsigned int tune_rule_T;       //!< T and W of the rule (HIP_WindowRuleTW()), the schedule while nothing is measured
 	unsigned int tune_rule_W;
 	unsigned long long tune_steps;  //!< timesteps the candidates ran (warm-up and timed blocks)
 	double tune_ms;                 //!< device time of the timed blocks
 	size_t tune_plane_bytes;        //!< plane bytes of the window rule (WindowPrepare())
+	std::vector<size_t> tune_final; //!< the finalists (indices into tune_cands), timed again in turn
+	unsigned int tune_final_round;  //!< the finalists' round and the position in it being timed
+	unsigned int tune_final_pos;
+	float* tune_probe_ref;          //!< the probe's reference buffer (incompressible values), freed when the tune starts
+	double tune_probe_ms;           //!< the fields' read time of the last probe
+	double tune_probe_ratio;        //!< the last probe's ratio: the fields' read speed over the reference's
+	unsigned int tune_defer_chunks; //!< chunks the tune waited for the fields to fill
+	bool tune_probe_done;           //!< the probe decided: the tune starts (no probe after that)
+	unsigned int tune_start_ts;     //!< the first timestep of the tune
+	//! The probe of the tune's start: true while the fields read faster than incompressible memory and the
+	//! read still slows down from chunk to chunk (a device that compresses the near-zero fields of the first
+	//! timesteps, and the timed blocks of that state rank the candidates differently from the filled grid)
+	bool WindowTuneDefer(unsigned int ts);
 	//! The tuner's candidate list; in WindowPrepare() for auto
 	void WindowTunePrepare();
-	//! Run the tuner's candidates that fit into the chunk [start_ts, start_ts+n), each one warm-up block and two
-	//! timed blocks of its T; returns the timesteps used, the rest of the chunk runs with the best (T, W) so far
+	//! Run the tuner's candidates that fit into the chunk [start_ts, start_ts+n), each one warm-up block and
+	//! HIP_TUNE_REPEATS timed pairs of blocks of its T (the fastest counts), then the finalists in turn; returns the timesteps used, the rest of the chunk runs with the best (T, W) so far
 	unsigned int WindowTune(unsigned int start_ts, unsigned int n);
 	//! The end of the tune: the best measured candidate (or the rule), logged
 	void WindowTuneFinish(bool complete);

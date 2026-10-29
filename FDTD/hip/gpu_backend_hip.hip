@@ -27,10 +27,14 @@
  *     block captured once as a graph and replayed; the voltage and current frontiers step back one plane per step,
  *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where that leaves fewer
  *     than T planes a window, T = 4, then 2: on a small L2 the halo of T = 8 alone takes most of it), then the
- *     tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of all x planes) and
- *     refines the three best windowed ones with W -/+25 % on the first timesteps of the run (real timesteps: every
- *     candidate is bit-identical) and keeps the fastest, one window only if 10 % faster than the best windowed one;
- *     every run tunes. rule: the rule without the tuner.
+ *     tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of all x planes),
+ *     refines the three best windowed ones with W -/+25 % and times the three best again in turn (real timesteps:
+ *     every candidate is bit-identical; three timed pairs of blocks a candidate, the fastest counts), and keeps the
+ *     fastest, a tie within 1 % the larger T then W, one window only if 10 % faster than the best windowed one; every
+ *     run tunes. The tune starts once the fields fill the grid: the rule's schedule runs while a read of the fields
+ *     is faster than one of incompressible memory and still slows down from chunk to chunk (a GPU that compresses
+ *     near-zero fields; a probe at the start of each chunk, at most 12 chunks; fields under 64 MB tune at once).
+ *     rule: the rule without the tuner.
  *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
  *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
  *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
@@ -940,6 +944,14 @@ GPU_Backend_HIP::Impl::Impl()
 	tune_steps = 0;
 	tune_ms = 0;
 	tune_plane_bytes = 0;
+	tune_final_round = 0;
+	tune_final_pos = 0;
+	tune_probe_ref = NULL;
+	tune_probe_ms = 0;
+	tune_probe_ratio = 0;
+	tune_defer_chunks = 0;
+	tune_probe_done = false;
+	tune_start_ts = 0;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -2367,13 +2379,145 @@ float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int 
 }
 
 // The tuner of OPENEMS_HIP_WINDOW=auto: a short list of (T, W) candidates, each timed on the live grid with one warm-up
-// block (which captures its graphs) and two timed blocks of its T (WindowTimedRun()), the three best refined once with
-// W -25 % and +25 %, the best measured one runs from then on. The candidates run real timesteps, in the chunks the
-// engine hands over: every schedule is bit-identical to the single step (the frontiers of WindowFrontiers()), so the
-// tune does not change the result and costs only the slower candidates' time; nothing is copied or restored.
+// block (which captures its graphs) and HIP_TUNE_REPEATS timed pairs of blocks of its T (WindowTimedRun(); the fastest
+// pair counts, as interference only adds time), the three best refined once with W -25 % and +25 %, then the three best
+// timed again in turn (HIP_TUNE_FINAL_ROUNDS rounds, against a drift of the device between the candidates' turns), the
+// best measured one runs from then on; a near tie (HIP_TUNE_TIE) goes to the larger T, then the larger W. The
+// candidates run real timesteps, in the chunks the engine hands over: every schedule is bit-identical to the single
+// step (the frontiers of WindowFrontiers()), so the tune does not change the result and costs only the slower
+// candidates' time; nothing is copied or restored. The tune starts once the fields fill the grid (WindowTuneDefer()).
 static const unsigned int HIP_TUNE_MAX_CANDIDATES = 13;   // the first list (the refinement adds up to 6)
 static const unsigned int HIP_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
+static const unsigned int HIP_TUNE_REPEATS = 3;           // timed pairs of blocks per candidate
+static const unsigned int HIP_TUNE_FINALISTS = 3;         // the best candidates timed again in turn
+static const unsigned int HIP_TUNE_FINAL_ROUNDS = 2;      // rounds of the finalists, HIP_TUNE_FINAL_PAIRS pairs each
+static const unsigned int HIP_TUNE_FINAL_PAIRS = 2;
+static const double HIP_TUNE_TIE = 0.01;                  // within this of the best: the larger T, then the larger W
+// the probe of the tune's start (WindowTuneDefer()): a buffer of incompressible values of this size against the fields
+static const size_t HIP_TUNE_PROBE_FLOATS = (size_t)64<<20;
+static const double HIP_TUNE_PROBE_RATIO = 1.10;          // the fields read this much faster than the buffer: compressed
+static const double HIP_TUNE_PROBE_GROWTH = 0.02;         // the read slowed down less than this since the last probe: filled
+static const unsigned int HIP_TUNE_MAX_DEFER_CHUNKS = 12; // the tune starts after these chunks at the latest
 static const double HIP_TUNE_ONE_WINDOW_MARGIN = 1.10;  // one window over all of x must be this much faster (WindowTuneFinish())
+
+// The probe of the tune's start (WindowTuneDefer()): the sum of n floats in fours, kept only when it equals a
+// sentinel, so that the loads stay; the threads stride over the buffer
+__global__ void tune_probe_read(const float* p, size_t n, float* out)
+{
+	const size_t threads = (size_t)gridDim.x*blockDim.x;
+	float s = 0;
+	for (size_t i=4*((size_t)blockIdx.x*blockDim.x + threadIdx.x); i+3<n; i+=4*threads)
+		s += p[i] + p[i+1] + p[i+2] + p[i+3];
+	if (s==-1.2345e38f)
+		out[0] = s;
+}
+
+// the reference buffer of the probe: a random mantissa in [1, 2) per value (incompressible)
+__global__ void tune_probe_fill(float* p, size_t n)
+{
+	const size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+	if (i>=n)
+		return;
+	unsigned int h = (unsigned int)i*2654435761u;
+	h ^= h>>15;
+	h *= 0x846ca68bu;
+	h ^= h>>16;
+	p[i] = __uint_as_float((h & 0x007FFFFFu) | 0x3F800000u);
+}
+
+bool GPU_Backend_HIP::Impl::WindowTuneDefer(unsigned int ts)
+{
+	// A GPU that compresses the near-zero fields of the first timesteps (the Arc B580: a PCB model of 28.7 Mcells
+	// starts at 7200 MC/s and settles at 5300 after 6000 timesteps) times the candidates in a state that ranks
+	// them differently from the filled grid. So the tune waits, with the rule's schedule, while a read of the
+	// fields runs faster than one of the reference buffer and the read still slows down from chunk to chunk; at
+	// most HIP_TUNE_MAX_DEFER_CHUNKS chunks (a grid that stays partly zero). Without room for the reference the
+	// tune starts at once.
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (tune_probe_done)
+		return false;
+	if (tune_defer_chunks>=HIP_TUNE_MAX_DEFER_CHUNKS)
+	{
+		Free(tune_probe_ref);
+		tune_probe_ref = NULL;
+		tune_probe_done = true;
+		return false;
+	}
+	const size_t nr = HIP_TUNE_PROBE_FLOATS;
+	const size_t nf = 3*numCellsD;
+	if (2*nf<nr/4)
+	{
+		// fields of less than a quarter of the reference (64 MB): their read is too short against the launch to
+		// compare, and the tune on the first timesteps costs little there
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: the fields are smaller than the probe's reference, the tune starts at timestep " << ts << std::endl;
+		tune_probe_done = true;
+		return false;
+	}
+	if (tune_probe_ref==NULL)
+	{
+		tune_probe_ref = TryAlloc<float>(nr + 4);
+		if (tune_probe_ref==NULL)
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: no device memory for the probe's reference, the tune starts at timestep " << ts << std::endl;
+			tune_probe_done = true;
+			return false;
+		}
+		HIP_Launch(this, "tune_probe_fill", tune_probe_fill, nr, 1, 1, tune_probe_ref, nr);
+	}
+	// the fields (voltages and currents) and the reference in turn, the fastest of three each (the host clock
+	// between two synchronizations)
+	const float* ref = tune_probe_ref;
+	float* out = tune_probe_ref + nr;
+	const size_t threads = (size_t)1<<18;
+	double ms_fields = -1, ms_ref = -1;
+	for (unsigned int r=0; r<3; ++r)
+	{
+		Flush();
+		std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, (const float*)volt, nf, out);
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, (const float*)curr, nf, out);
+		Flush();
+		const double mf = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		t0 = std::chrono::steady_clock::now();
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, ref, nr, out);
+		Flush();
+		const double mr = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if ((ms_fields<0) || (mf<ms_fields))
+			ms_fields = mf;
+		if ((ms_ref<0) || (mr<ms_ref))
+			ms_ref = mr;
+	}
+	if ((ms_fields<=0) || (ms_ref<=0))
+		return false;
+	const double fields_gbs = 2.0*nf*sizeof(float)/(ms_fields*1e6);
+	const double ref_gbs = (double)nr*sizeof(float)/(ms_ref*1e6);
+	const double ratio = fields_gbs/ref_gbs;
+	const double growth = (tune_probe_ms>0) ? ms_fields/tune_probe_ms - 1.0 : 1.0;
+	const bool wait = (ratio>HIP_TUNE_PROBE_RATIO) && (growth>HIP_TUNE_PROBE_GROWTH);
+	tune_probe_ms = ms_fields;
+	tune_probe_ratio = ratio;
+	if (verbose)
+	{
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: probe at timestep " << ts << ": the fields read at " << std::fixed << std::setprecision(0)
+		     << fields_gbs << " GB/s, the reference at " << ref_gbs << " GB/s (" << std::setprecision(2) << ratio << "x";
+		if (tune_defer_chunks>0)
+			line << ", the read " << std::setprecision(1) << growth*100 << " % slower than at the last probe";
+		line << "): the tune " << (wait ? "waits (the rule's schedule)" : "starts");
+		std::cout << line.str() << std::endl;
+	}
+	if (wait)
+	{
+		++tune_defer_chunks;
+		return true;
+	}
+	Free(tune_probe_ref);
+	tune_probe_ref = NULL;
+	tune_probe_done = true;
+	return false;
+}
 
 void GPU_Backend_HIP::Impl::WindowTunePrepare()
 {
@@ -2389,7 +2533,7 @@ void GPU_Backend_HIP::Impl::WindowTunePrepare()
 				return;
 		if (tune_cands.size()<HIP_TUNE_MAX_CANDIDATES)
 		{
-			WindowCandidate c = {T, W, -1};
+			WindowCandidate c = {T, W, -1, -1};
 			tune_cands.push_back(c);
 		}
 	};
@@ -2404,13 +2548,19 @@ void GPU_Backend_HIP::Impl::WindowTunePrepare()
 			add(Ts[t], HIP_WindowRule(l2_bytes, tune_plane_bytes, Ts[t], dim.nx, coeff_table_bytes, margins[m], Ts[t] + 1));
 	unsigned int steps = 0;
 	for (size_t k=0; k<tune_cands.size(); ++k)
-		steps += 3*tune_cands[k].T;
+		steps += (1 + 2*HIP_TUNE_REPEATS)*tune_cands[k].T;
+	tune_final.clear();
+	tune_final_round = tune_final_pos = 0;
+	tune_defer_chunks = 0;
+	tune_probe_done = false;
+	tune_probe_ms = tune_probe_ratio = 0;
+	tune_start_ts = 0;
 	tune_state = 1;
 	win_source = "untuned";
 	if (verbose)
-		std::cout << "GPU_Backend_HIP: window: tuning on the first " << steps << " timesteps (" << tune_cands.size()
-		          << " candidates of a warm-up and two timed blocks, then the three best with W -/+25 %; real timesteps, each"
-		          << " candidate bit-identical)" << std::endl;
+		std::cout << "GPU_Backend_HIP: window: tuning on " << steps << " timesteps once the fields fill the grid (" << tune_cands.size()
+		          << " candidates of a warm-up block and " << HIP_TUNE_REPEATS << " timed pairs of blocks, then the three best with W -/+25 %,"
+		          << " then the three best " << HIP_TUNE_FINAL_ROUNDS << " more rounds in turn; real timesteps, each candidate bit-identical)" << std::endl;
 }
 
 void GPU_Backend_HIP::Impl::WindowDropGraphs(unsigned int keep_W)
@@ -2428,9 +2578,66 @@ void GPU_Backend_HIP::Impl::WindowDropGraphs(unsigned int keep_W)
 unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned int n)
 {
 	unsigned int used = 0;
+	bool timed_any = false;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		timed_any = timed_any || (tune_cands[k].mcs>=0);
+	if ((tune_state==1) && !timed_any && !tune_probe_done && WindowTuneDefer(start_ts))
+	{
+		// the fields still fill the grid: this chunk runs the rule's schedule
+		win_T = tune_rule_T;
+		win_W = tune_rule_W;
+		WindowDropGraphs(win_W);
+		return 0;
+	}
+	if (!timed_any)
+		tune_start_ts = start_ts;
 	++tune_chunks;
+	// one candidate: a warm-up block of its T (captures the graphs of its W), then timed pairs of blocks; the fastest
+	// pair counts (the host's interference only adds time), the slowest is kept for the spread
+	auto time_candidate = [&](WindowCandidate& c, unsigned int pairs)
+	{
+		win_T = c.T;
+		win_W = c.W;
+		WindowRun(start_ts + used, c.T);
+		used += c.T;
+		tune_steps += c.T;
+		for (unsigned int p=0; p<pairs; ++p)
+		{
+			const float ms = WindowTimedRun(start_ts + used, 2*c.T);
+			const double mcs = (ms>0) ? (double)numCells*2.0*c.T/((double)ms*1e3) : 0;
+			if ((c.mcs<0) || (mcs>c.mcs))
+				c.mcs = mcs;
+			if ((c.mcs_lo<0) || (mcs<c.mcs_lo))
+				c.mcs_lo = mcs;
+			tune_ms += ms;
+			tune_steps += 2*c.T;
+			used += 2*c.T;
+		}
+		WindowDropGraphs(UINT_MAX);   // at most 32 graphs: the next candidate starts empty
+	};
 	while (tune_state>0)
 	{
+		if (tune_state==3)
+		{
+			// the finalists' rounds, in turn
+			while (tune_final_round<HIP_TUNE_FINAL_ROUNDS)
+			{
+				if (tune_final_pos>=tune_final.size())
+				{
+					++tune_final_round;
+					tune_final_pos = 0;
+					continue;
+				}
+				WindowCandidate& c = tune_cands[tune_final[tune_final_pos]];
+				if ((1 + 2*HIP_TUNE_FINAL_PAIRS)*c.T>n-used)
+					break;   // the rest of the chunk is too short: the next chunk continues
+				time_candidate(c, HIP_TUNE_FINAL_PAIRS);
+				++tune_final_pos;
+			}
+			if (tune_final_round>=HIP_TUNE_FINAL_ROUNDS)
+				WindowTuneFinish(true);
+			break;
+		}
 		// the first candidate not measured yet that fits into the rest of the chunk
 		int next = -1;
 		bool pending = false;
@@ -2438,7 +2645,7 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 			if (tune_cands[k].mcs<0)
 			{
 				pending = true;
-				if (3*tune_cands[k].T<=n-used)
+				if ((1 + 2*HIP_TUNE_REPEATS)*tune_cands[k].T<=n-used)
 				{
 					next = (int)k;
 					break;
@@ -2448,8 +2655,16 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 		{
 			if (tune_state==2)
 			{
-				WindowTuneFinish(true);
-				break;
+				// the finalists: the best measured, timed again in turn
+				std::vector<size_t> order(tune_cands.size());
+				for (size_t k=0; k<order.size(); ++k)
+					order[k] = k;
+				std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {return tune_cands[a].mcs>tune_cands[b].mcs;});
+				tune_final.assign(order.begin(), order.begin() + std::min((size_t)HIP_TUNE_FINALISTS, order.size()));
+				tune_final_round = 0;
+				tune_final_pos = 0;
+				tune_state = 3;
+				continue;
 			}
 			// the refinement: the three best measured, each with W -25 % and +25 % (at least one plane apart)
 			std::vector<WindowCandidate> best = tune_cands;
@@ -2472,7 +2687,7 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 						known = known || ((tune_cands[m].T==best[k].T) && (tune_cands[m].W==ws[j]));
 					if (!known)
 					{
-						WindowCandidate c = {best[k].T, ws[j], -1};
+						WindowCandidate c = {best[k].T, ws[j], -1, -1};
 						tune_cands.push_back(c);
 					}
 				}
@@ -2481,16 +2696,7 @@ unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned i
 		}
 		if (next<0)
 			break;   // the rest of the chunk is too short for the next candidate
-		WindowCandidate& c = tune_cands[next];
-		win_T = c.T;
-		win_W = c.W;
-		WindowRun(start_ts + used, c.T);   // warm-up: captures the graphs of this W
-		const float ms = WindowTimedRun(start_ts + used + c.T, 2*c.T);
-		c.mcs = (ms>0) ? (double)numCells*2.0*c.T/((double)ms*1e3) : 0;
-		tune_ms += ms;
-		tune_steps += 3*c.T;
-		used += 3*c.T;
-		WindowDropGraphs(UINT_MAX);   // at most 32 graphs: the next candidate starts empty
+		time_candidate(tune_cands[next], HIP_TUNE_REPEATS);
 	}
 	if ((tune_state>0) && (tune_chunks>=HIP_TUNE_MAX_CHUNKS))
 		WindowTuneFinish(false);
@@ -2516,6 +2722,8 @@ void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
 {
 	const bool verbose = g_settings.GetVerboseLevel()>1;
 	tune_state = 0;
+	Free(tune_probe_ref);
+	tune_probe_ref = NULL;
 	int best = -1;
 	unsigned int measured = 0;
 	for (size_t k=0; k<tune_cands.size(); ++k)
@@ -2535,24 +2743,32 @@ void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
 		if (verbose)
 		{
 			std::cout << "GPU_Backend_HIP: window: not tuned, the first " << tune_chunks << " chunks were too short for the "
-			          << 3*win_T << " timesteps of the rule's candidate (" << measured << " of " << tune_cands.size()
+			          << (1 + 2*HIP_TUNE_REPEATS)*win_T << " timesteps of the rule's candidate (" << measured << " of " << tune_cands.size()
 			          << " candidates timed): the rule, T=" << win_T << " W=" << win_W << std::endl;
 		}
 		WindowDropGraphs(win_W);
 		return;
 	}
+	// the best windowed candidate: a near tie (HIP_TUNE_TIE) goes to the larger T (fewer blocks a timestep), then
+	// the larger W (fewer windows at the same T), the same bits either way
+	int windowed = -1;
+	double top = -1;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		if ((tune_cands[k].mcs>=0) && (tune_cands[k].W<dim.nx))
+			top = std::max(top, tune_cands[k].mcs);
+	for (size_t k=0; k<tune_cands.size(); ++k)
+	{
+		const WindowCandidate& c = tune_cands[k];
+		if ((c.mcs<0) || (c.W>=dim.nx) || (c.mcs<(1.0 - HIP_TUNE_TIE)*top))
+			continue;
+		if ((windowed<0) || (c.T>tune_cands[windowed].T) || ((c.T==tune_cands[windowed].T) && (c.W>tune_cands[windowed].W)))
+			windowed = (int)k;
+	}
 	// one window over all of x only when it beats the best windowed candidate clearly: where the timed blocks
 	// barely discriminate (an Arc B580 through chipStar: 6180 against 6088 MC/s timed, 1343 against 2146 run) a near
 	// tie must not drop the run to the single step's work; on an H100 and an A100 it wins by 20 and 28 %
-	if (tune_cands[best].W>=dim.nx)
-	{
-		int windowed = -1;
-		for (size_t k=0; k<tune_cands.size(); ++k)
-			if ((tune_cands[k].mcs>=0) && (tune_cands[k].W<dim.nx) && ((windowed<0) || (tune_cands[k].mcs>tune_cands[windowed].mcs)))
-				windowed = (int)k;
-		if ((windowed>=0) && (tune_cands[best].mcs<HIP_TUNE_ONE_WINDOW_MARGIN*tune_cands[windowed].mcs))
-			best = windowed;
-	}
+	if ((windowed>=0) && ((tune_cands[best].W<dim.nx) || (tune_cands[best].mcs<HIP_TUNE_ONE_WINDOW_MARGIN*tune_cands[windowed].mcs)))
+		best = windowed;
 	win_T = tune_cands[best].T;
 	win_W = tune_cands[best].W;
 	win_source = "tuned";
@@ -2567,15 +2783,23 @@ void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
 		{
 			line << (k ? "; " : " ") << tune_cands[k].T << "," << tune_cands[k].W << " ";
 			if (tune_cands[k].mcs>=0)
+			{
+				// the slowest and the fastest sample
+				if (tune_cands[k].mcs_lo<tune_cands[k].mcs)
+					line << tune_cands[k].mcs_lo << "..";
 				line << tune_cands[k].mcs;
+			}
 			else
 				line << "-";
 		}
 		line << ")";
 		std::cout << line.str() << std::endl;
 		std::ostringstream cost;
-		cost << "GPU_Backend_HIP: window: the tune ran " << tune_steps << " timesteps in " << tune_chunks << " chunk"
-		     << (tune_chunks>1 ? "s" : "") << " (" << measured << " of " << tune_cands.size() << " candidates, timed blocks "
+		cost << "GPU_Backend_HIP: window: the tune ran " << tune_steps << " timesteps from timestep " << tune_start_ts << " in "
+		     << tune_chunks << " chunk" << (tune_chunks>1 ? "s" : "");
+		if (tune_defer_chunks>0)
+			cost << " after " << tune_defer_chunks << " chunk" << (tune_defer_chunks>1 ? "s" : "") << " of the rule's schedule while the fields filled the grid";
+		cost << " (" << measured << " of " << tune_cands.size() << " candidates, timed blocks "
 		     << std::fixed << std::setprecision(1) << tune_ms << " ms)" << (complete ? "" : ", stopped: the chunks were too short for the rest");
 		std::cout << cost.str() << std::endl;
 	}

@@ -101,6 +101,26 @@ there are unreleased changes. It becomes the next release entry.
   its kernel and one window covers the grid (no L2 gain there). The
   environment knobs of the HIP backend are listed with their defaults and
   measured effects at the top of `FDTD/hip/gpu_backend_hip.hip`.
+- The tuner of the HIP backend's windowed blocks starts once the fields
+  fill the grid, times every candidate three times and counts the fastest,
+  times the three best again in turn, and gives a tie within 1 % to the
+  larger T, then the larger W, as the SYCL backend's. A probe at the start
+  of each chunk reads the fields and a 256 MB buffer of random mantissas
+  with the same kernel; the rule's schedule runs while the fields read more
+  than 10 % faster than the buffer and the read still slows down by more
+  than 2 % from probe to probe, at most 12 chunks; fields under 64 MB tune
+  at once. A GPU that compresses the near-zero fields of the first
+  timesteps times the candidates in a state that ranks them differently
+  from the filled grid: through chipStar on an Arc B580 the probe reads a
+  model of 3.06 Mcells at 3.2x at timestep 0 and starts the tune at
+  timestep 2400, as the SYCL backend does on that GPU. NVIDIA GPUs do not
+  compress (0.8x to 1.07x at timestep 0) and tune at once: on an H100 a
+  PCB model of 28.7 Mcells keeps one window over all of x and its speed
+  (17,430 MC/s, three runs on three GPUs at once, the timed figure 2 %
+  above the settled speed); on two RTX 5080s held at a 250 W power cap
+  each card repeats its own pick (T = 16 with W = 27 on one, 34 on the
+  other, 3 of 3 runs each), the faster of the two on that card. The
+  results are bit-identical.
 
 ### Fixed
 
