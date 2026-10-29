@@ -4,6 +4,12 @@
 # passes the OPENEMS_* variables below and installs the plugin).
 IF(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   cmake_minimum_required(VERSION 3.1...3.10)
+  # the GCC of libopenEMS (see below) for project() too, whose compiler identification
+  # and check take CXXFLAGS: the GCC icpx picks by itself, the newest, need not have
+  # C++ headers, and icpx would not be recognized (no -fPIC) or fail the check
+  IF(OPENEMS_GCC_INSTALL_DIR)
+    set(ENV{CXXFLAGS} "$ENV{CXXFLAGS} --gcc-install-dir=${OPENEMS_GCC_INSTALL_DIR}")
+  ENDIF()
   project(openEMS_gpu_sycl CXX)
   set(CMAKE_CXX_STANDARD 17)
   set(_sycl_standalone ON)
