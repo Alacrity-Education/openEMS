@@ -15,6 +15,62 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/*
+ * Environment knobs of the HIP backend (read once when a grid is set up; --verbose=2 prints the decisions).
+ * Every knob changes how the backend computes, never what: unless a knob says otherwise its settings are
+ * bit-identical to each other. Speeds are from an RTX 5090: "PCB" is a PCB model of 28.7 Mcells (921 x 708 x
+ * 44, Mur on six faces, four copper sheet planes), "small PCB" a model of 3.06 Mcells (337 x 227 x 40, Mur,
+ * four sheet planes).
+ *
+ * OPENEMS_HIP_WINDOW = auto (default) | 0 | rule | T,W[,B]
+ *     The timesteps as blocks of T steps marched along x in windows of W x planes that stay in the L2 cache, each
+ *     block captured once as a graph and replayed; the voltage and current frontiers step back one plane per step,
+ *     so the halo is T+1 planes. auto: the rule (T = 8, W = 0.65 L2 / plane bytes - (T+1); where that leaves fewer
+ *     than T planes a window, T = 4, then 2: on a small L2 the halo of T = 8 alone takes most of it), then the
+ *     tuner times up to 13 (T, W) candidates (T 2 to 16, 0.45 to 0.85 of L2, and one window of all x planes),
+ *     refines the three best windowed ones with W -/+25 % and times the three best again in turn (real timesteps:
+ *     every candidate is bit-identical; three timed pairs of blocks a candidate, the fastest counts), and keeps the
+ *     fastest, a tie within 1 % the larger T then W, one window only if 10 % faster than the best windowed one; every
+ *     run tunes. The tune starts once the fields fill the grid: the rule's schedule runs while a read of the fields
+ *     is faster than one of incompressible memory and still slows down from chunk to chunk (a GPU that compresses
+ *     near-zero fields; a probe at the start of each chunk, at most 12 chunks; fields under 64 MB tune at once).
+ *     rule: the rule without the tuner.
+ *     0: one timestep at a time. T,W: forced (W may be NX; B is accepted and unused). Grids with TF/SF, Debye,
+ *     absorbing sheets, cylinder coordinates, multi-grids or Mur planes outside the voltage update keep the single
+ *     step; auto also keeps the fused step on grids where it folds the UPML regions into its kernel and one window
+ *     covers all of x (bench pml S: 23839 MC/s fused against 19406 windowed). PCB: 22944 MC/s at T 8, W 34 (the
+ *     rule's window while its halo was 2T+1) against 13877 single-step (+65 %); small PCB: 21806 against 13901
+ *     (+57 %), tuned (T 16, W 193) 23906 against 21870 with that rule (+9.3 %).
+ * OPENEMS_HIP_ZPAD = auto (default) | 0
+ *     The z stride of the device layout rounded up to 64, so that every z line starts on the same alignment. auto: on
+ *     grids where the fused step is blocked, unless that more than doubles the z lines or the padded fields and
+ *     coefficients would take more than half of the free device memory; 0: off.
+ * OPENEMS_HIP_SHAPE = auto (default) | 0 | cN | TZxTY
+ *     The thread block of the separate main kernels: auto times candidates on the live grid at the first timestep;
+ *     a candidate within 0.5 % of the fastest ties with it, and a tie goes to the first listed, 32x8 (on the PCB,
+ *     32x8, 64x4 and 32x4 tie within 0.03 % there, while inside the windowed blocks 32x8 is 1.8 to 2.6 % faster).
+ *     0 the former block, cN (N a multiple of 64) or TZxTY forced (at most 256 threads). The candidates TZxTY take
+ *     TZ threads along z and TY rows; cN (c128, c256), the compact layout, runs the y rows of the z lines one after
+ *     the other in blocks of N threads, so a z line of 44 nodes takes 44 lanes instead of two warps: the PCB single
+ *     step on an H100 16912 MC/s instead of 15610 (c128), on an A100 11102 instead of 10741 (c256). ZPAD and SHAPE
+ *     together: small PCB 10226 to 11572 MC/s (+13 %), the PCB 12822 to 13877 (+8.2 %).
+ * OPENEMS_HIP_INDEX = 32 | 64
+ *     The index width of the fused step; default 32 on NVIDIA where the grid fits (V100: 64 registers against 126,
+ *     half the occupancy with 64), 64 on AMD.
+ * OPENEMS_HIP_FUSED_STEP = unset (default) | 0
+ *     The voltage and current updates fused into one pass, on grids without Mur, sheets and the other extensions
+ *     that block it; 0 never. The windowed blocks always run the separate kernels. V100: pml S/M within 2 to 7 %
+ *     of the two-pass path with the UPML fused into the main kernels.
+ * OPENEMS_HIP_FUSED_TZ, OPENEMS_HIP_FUSED_TY, OPENEMS_HIP_FUSED_XC
+ *     Development: the tile of the fused step (TZ 32 or 64 threads along z, AMD only; TY 4, 8 or 16 rows along y,
+ *     default 8, other values run 8; XC x lines per block, default 4).
+ * OPENEMS_HIP_UPML_FUSION = 1 (default) | 0
+ *     The UPML regions fused with the main updates; 0 the separate pre/post kernels (V100: 27 to 32 % slower).
+ * OPENEMS_HIP_KERNEL_TIMES = 0 (default) | 1
+ *     Development: a block of kernel times at the end of the run, from events around every launch (no graphs);
+ *     inflates the run time (small PCB by about 53 %): kernel shares, never speeds.
+ */
+
 #include "hip/hip_runtime.h"
 #include <algorithm>
 #include <climits>
@@ -23,6 +79,8 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -30,21 +88,55 @@
 #include "hip_internal.h"
 #include "gpu_build_id.h"
 #include "FDTD/operator.h"
+#include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
+#include "FDTD/extensions/engine_ext_mur_abc.h"
+#include "FDTD/extensions/engine_ext_dispersive.h"
+#include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/operator_ext_excitation.h"
+#include "FDTD/extensions/operator_ext_lumpedRLC.h"
+#include "FDTD/extensions/operator_ext_steadystate.h"
+
+// The thread of a main kernel: its index tz along z (see GPU_Backend_HIP::Impl::MainRange()) and its y row ty. Two-
+// dimensional blocks (Z.compact 0): tz along x of the grid and the block, ty along y; the compact layout: the rows of
+// Z.compact threads one after the other in one-dimensional blocks (a z line of 44 nodes then takes 44 lanes, not 64)
+__device__ __forceinline__ void main_thread(const HIP_ZSlabs& Z, unsigned int& tz, unsigned int& ty)
+{
+	if (Z.compact)
+	{
+		const unsigned int t = blockIdx.x*blockDim.x + threadIdx.x;
+		ty = __umulhi(t, Z.compact_m);
+		tz = t - ty*Z.compact;
+		return;
+	}
+	tz = blockIdx.x*blockDim.x + threadIdx.x;
+	ty = blockIdx.y*blockDim.y + threadIdx.y;
+}
+
+// The occupancy of the main kernels on the A100 (sm_80) and the H100 (sm_90): without a bound they take 47 and 56
+// registers there (10 and 9 blocks of 128 threads per multiprocessor); bounded to 6 blocks of 256 (40 registers) they
+// run more warps at once (H100, the PCB model: single step +6.2 %). Blocks of the main kernels have at most 256
+// threads (the shapes of DecideShape(), Block(), OPENEMS_HIP_SHAPE). Other architectures keep the compiler's choice.
+#if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__==800) || (__CUDA_ARCH__==900))
+#define HIP_MAIN_BOUNDS __launch_bounds__(256, 6)
+#else
+#define HIP_MAIN_BOUNDS
+#endif
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
 // over the nodes in [B, E). One thread per mesh node: z along x-threads (contiguous), y along
 // y-threads, x along the grid z-dimension. The coefficients are read with main_coeff().
 // Nodes below Z.z_lo or from Z.z_hi on belong to UPML regions along z (see HIP_ZSlabs).
-__global__ void update_voltages(float* __restrict__ volt, const float* __restrict__ curr,
+__global__ void HIP_MAIN_BOUNDS update_voltages(float* __restrict__ volt, const float* __restrict__ curr,
                                 const void* index, const float* ca, const float* cb, unsigned int mode,
                                 HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
 {
 	// with UPML regions along z: slab lo, main nodes and slab hi in whole warps each (no divergence)
-	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -62,7 +154,7 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + blockIdx.z;
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -76,10 +168,10 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
 		return;
 	}
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xm = (x>0) ? (size_t)N.ny*N.nz : 0;   // shift to the previous line, none on the first
-	const size_t ym = (y>0) ? N.nz : 0;
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+	const size_t ym = (y>0) ? N.nzd : 0;
 	const size_t zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
 	const float* vv = C.a;
@@ -103,13 +195,184 @@ __global__ void update_voltages(float* __restrict__ volt, const float* __restric
 	volt[2*sn+i] = v;
 }
 
-// the currents on the last mesh line of each direction are not updated
-__global__ void update_currents(float* __restrict__ curr, const float* __restrict__ volt,
-                                const void* index, const float* ca, const float* cb, unsigned int mode,
-                                HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
+// Mur mode 1: the voltage update with the first order Mur ABC of the active planes F, which
+// mode 0 runs as mur_pre, mur_post and mur_apply (hip_ext_mur_abc.hip, Engine_Ext_Mur_ABC), as two launches over
+// disjoint nodes: update_voltages_inner off the planes, mur_shell on the line and shift line of each. The Mur value of
+// component c of a cell L on the line of a plane is
+//     v = V_old(S) - k*V_old(L);  v += k*V_new(S)
+// with S the cell next to L on the shift line and V_new(S) its main update. The thread of S writes it: it holds
+// V_old(S) and computes V_new(S); the thread of L leaves component c alone. Every voltage has one writer, and
+// the only thread that reads its old value is that writer, so no thread waits for another.
+// Component c is tangential to the planes normal to the two other axes a = c+1 and b = c+2 (mod 3). An edge
+// cell E on the lines of an a-plane and of a b-plane takes the value of the plane applied last, the apply hooks
+// running in the extension order: the plane of the highest rank (HIP_MurFace::rank; with Mur on all faces the
+// one of the lowest face: x-low wins over y-low and z-low, see Engine::SortExtensionByPriority()). Its shift
+// cell is on the line of the other plane, whose Mur value replaces the main update there, while E needs that
+// main update (the Mur post hooks all read before the first apply): the thread of the diagonal cell D (on the
+// shift lines of both planes) writes E and both line cells next to it, and computes the main update of the
+// shift cell of E again from its old value, with the statements of the main update (volt_update_at()).
+// So for each component c a thread on no line of an active a- or b-plane writes its own main update, on the
+// shift line of an a-plane the Mur value of the a-line cell next to it, the same for b, and on both shift lines
+// the edge E. The normal component of a line cell is the main update of its own thread.
+template<unsigned int c>
+__device__ __forceinline__ void mur_volt_component(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
+                                                   unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
+                                                   unsigned int x, unsigned int y, unsigned int z, const HIP_MainCoeff& C,
+                                                   size_t sn, size_t i, size_t xm, size_t ym, size_t zm)
 {
-	// with UPML regions along z: slab lo, main nodes and slab hi in whole warps each (no divergence)
-	const unsigned int tz = blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int a = (c+1)%3;
+	const unsigned int b = (c+2)%3;
+	const unsigned int p[3] = {x, y, z};
+	const unsigned int n[3] = {N.nx, N.ny, N.nz};
+	const bool a0 = (active>>(2*a)) & 1u;
+	const bool a1 = (active>>(2*a+1)) & 1u;
+	const bool b0 = (active>>(2*b)) & 1u;
+	const bool b1 = (active>>(2*b+1)) & 1u;
+	if ((a0 && (p[a]==F[2*a].line)) || (a1 && (p[a]==F[2*a+1].line)) || (b0 && (p[b]==F[2*b].line)) || (b1 && (p[b]==F[2*b+1].line)))
+		return;   // a line cell: written by the thread of its shift cell
+	const bool sa0 = a0 && (p[a]==F[2*a].shift);
+	const bool sa = sa0 || (a1 && (p[a]==F[2*a+1].shift));
+	const bool sb0 = b0 && (p[b]==F[2*b].shift);
+	const bool sb = sb0 || (b1 && (p[b]==F[2*b+1].shift));
+	const float old = volt[c*sn+i];
+	const float nv = volt_update_node(c, old, curr, C, sn, i, xm, ym, zm);
+	if (!sa && !sb)
+	{
+		volt[c*sn+i] = nv;
+		return;
+	}
+	// the a-plane: c is its component nyPP, coefficient (i,j) = (p[b], p[c]); the b-plane: c is its nyP, (i,j) = (p[c], p[a])
+	const HIP_MurFace& A = F[sa0 ? 2*a : 2*a+1];
+	const HIP_MurFace& B = F[sb0 ? 2*b : 2*b+1];
+	const unsigned int la = A.line;
+	const unsigned int lb = B.line;
+	// the line cells La (a-line), Lb (b-line) and the edge E, all read before any is written
+	unsigned int q[3] = {x, y, z};
+	q[a] = la;
+	const size_t ia = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	q[b] = lb;
+	const size_t ie = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	q[a] = p[a];
+	const size_t ib = c*sn + nijk(N, 0, q[0], q[1], q[2]);
+	const float old_a = sa ? volt[ia] : 0.0f;
+	const float old_b = sb ? volt[ib] : 0.0f;
+	float v_e = 0.0f;
+	if (sa && sb)
+	{
+		const float old_e = volt[ie];
+		if (A.rank>B.rank)
+		{
+			// the a-plane is applied last: its shift cell of E is Lb (q = Lb)
+			const float k = A.c_nyPP[(size_t)lb*n[c] + p[c]];
+			const float new_b = volt_update_at(c, old_b, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			v_e = old_b - k * old_e;
+			v_e = v_e + k * new_b;
+		}
+		else
+		{
+			// the b-plane is applied last: its shift cell of E is La
+			q[a] = la;
+			q[b] = p[b];
+			const float k = B.c_nyP[(size_t)p[c]*n[a] + la];
+			const float new_a = volt_update_at(c, old_a, curr, index, ca, cb, mode, N, q[0], q[1], q[2]);
+			v_e = old_a - k * old_e;
+			v_e = v_e + k * new_a;
+		}
+	}
+	volt[c*sn+i] = nv;
+	if (sa)
+	{
+		const float k = A.c_nyPP[(size_t)p[b]*n[c] + p[c]];
+		float v = old - k * old_a;
+		v = v + k * nv;
+		volt[ia] = v;
+	}
+	if (sb)
+	{
+		const float k = B.c_nyP[(size_t)p[c]*n[a] + p[a]];
+		float v = old - k * old_b;
+		v = v + k * nv;
+		volt[ib] = v;
+	}
+	if (sa && sb)
+		volt[ie] = v_e;
+}
+
+// all components of node (x, y, z) on the line or the shift line of a Mur plane
+__device__ __forceinline__ void mur_volt_node(float* volt, const float* curr, const void* index, const float* ca, const float* cb,
+                                              unsigned int mode, const HIP_GridDim& N, const HIP_MurFace* F, unsigned int active,
+                                              unsigned int x, unsigned int y, unsigned int z)
+{
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
+	const size_t i  = nijk(N, 0, x, y, z);
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;
+	const size_t ym = (y>0) ? N.nzd : 0;
+	const size_t zm = (z>0) ? 1 : 0;
+	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	mur_volt_component<0>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<1>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+	mur_volt_component<2>(volt, curr, index, ca, cb, mode, N, F, active, x, y, z, C, sn, i, xm, ym, zm);
+}
+
+// Mur mode 2: the Mur value of the tangential components x and y of a node L on the line of an active
+// z plane, from the node S on its shift line in the same z line, held by another lane of the same warp (the lane
+// test is in z, the lanes along z are contiguous; DecideMurFused() refuses the mode when a line and its shift line
+// fall into different warps, MurZFaceRefusal()). Called by every thread of update_voltages_inner<true> on a node of
+// the interior of the z faces and inside them, with the old values o_x, o_y and the main updates v_x, v_y of its own
+// node (index xy = x*ny + y of the plane's coefficients, as the Mur extension indexes them: i along nyP = x, j along
+// nyPP = y). The lanes of L and S exchange V_old and V_new through shuffles; L replaces its main update with
+//     v = V_old(S) - k*V_old(L);  v = v + k*V_new(S)
+// the statements of mur_pre and mur_post, which mur_apply writes. The z component of L stays its main update (the
+// z planes write only x and y), and S keeps its main update, as every main node. Node sets: this kernel writes the
+// nodes with x and y inside [S.L, S.H) on every z line of the main range (the z faces' lines and shift lines
+// included); mur_shell the others (the x-face slabs, then the y-face slabs inside x: the 2-line bands along the four
+// edges of each z face, their shift cells too), which never read a voltage this kernel writes. Interior warps
+// (no lane on a z face line or shift line) skip the branch together.
+__device__ __forceinline__ void mur_zface_lane(const HIP_MurZFaces& M, unsigned int z, size_t xy,
+                                               float o_x, float o_y, float& v_x, float& v_y)
+{
+	for (unsigned int f=0; f<2; ++f)
+	{
+		if (!((M.active>>f) & 1u))
+			continue;
+		const bool on_line = (z==M.line[f]);
+		if (!on_line && (z!=M.shift[f]))
+			continue;
+		// lanes along z: the partner's lane is this lane shifted by the z distance
+		const unsigned int lane = ((threadIdx.z*blockDim.y + threadIdx.y)*blockDim.x + threadIdx.x) % warpSize;
+		const int dz = on_line ? (int)M.shift[f] - (int)M.line[f] : (int)M.line[f] - (int)M.shift[f];
+		const int other = (int)lane + dz;
+		const HIP_LaneMask mask = ((HIP_LaneMask)1 << lane) | ((HIP_LaneMask)1 << other);
+		const float so_x = __shfl_sync(mask, o_x, other);
+		const float so_y = __shfl_sync(mask, o_y, other);
+		const float sn_x = __shfl_sync(mask, v_x, other);
+		const float sn_y = __shfl_sync(mask, v_y, other);
+		if (on_line)
+		{
+			const float k_x = M.c_x[f][xy];
+			float v = so_x - k_x * o_x;
+			v = v + k_x * sn_x;
+			v_x = v;
+			const float k_y = M.c_y[f][xy];
+			v = so_y - k_y * o_y;
+			v = v + k_y * sn_y;
+			v_y = v;
+		}
+	}
+}
+
+// The main update of the nodes inside the box [S.L, S.H), the statements of update_voltages: in one kernel with
+// the Mur nodes (all the same, see mur_shell) the registers of the Mur path halve the occupancy of every block,
+// and the warps on the outer z lines of every line run both paths. ZF (Mur mode 2): the box covers
+// the z faces too, whose interior gets its Mur values from mur_zface_lane().
+template<bool ZF>
+__global__ void HIP_MAIN_BOUNDS update_voltages_inner(float* __restrict__ volt, const float* __restrict__ curr,
+                                      const void* index, const float* ca, const float* cb, unsigned int mode,
+                                      HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z, HIP_MurShell S,
+                                      HIP_MurZFaces M)
+{
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
 	unsigned int z = B.nz + tz;
 	if (Z.t_int)
 	{
@@ -127,7 +390,117 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 		else
 			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
 	}
-	const unsigned int y = B.ny + blockIdx.y*blockDim.y + threadIdx.y;
+	const unsigned int y = B.ny + ty;
+	const unsigned int x = B.nx + blockIdx.z;
+	if (z>=E.nz || y>=E.ny || x>=E.nx)
+		return;
+	if (z<Z.z_lo)
+	{
+		upml_fused_volt_node(volt, volt, curr, Z.volt_lo, N, Z.R_lo, x-Z.R_lo.sx, y-Z.R_lo.sy, z-Z.R_lo.sz);
+		return;
+	}
+	if (z>=Z.z_hi)
+	{
+		upml_fused_volt_node(volt, volt, curr, Z.volt_hi, N, Z.R_hi, x-Z.R_hi.sx, y-Z.R_hi.sy, z-Z.R_hi.sz);
+		return;
+	}
+	if ((x<S.L.nx) || (x>=S.H.nx) || (y<S.L.ny) || (y>=S.H.ny) || (z<S.L.nz) || (z>=S.H.nz))
+		return;   // a node of mur_shell
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
+	const size_t i  = nijk(N, 0, x, y, z);
+	const size_t xm = (x>0) ? (size_t)N.ny*N.nzd : 0;   // shift to the previous line, none on the first
+	const size_t ym = (y>0) ? N.nzd : 0;
+	const size_t zm = (z>0) ? 1 : 0;
+	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 0);
+	if (!ZF)
+	{
+		volt[i]      = volt_update_node(0, volt[i], curr, C, sn, i, xm, ym, zm);
+		volt[sn+i]   = volt_update_node(1, volt[sn+i], curr, C, sn, i, xm, ym, zm);
+		volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+		return;
+	}
+	const float o_x = volt[i];
+	const float o_y = volt[sn+i];
+	float v_x = volt_update_node(0, o_x, curr, C, sn, i, xm, ym, zm);
+	float v_y = volt_update_node(1, o_y, curr, C, sn, i, xm, ym, zm);
+	volt[2*sn+i] = volt_update_node(2, volt[2*sn+i], curr, C, sn, i, xm, ym, zm);
+	mur_zface_lane(M, z, (size_t)x*N.ny + y, o_x, o_y, v_x, v_y);
+	volt[i]    = v_x;
+	volt[sn+i] = v_y;
+}
+
+// the j-th of the n0 + (E-H) lines of an axis outside [L, H) (n0 = L-B)
+__device__ __forceinline__ unsigned int mur_shell_line(unsigned int j, unsigned int B, unsigned int L, unsigned int H)
+{
+	return (j<L-B) ? B+j : H+(j-(L-B));
+}
+
+// The main nodes outside the box [S.L, S.H): the lines and shift lines of the Mur planes (inactive ones too),
+// one thread per node, as the slabs of the x faces (all y, z), of the y faces (x inside) and of the z faces
+// (x and y inside; with Mur mode 2 S spans all z lines, so there are none: update_voltages_inner<true>
+// has them).
+// Launched right after update_voltages_inner, on nodes disjoint from its own.
+__global__ void mur_shell(float* volt, const float* curr, const void* index, const float* ca, const float* cb, unsigned int mode,
+                          HIP_GridDim N, HIP_MurShell S, const HIP_MurFace* F, unsigned int active)
+{
+	size_t k = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int fx = S.E.nx-S.B.nx, fy = S.E.ny-S.B.ny, fz = S.E.nz-S.B.nz;   // full extents
+	const unsigned int ix = S.H.nx-S.L.nx, iy = S.H.ny-S.L.ny;                         // inner extents
+	const unsigned int cx = fx-ix, cy = fy-iy, cz = fz-(S.H.nz-S.L.nz);                // outer lines
+	const size_t sx = (size_t)cx*fy*fz, sy = (size_t)ix*cy*fz, sz = (size_t)ix*iy*cz;
+	unsigned int x, y, z;
+	if (k<sx)
+	{
+		x = mur_shell_line((unsigned int)(k/((size_t)fy*fz)), S.B.nx, S.L.nx, S.H.nx);
+		k %= (size_t)fy*fz;
+		y = S.B.ny + (unsigned int)(k/fz);
+		z = S.B.nz + (unsigned int)(k%fz);
+	}
+	else if ((k -= sx)<sy)
+	{
+		x = S.L.nx + (unsigned int)(k/((size_t)cy*fz));
+		k %= (size_t)cy*fz;
+		y = mur_shell_line((unsigned int)(k/fz), S.B.ny, S.L.ny, S.H.ny);
+		z = S.B.nz + (unsigned int)(k%fz);
+	}
+	else if ((k -= sy)<sz)
+	{
+		x = S.L.nx + (unsigned int)(k/((size_t)iy*cz));
+		k %= (size_t)iy*cz;
+		y = S.L.ny + (unsigned int)(k/cz);
+		z = mur_shell_line((unsigned int)(k%cz), S.B.nz, S.L.nz, S.H.nz);
+	}
+	else
+		return;
+	mur_volt_node(volt, curr, index, ca, cb, mode, N, F, active, x, y, z);
+}
+
+// the currents on the last mesh line of each direction are not updated
+__global__ void HIP_MAIN_BOUNDS update_currents(float* __restrict__ curr, const float* __restrict__ volt,
+                                const void* index, const float* ca, const float* cb, unsigned int mode,
+                                HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_ZSlabs Z)
+{
+	// with UPML regions along z: slab lo, main nodes and slab hi in whole warps each (no divergence)
+	unsigned int tz, ty;
+	main_thread(Z, tz, ty);
+	unsigned int z = B.nz + tz;
+	if (Z.t_int)
+	{
+		if (tz<Z.t_lo)
+		{
+			if (B.nz+tz>=Z.z_lo)
+				return;
+		}
+		else if (tz<Z.t_lo+Z.t_int)
+		{
+			z = Z.z_lo + (tz-Z.t_lo);
+			if (z>=Z.z_hi)
+				return;
+		}
+		else
+			z = Z.z_hi + (tz-Z.t_lo-Z.t_int);
+	}
+	const unsigned int y = B.ny + ty;
 	const unsigned int x = B.nx + blockIdx.z;
 	if (z>=E.nz || y>=E.ny || x>=E.nx)
 		return;
@@ -143,10 +516,10 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 	}
 	if (z+1>=N.nz || y+1>=N.ny || x+1>=N.nx)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, x, y, z);
-	const size_t xp = (size_t)N.ny*N.nz;
-	const size_t yp = N.nz;
+	const size_t xp = (size_t)N.ny*N.nzd;
+	const size_t yp = N.nzd;
 	const HIP_MainCoeff C = main_coeff(index, ca, cb, mode, sn, i, 6);
 	const float* ii = C.a;
 	const float* iv = C.b;
@@ -177,10 +550,10 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
                                            const void* index, const float* va, const float* vb, unsigned int mode,
                                            const HIP_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
 {
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, x, y, z);
-	const I xm = (x>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (y>0) ? N.nz : 0;
+	const I xm = (x>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (y>0) ? N.nzd : 0;
 	const I zm = (z>0) ? 1 : 0;
 	const HIP_MainCoeffT<I> C = main_coeff<I>(index, va, vb, mode, sn, i, 0);
 	float t;
@@ -232,7 +605,7 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const bool main_yz = (z<E.nz) && (y<E.ny);                          // a main node line
 	const bool owner = main_yz && (tz<TZ-1) && (ty<TY-1);  // written by this block
 	const bool in_grid = (z<N.nz) && (y<N.ny);
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 
 	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
@@ -393,10 +766,10 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nodes[k];
-	const size_t xp = (size_t)N.ny*N.nz;
-	const size_t yp = N.nz;
+	const size_t xp = (size_t)N.ny*N.nzd;
+	const size_t yp = N.nzd;
 	const HIP_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
 	c  = curr_in[i] * C.a[0];
@@ -419,7 +792,7 @@ __global__ void energy_lines(const float* __restrict__ volt, const float* __rest
 	const unsigned int y = blockIdx.y*blockDim.y + threadIdx.y;
 	if (z>=L.nz || y>=L.ny)
 		return;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	float E = 0, H = 0;
 	for (unsigned int x=0; x<L.nx; ++x)
 	{
@@ -523,8 +896,13 @@ HIP_Context::~HIP_Context()
 
 GPU_Backend_HIP::Impl::Impl()
 {
-	dim.nx = dim.ny = dim.nz = 0;
-	numCells = 0;
+	dim.nx = dim.ny = dim.nz = dim.nzd = 0;
+	numCells = numCellsD = 0;
+	shape_mode = 0;
+	shape_tz = shape_ty = 0;
+	shape_forced = false;
+	shape_decided = false;
+	shape_block = dim3(0, 0, 0);
 	volt = curr = vv = vi = ii = iv = NULL;
 	coeff_mode = 0;
 	index = NULL;
@@ -542,6 +920,38 @@ GPU_Backend_HIP::Impl::Impl()
 	snap_dev = NULL;
 	snap_host = NULL;
 	snap_taken = false;
+	mur_mode = -1;
+	memset(&mur, 0, sizeof(mur));
+	mur_dev = NULL;
+	memset(&mur_shell, 0, sizeof(mur_shell));
+	mur_shell_count = 0;
+	mur_released = false;
+	mur_zf_on = false;
+	memset(&mur_zf, 0, sizeof(mur_zf));
+	window = HIP_ParseWindowKnob(NULL, 0);
+	window_used = false;
+	step_base = NULL;
+	window_ready = -1;
+	win_T = win_W = win_B = 0;
+	l2_bytes = 0;
+	coeff_table_bytes = 0;
+	launches = 0;
+	window_graphs_on = false;
+	window_logged = false;
+	window_steps = window_blocks = window_chunks = window_block_launches = 0;
+	tune_state = 0;
+	tune_chunks = tune_rule_T = tune_rule_W = 0;
+	tune_steps = 0;
+	tune_ms = 0;
+	tune_plane_bytes = 0;
+	tune_final_round = 0;
+	tune_final_pos = 0;
+	tune_probe_ref = NULL;
+	tune_probe_ms = 0;
+	tune_probe_ratio = 0;
+	tune_defer_chunks = 0;
+	tune_probe_done = false;
+	tune_start_ts = 0;
 	HIP_Check(hipEventCreateWithFlags(&snap_evaluated, hipEventDisableTiming), "hipEventCreate");
 	HIP_Check(hipEventCreateWithFlags(&snap_done, hipEventDisableTiming), "hipEventCreate");
 }
@@ -553,6 +963,13 @@ GPU_Backend_HIP::Impl::~Impl()
 		(void)hipStreamSynchronize(ctx->stream);
 		(void)hipStreamSynchronize(ctx->copy_stream);
 	}
+	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); ++it)
+		(void)hipGraphExecDestroy(it->second.exec);
+	if (window_steps && (tune_state>0) && (g_settings.GetVerboseLevel()>1))
+		std::cout << "GPU_Backend_HIP: window: not tuned, the run ended during the tune (" << tune_steps << " timesteps of candidates)" << std::endl;
+	if (window_steps && (g_settings.GetVerboseLevel()>1))
+		std::cout << "GPU_Backend_HIP: window: " << window_steps << " timesteps in " << window_chunks << " chunks, " << window_blocks
+		          << " blocks, " << window_graphs.size() << " graphs" << std::endl;
 	FreeSnapshots();
 	(void)hipEventDestroy(snap_evaluated);
 	(void)hipEventDestroy(snap_done);
@@ -612,8 +1029,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 			list.push_back(*it);
 	}
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
-	volt_next = TryAlloc<float>(3*numCells);
-	curr_next = TryAlloc<float>(3*numCells);
+	volt_next = TryAlloc<float>(3*numCellsD);
+	curr_next = TryAlloc<float>(3*numCellsD);
 	if ((volt_next==NULL) || (curr_next==NULL))
 	{
 		Free(volt_next);
@@ -623,11 +1040,13 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		return false;
 	}
 	fixup_count = list.size();
+	for (size_t k=0; k<list.size(); ++k)
+		list[k] = Dev(list[k]);   // host flat indices above, see numCellsD
 	fixup = Alloc<size_t>(fixup_count, list.data());
 
 	// both buffers start with the current fields
-	HIP_Check(hipMemcpyAsync(volt_next, volt, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
-	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
+	HIP_Check(hipMemcpyAsync(volt_next, volt, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
+	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	Flush();
 	fused_step = 1;
 	if (g_settings.GetVerboseLevel()>1)
@@ -638,6 +1057,244 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		std::cout << std::endl;
 	}
 	return true;
+}
+
+std::string GPU_Backend_HIP::Impl::MurRefusal() const
+{
+	if (mur_released)
+		return "host fallback";
+	if (fused_step>0)
+		return "fused step";
+	const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
+	const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
+	const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+	// the line cells and the shift cells, updated in the main kernel, must be main nodes, outside the UPML regions
+	unsigned int faces = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+	{
+		const HIP_MurPlane& P = mur_planes[k];
+		for (int n=0; n<3; ++n)
+		{
+			const bool in = (n==P.ny) ? ((P.line>=start[n]) && (P.line<stop[n]) && (P.shift>=start[n]) && (P.shift<stop[n]))
+			                          : ((start[n]==0) && (stop[n]==n_lines[n]));
+			if (!in)
+				return "a Mur plane crosses a UPML region";
+		}
+		const unsigned int f = 2*P.ny + (P.line>0 ? 1 : 0);
+		if (faces & (1u<<f))
+			return "two Mur planes on one face";
+		faces |= 1u<<f;
+	}
+	for (int n=0; n<3; ++n)
+		if (((faces>>(2*n)) & 3u)==3u && (n_lines[n]<4))
+			return "fewer than 4 lines between two Mur planes";
+	size_t last_mur = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		last_mur = std::max(last_mur, mur_planes[k].seq);
+	// a voltage (flat index g) on the line of a Mur plane, of a component the plane writes
+	auto on_line = [&](size_t g, bool any_component) {
+		const unsigned int c = (unsigned int)(g/numCells);
+		const size_t node = g % numCells;
+		const unsigned int q[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((q[mur_planes[k].ny]==mur_planes[k].line) && (any_component || ((int)c!=mur_planes[k].ny)))
+				return true;
+		return false;
+	};
+	// The other extensions: the Mur values are written in the main update, before the post and apply hooks
+	// of all extensions, so none of them may read or write the voltages of the line cells, unless its hook
+	// runs only after the Mur apply hooks (the excitation). The UPML region updates are outside the main nodes.
+	for (size_t e=0; e<ext_log.size(); ++e)
+	{
+		Engine_Extension* eng_ext = ext_log[e].eng_ext;
+		if (dynamic_cast<Engine_Ext_Mur_ABC*>(eng_ext))
+			continue;
+		if (dynamic_cast<Engine_Ext_UPML*>(eng_ext))
+		{
+			if (upml_fused<=0)
+				return "UPML not fused";
+			continue;
+		}
+		const bool disp = dynamic_cast<Engine_Ext_Dispersive*>(eng_ext)!=NULL;   // Lorentz/Drude materials, sheets, Debye materials
+		const bool exc = dynamic_cast<Engine_Ext_Excitation*>(eng_ext)!=NULL;
+		const bool rlc = dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)!=NULL;
+		const bool ssd = dynamic_cast<Engine_Ext_SteadyState*>(eng_ext)!=NULL;
+		if (!disp && !exc && !rlc && !ssd)
+			return eng_ext->GetExtensionName();
+		if (ssd)
+			return "steady-state detection reads the fields before the Mur apply";
+		if (exc && (e>last_mur))
+			continue;   // only an apply hook, after those of the Mur planes
+		if (exc || rlc)
+		{
+			for (size_t k=ext_log[e].vm_begin; k<ext_log[e].vm_end; ++k)
+				if (on_line(volt_modified[k], false))
+					return eng_ext->GetExtensionName() + " on a Mur plane";
+			continue;
+		}
+		for (size_t k=ext_log[e].nodes_begin; k<ext_log[e].nodes_end; ++k)
+			if (on_line(ext_nodes[k], true))
+				return eng_ext->GetExtensionName() + " on a Mur plane";
+	}
+	return std::string();
+}
+
+// HIP_ZSlabs::compact_m of rows of \a R threads: 2^32 / R rounded up; __umulhi(t, m) = t / R exactly for t < 2^32 / R
+// (the error of m is below 1, so t*m/2^32 stays below the next multiple of 1/R)
+static unsigned int HIP_CompactM(unsigned int R)
+{
+	return (unsigned int)((0x100000000ULL + R - 1)/R);
+}
+
+// true if the threads of the z positions tz_a and tz_b are in the same warp of \a w threads in every one of \a rows
+// rows of \a R threads of the compact layout (blocks of a multiple of w threads)
+static bool HIP_SameWarpZCompact(unsigned int tz_a, unsigned int tz_b, unsigned int R, unsigned int rows, unsigned int w)
+{
+	for (unsigned int r=0; r<rows; ++r)
+		if (((size_t)r*R + tz_a)/w != ((size_t)r*R + tz_b)/w)
+			return false;
+	return true;
+}
+
+// true if the threads of the z positions tz_a and tz_b (thread index along z: threadIdx.x of blocks of \a block
+// threads, see MainRange()) are in the same warp of \a w threads, for every y and x thread of the block
+static bool HIP_SameWarpZ(unsigned int tz_a, unsigned int tz_b, const dim3& block, unsigned int w)
+{
+	if (tz_a/block.x != tz_b/block.x)
+		return false;   // different blocks
+	const unsigned int a = tz_a%block.x, b = tz_b%block.x;
+	for (unsigned int k=0; k<block.y*block.z; ++k)
+		if ((k*block.x + a)/w != (k*block.x + b)/w)
+			return false;
+	return true;
+}
+
+std::string GPU_Backend_HIP::Impl::MurZFaceRefusal()
+{
+	memset(&mur_zf, 0, sizeof(mur_zf));
+	if (dim.nz<6)
+		return "fewer than 6 z lines";
+	bool any = false;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+	{
+		const HIP_MurPlane& P = mur_planes[k];
+		if (P.ny!=2)
+			continue;
+		const unsigned int f = (P.line>0) ? 1 : 0;
+		mur_zf.c_x[f] = P.c_nyP;
+		mur_zf.c_y[f] = P.c_nyPP;
+		mur_zf.line[f] = P.line;
+		mur_zf.shift[f] = P.shift;
+		any = true;
+	}
+	if (!any)
+		return "no Mur plane on a z face";
+	// the launch of update_voltages_inner (UpdateVoltages()): the thread index along z of a main node, and the block
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	// the block of the launch: DecideShape() ran before this decision (the fused step leaves it unset, then Block())
+	const dim3 block = (shape_block.x>0) ? shape_block : Block(threads_z, E.ny-B.ny);
+	auto tz = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+	for (unsigned int f=0; f<2; ++f)
+		if ((mur_zf.c_x[f]!=NULL) && !(MainCompact() ? HIP_SameWarpZCompact(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), threads_z, E.ny-B.ny, ctx->warp_size)
+		                                             : HIP_SameWarpZ(tz(mur_zf.line[f]), tz(mur_zf.shift[f]), block, ctx->warp_size)))
+			return std::string("the line and the shift line of the z-") + (f ? "high" : "low") + " plane are in different warps";
+	return std::string();
+}
+
+void GPU_Backend_HIP::Impl::DecideMurFused()
+{
+	if (mur_mode>=0)
+		return;
+	mur_mode = 0;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (!mur_planes.empty())
+	{
+		const std::string reason = MurRefusal();
+		if (reason.empty())
+			mur_mode = 1;
+		else if (verbose)
+		{
+			std::cout << "GPU_Backend_HIP: Mur fused: 2 unavailable: " << reason << std::endl;
+			std::cout << "GPU_Backend_HIP: Mur fused: 1 unavailable: " << reason << std::endl;
+		}
+	}
+	if (mur_mode==1)
+	{
+		// the plane applied last has the highest rank (see mur_volt_component)
+		const unsigned int active = mur.active;
+		memset(&mur, 0, sizeof(mur));
+		mur.active = active;
+		for (size_t k=0; k<mur_planes.size(); ++k)
+		{
+			const HIP_MurPlane& P = mur_planes[k];
+			HIP_MurFace& F = mur.f[2*P.ny + (P.line>0 ? 1 : 0)];
+			F.c_nyP = P.c_nyP;
+			F.c_nyPP = P.c_nyPP;
+			F.line = P.line;
+			F.shift = P.shift;
+			F.rank = (unsigned int)P.seq;
+		}
+		mur_dev = Alloc<HIP_MurFace>(6, mur.f);
+		// the box of update_voltages_inner: the main nodes but the lines and shift lines of the planes
+		const unsigned int b[3] = {main_start.nx, main_start.ny, main_start.nz};
+		const unsigned int e[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+		unsigned int l[3], h[3];
+		for (int n=0; n<3; ++n)
+		{
+			l[n] = b[n];
+			h[n] = e[n];
+		}
+		for (size_t k=0; k<mur_planes.size(); ++k)
+		{
+			const HIP_MurPlane& P = mur_planes[k];
+			if (P.line<P.shift)
+				l[P.ny] = std::max(l[P.ny], P.shift+1);
+			else
+				h[P.ny] = std::min(h[P.ny], P.shift);
+		}
+		size_t inner = 1;
+		for (int n=0; n<3; ++n)
+		{
+			h[n] = std::max(h[n], l[n]);   // fewer lines than the two layers of both planes: no inner nodes
+			inner *= h[n]-l[n];
+		}
+		mur_shell.B = main_start;
+		mur_shell.E = main_stop;
+		mur_shell.L.nx = l[0]; mur_shell.L.ny = l[1]; mur_shell.L.nz = l[2];
+		mur_shell.H.nx = h[0]; mur_shell.H.ny = h[1]; mur_shell.H.nz = h[2];
+		mur_shell_count = (size_t)(e[0]-b[0])*(e[1]-b[1])*(e[2]-b[2]) - inner;
+		const std::string reason = MurZFaceRefusal();
+		if (reason.empty())
+		{
+			// the z faces' interior moves to update_voltages_inner: mur_shell keeps its x- and y-face slabs
+			mur_zf_on = true;
+			mur_shell_count = (size_t)(e[0]-b[0] - (h[0]-l[0]))*(e[1]-b[1])*(e[2]-b[2])
+			                + (size_t)(h[0]-l[0])*(e[1]-b[1] - (h[1]-l[1]))*(e[2]-b[2]);
+		}
+		else if (verbose)
+			std::cout << "GPU_Backend_HIP: Mur fused: 2 unavailable: " << reason << std::endl;
+	}
+	if (verbose)
+	{
+		if (mur_zf_on)
+			std::cout << "GPU_Backend_HIP: Mur fused: 2 (" << mur_planes.size() << " planes, z faces in the kernel)" << std::endl;
+		else
+			std::cout << "GPU_Backend_HIP: Mur fused: " << mur_mode << " (" << mur_planes.size() << " planes)" << std::endl;
+		if (mur_mode==1)
+		{
+			static const char* const faces[6] = {"x-low", "x-high", "y-low", "y-high", "z-low", "z-high"};
+			std::vector<std::pair<size_t, int> > order;
+			for (size_t k=0; k<mur_planes.size(); ++k)
+				order.push_back(std::make_pair(mur_planes[k].seq, 2*mur_planes[k].ny + (mur_planes[k].line>0 ? 1 : 0)));
+			std::sort(order.begin(), order.end());
+			std::cout << "GPU_Backend_HIP: Mur planes in apply order (edges take the last):";
+			for (size_t k=0; k<order.size(); ++k)
+				std::cout << " " << faces[order[k].second];
+			std::cout << std::endl;
+		}
+	}
 }
 
 void GPU_Backend_HIP::Impl::ResetZSlabs()
@@ -667,6 +1324,136 @@ void GPU_Backend_HIP::Impl::MainRange(HIP_GridDim& B, HIP_GridDim& E, unsigned i
 		zslabs.t_int = warps(zslabs.z_hi - zslabs.z_lo);
 		threads_z = zslabs.t_lo + zslabs.t_int + warps(E.nz - zslabs.z_hi);
 	}
+	zslabs.compact = MainCompact() ? threads_z : 0;
+	zslabs.compact_m = MainCompact() ? HIP_CompactM(threads_z) : 0;
+}
+
+void GPU_Backend_HIP::Impl::DecideShape()
+{
+	if (shape_decided)
+		return;
+	shape_decided = true;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (fused_step>0)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: shape: unused (fused step)" << std::endl;
+		return;
+	}
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	std::ostringstream reason;
+	if (shape_mode==0)
+		reason << "default";
+	else if (shape_forced)
+		reason << "OPENEMS_HIP_SHAPE";
+	else
+	{
+		// auto: time the candidates on copies of the fields (the run's own fields and state stay untouched): per
+		// shape, after a warm-up, rounds of update_voltages + update_currents pairs, the best round counts. The UPML
+		// regions along z in the main kernels (HIP_ZSlabs) update their flux in place: the timed launches take every
+		// node of the range as a main node instead (the same lines and reads, without the flux). The candidates in
+		// the order of preference: a tie within 0.5 % of the fastest goes to the first listed (32x8: on a PCB of
+		// 28.7 Mcells three shapes tied within 0.03 % here, and inside the windowed blocks 32x8 ran 1.8 to 2.6 %
+		// faster than the other two). TZ x 1: the compact layout (blocks of TZ threads over the rows of threads_z
+		// threads, see main_thread()), offered only where the Mur z faces' line and shift line stay in one warp in
+		// every row (MurZFaceRefusal())
+		static const unsigned int listed[][2] = {{32, 8}, {128, 1}, {256, 1}, {64, 4}, {32, 4}, {16, 16}, {128, 2}};
+		const float tie = 1.005f;
+		bool compact_ok = (threads_z*(unsigned long long)(E.ny-B.ny)*threads_z < 0x100000000ULL);
+		auto tzof = [&](unsigned int z) {return zslabs.t_int ? zslabs.t_lo + (z - zslabs.z_lo) : z - B.nz;};
+		for (size_t k=0; k<mur_planes.size(); ++k)
+			if ((mur_planes[k].ny==2) && !HIP_SameWarpZCompact(tzof(mur_planes[k].line), tzof(mur_planes[k].shift), threads_z, E.ny-B.ny, ctx->warp_size))
+				compact_ok = false;
+		std::vector<dim3> candidates;
+		for (size_t k=0; k<sizeof(listed)/sizeof(listed[0]); ++k)
+			if (compact_ok || (listed[k][1]>1))
+				candidates.push_back(dim3(listed[k][0], listed[k][1], 1));
+		auto name = [](const dim3& b) {return (b.y==1) ? "c" + std::to_string(b.x) : std::to_string(b.x) + "x" + std::to_string(b.y);};
+		const unsigned int n_cand = (unsigned int)candidates.size();
+		const unsigned int pairs = 20, rounds = 2;
+		const bool c = coeff_mode>0;
+		const unsigned int nt = E.nz - B.nz, nj = E.ny - B.ny, nk = E.nx - B.nx;
+		float* v = (nt && nj && nk) ? TryAlloc<float>(3*numCellsD) : NULL;
+		float* i = v ? TryAlloc<float>(3*numCellsD) : NULL;
+		hipEvent_t start = NULL, stop = NULL;
+		const bool ok = (i!=NULL) && (hipEventCreate(&start)==hipSuccess) && (hipEventCreate(&stop)==hipSuccess);
+		if (ok)
+		{
+			HIP_Check(hipMemcpyAsync(v, volt, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "shape tuning buffers");
+			HIP_Check(hipMemcpyAsync(i, curr, 3*numCellsD*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "shape tuning buffers");
+			HIP_ZSlabs Z = zslabs;
+			Z.t_lo = Z.t_int = 0;
+			Z.z_lo = B.nz;
+			Z.z_hi = E.nz;
+			auto run = [&](unsigned int k, unsigned int n)
+			{
+				const dim3 block = candidates[k];
+				const bool compact = block.y==1;
+				const dim3 grid = compact ? dim3((nt*nj + block.x - 1)/block.x, 1, nk) : Grid(block, nt, nj, nk);
+				Z.compact = compact ? nt : 0;
+				Z.compact_m = compact ? HIP_CompactM(nt) : 0;
+				for (unsigned int p=0; p<n; ++p)
+				{
+					update_voltages<<<grid, block, 0, Stream()>>>(v, (const float*)i, (const void*)index, (const float*)(c ? coeff : vv),
+					                                               (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, Z);
+					update_currents<<<grid, block, 0, Stream()>>>(i, (const float*)v, (const void*)index, (const float*)(c ? coeff : ii),
+					                                               (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, Z);
+				}
+				CheckLaunch("shape tuning");
+			};
+			std::vector<float> best(n_cand, std::numeric_limits<float>::max());
+			for (unsigned int k=0; k<n_cand; ++k)
+				run(k, 2);
+			for (unsigned int r=0; r<rounds; ++r)
+				for (unsigned int k=0; k<n_cand; ++k)
+				{
+					HIP_Check(hipEventRecord(start, Stream()), "hipEventRecord");
+					run(k, pairs);
+					HIP_Check(hipEventRecord(stop, Stream()), "hipEventRecord");
+					HIP_Check(hipEventSynchronize(stop), "hipEventSynchronize");
+					float ms = 0;
+					HIP_Check(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
+					best[k] = std::min(best[k], 1000*ms/pairs);
+				}
+			unsigned int fastest = 0;
+			for (unsigned int k=1; k<n_cand; ++k)
+				if (best[k]<best[fastest])
+					fastest = k;
+			unsigned int b = 0;
+			while (best[b]>tie*best[fastest])
+				++b;
+			shape_mode = (candidates[b].y==1) ? 3 : 1;
+			shape_tz = candidates[b].x;
+			shape_ty = candidates[b].y;
+			reason << "timed:";
+			for (unsigned int k=0; k<n_cand; ++k)
+				reason << " " << name(candidates[k]) << " " << std::fixed << std::setprecision(1) << best[k] << " us";
+			reason << " per voltage and current update, best " << name(candidates[b]);
+			if (b!=fastest)
+				reason << " (" << name(candidates[fastest]) << " within 0.5 %: the first listed wins)";
+			if (!compact_ok)
+				reason << " (compact layouts refused: a Mur z face's line and shift line in different warps)";
+		}
+		else
+		{
+			(void)hipGetLastError();
+			shape_mode = 0;
+			reason << "default, no nodes or not enough device memory to time the shapes";
+		}
+		if (start)
+			(void)hipEventDestroy(start);
+		if (stop)
+			(void)hipEventDestroy(stop);
+		Flush();
+		Free(v);
+		Free(i);
+	}
+	shape_block = MainBlock(threads_z, E.ny-B.ny);
+	if (verbose)
+		std::cout << "GPU_Backend_HIP: shape: " << (MainCompact() ? "c" : "") << shape_block.x
+		          << (MainCompact() ? std::string() : "x" + std::to_string(shape_block.y)) << " (" << reason.str() << ")" << std::endl;
 }
 
 void GPU_Backend_HIP::Impl::FreeSnapshots()
@@ -879,17 +1666,116 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->dim.nx = numLines[0];
 	d->dim.ny = numLines[1];
 	d->dim.nz = numLines[2];
+	d->dim.nzd = numLines[2];
 	d->numCells = (size_t)numLines[0]*numLines[1]*numLines[2];
+	// OPENEMS_HIP_ZPAD: the z lines of the device layout are stored with a stride rounded up to a multiple of 64, so that
+	// every line starts on the same alignment (see nijk()). auto (default): padded if the fused step will be blocked (the
+	// separate main kernels gain from it; the fused step does not), unless the padding would more than double the z
+	// lines or the padded fields and full coefficient arrays (24 + 48 bytes a node, the most the main update allocates)
+	// would take more than half of the free device memory; 0: off. The prediction of the fused step is the test of
+	// CreateExtension() on the operator extensions (each becomes one engine extension), the sub-grids and
+	// OPENEMS_HIP_FUSED_STEP=0; the other reasons are only known later (UPML that cannot fuse, an excited current on a
+	// last line, memory): those grids keep the unpadded layout with the separate kernels.
+	const unsigned int zpad = 64;
+	const char* zpad_env = getenv("OPENEMS_HIP_ZPAD");
+	const bool zpad_auto = !(zpad_env && (std::string(zpad_env)=="0"));
+	if (zpad_env && zpad_auto && (std::string(zpad_env)!="auto"))
+		std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_ZPAD=" << zpad_env << " is not auto or 0, using auto" << std::endl;
+	std::string zpad_reason;   // what blocks the fused step (auto pads), empty: nothing
+	std::string zpad_skip;     // why auto does not pad although the fused step is blocked
+	if (zpad_auto)
+	{
+		const char* fused_env = getenv("OPENEMS_HIP_FUSED_STEP");
+		if (fused_env && (atoi(fused_env)==0))
+			zpad_reason = "OPENEMS_HIP_FUSED_STEP=0";
+		else if ((d->fused_blockers>0) || dynamic_cast<const Operator_CylinderMultiGrid*>(op))
+			zpad_reason = "a sub-grid";   // a sub-grid (see NewSubGridBackend()), or the grid of a multi-grid operator, which gets one
+		for (size_t n=0; (n<op->GetNumberOfExtentions()) && zpad_reason.empty(); ++n)
+		{
+			Operator_Extension* op_ext = op->GetExtension(n);
+			if (!dynamic_cast<Operator_Ext_UPML*>(op_ext) && !dynamic_cast<Operator_Ext_Excitation*>(op_ext)
+			    && !dynamic_cast<Operator_Ext_LumpedRLC*>(op_ext) && !dynamic_cast<Operator_Ext_SteadyState*>(op_ext))
+				zpad_reason = op_ext->GetExtensionName();
+		}
+		if (!zpad_reason.empty())
+		{
+			const unsigned int nzd = (numLines[2] + zpad - 1)/zpad*zpad;
+			const size_t padded_bytes = (size_t)numLines[0]*numLines[1]*nzd*(24 + 48);
+			size_t free_bytes = 0, total_bytes = 0;
+			std::ostringstream skip;
+			if (nzd - numLines[2] > numLines[2])
+				skip << "the padding would more than double the " << numLines[2] << " z lines";
+			else if (hipMemGetInfo(&free_bytes, &total_bytes)!=hipSuccess)
+			{
+				(void)hipGetLastError();
+				skip << "the free device memory is unknown";
+			}
+			else if (padded_bytes > free_bytes/2)
+				skip << "the padded fields and coefficients (" << (padded_bytes>>20) << " MiB) would take more than half of the free device memory ("
+				     << (free_bytes>>20) << " MiB)";
+			zpad_skip = skip.str();
+			if (zpad_skip.empty())
+				d->dim.nzd = nzd;
+		}
+	}
+	d->numCellsD = (size_t)numLines[0]*numLines[1]*d->dim.nzd;
+	if (g_settings.GetVerboseLevel()>1)
+	{
+		if (d->dim.nzd!=d->dim.nz)
+		{
+			std::ostringstream pct;
+			pct << std::fixed << std::setprecision(1) << 100.0*(d->dim.nzd - d->dim.nz)/d->dim.nz;
+			std::cout << "GPU_Backend_HIP: z padding: " << d->dim.nz << " lines stored as " << d->dim.nzd << " (auto: the fused step is blocked by "
+			          << zpad_reason << ", " << pct.str() << " % more field memory)" << std::endl;
+		}
+		else if (!zpad_auto)
+			std::cout << "GPU_Backend_HIP: z padding: off" << std::endl;
+		else if (zpad_reason.empty())
+			std::cout << "GPU_Backend_HIP: z padding: off (auto: fused step)" << std::endl;
+		else
+			std::cout << "GPU_Backend_HIP: z padding: off (auto: the fused step is blocked by " << zpad_reason << ", but " << zpad_skip << ")" << std::endl;
+	}
+	// OPENEMS_HIP_SHAPE: auto (default: timed, see DecideShape()) or 0 Block()
+	d->shape_mode = 2;
+	if (const char* env = getenv("OPENEMS_HIP_SHAPE"))
+	{
+		const std::string shape = env;
+		unsigned int tz = 0, ty = 0;
+		char tail = 0;
+		if (shape=="0")
+			d->shape_mode = 0;
+		else if ((sscanf(shape.c_str(), "c%u%c", &tz, &tail)==1) && (tz>0) && (tz%64==0) && (tz<=256))
+		{
+			d->shape_mode = 3;
+			d->shape_tz = tz;
+			d->shape_ty = 1;
+			d->shape_forced = true;
+		}
+		else if ((sscanf(shape.c_str(), "%ux%u%c", &tz, &ty, &tail)==2) && (tz>0) && (ty>1) && (tz*ty<=256))
+		{
+			d->shape_mode = 1;
+			d->shape_tz = tz;
+			d->shape_ty = ty;
+			d->shape_forced = true;
+		}
+		else if (shape!="auto")
+			std::cerr << "GPU_Backend_HIP: OPENEMS_HIP_SHAPE=" << shape << " is not 0, auto, cN or TZxTY, using auto" << std::endl;
+	}
 	d->main_start.nx = d->main_start.ny = d->main_start.nz = 0;
 	d->main_stop = d->dim;
 	d->upml_fused = -1;
 	d->ResetZSlabs();
+	d->window = HIP_ParseWindowKnob(getenv("OPENEMS_HIP_WINDOW"), d->dim.nx);
 
 	// the main updates launch one block per x line along z, which the device limits (64k on AMD and NVIDIA);
 	// from the properties: hipDeviceGetAttribute calls the CUDA driver API on NVIDIA, which the
 	// plugin does not link (MSVC keeps that call, GCC folds it away)
 	hipDeviceProp_t prop;
 	HIP_Check(hipGetDeviceProperties(&prop, d->ctx->device), "hipGetDeviceProperties");
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << "GPU_Backend_HIP: " << prop.name << ": " << prop.multiProcessorCount << " multiprocessors, L2 cache "
+		          << prop.l2CacheSize/(1024*1024) << " MiB, warp size " << d->ctx->warp_size << std::endl;
+	d->l2_bytes = prop.l2CacheSize>0 ? (size_t)prop.l2CacheSize : 0;
 	int max_grid_z = prop.maxGridSize[2];
 	if ((max_grid_z>0) && (d->dim.nx>(unsigned int)max_grid_z))
 	{
@@ -900,7 +1786,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 
 	// The fused step indexes with 32 bit on NVIDIA while the fields fit (faster there), with
 	// 64 bit on AMD; OPENEMS_HIP_INDEX=32 or 64 overrides.
-	const bool fits32 = 3*d->numCells <= UINT_MAX;
+	const bool fits32 = 3*d->numCellsD <= UINT_MAX;
 #ifdef __HIP_PLATFORM_AMD__
 	d->index32 = false;
 #else
@@ -914,19 +1800,24 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 		d->index32 = false;
 	}
 
-	const size_t count = 3*d->numCells;
+	const size_t count = 3*d->numCellsD;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	if (d->window.on)
+		d->step_base = d->Alloc<int>(1);
 
 	// upload the final operator coefficients, including all changes by operator extensions.
-	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
-	// every distinct set of the 12 coefficients of a node once and a set index per node
+	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store every distinct set of
+	// the 12 coefficients of a node once and a 16 or 32 bit set index per node. Where the sets do not pay
+	// (GPU_FindSets() refuses: too many distinct sets, e.g. a graded mesh with many spacings), the four full
+	// arrays below (48 bytes per node); the kernels read either form (coeff_mode, logged at verbose level 2)
 	GPU_CoeffSets sets;
 	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
 		d->coeff_mode = sets.mode;
-		d->index = d->AllocIndex(sets);
+		d->index = d->AllocIndex(sets, d->dim.nzd!=d->dim.nz);   // per node of the device layout
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		d->coeff_table_bytes = sets.table.size()*sizeof(float);
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
@@ -936,7 +1827,13 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	// the full arrays, one host copy at a time
 	d->coeff_mode = 0;
 	std::vector<float> values;
-	auto upload = [&](int c) {GPU_CoefficientArray(op, numLines, c, values); return d->Alloc<float>(count, values.data());};
+	auto upload = [&](int c)
+	{
+		GPU_CoefficientArray(op, numLines, c, values);
+		if (d->dim.nzd!=d->dim.nz)
+			values = d->Padded(values.data(), values.size());   // per node of the device layout
+		return d->Alloc<float>(count, values.data());
+	};
 	d->vv = upload(0);
 	d->vi = upload(1);
 	d->ii = upload(2);
@@ -947,7 +1844,10 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 void GPU_Backend_HIP::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
-	if (d->DecideFusedStep())
+	const bool fused = d->DecideFusedStep();
+	d->DecideShape();       // once, after the fused step and before DecideMurFused() (which may refuse a shape)
+	d->DecideMurFused();   // once, after the pre hooks of the first timestep (the UPML decides its regions there)
+	if (fused)
 	{
 		// the main nodes, or the whole grid with the UPML regions in the kernel (see update_fused)
 		HIP_GridDim B = d->main_start;
@@ -985,7 +1885,30 @@ void GPU_Backend_HIP::UpdateVoltages()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	HIP_Launch(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	if ((d->mur_mode==1) && d->mur.active)
+	{
+		// the nodes off the Mur planes, then those on them (disjoint, see mur_volt_component); mode 2: the interior
+		// of the z faces in the first kernel (see mur_zface_lane), the box spans all z lines, so mur_shell has no
+		// z-face slabs (its threads past the count would otherwise run into them)
+		HIP_MurShell S = d->mur_shell;
+		if (d->mur_zf_on)
+		{
+			S.L.nz = d->main_start.nz;
+			S.H.nz = d->main_stop.nz;
+			HIP_MurZFaces M = d->mur_zf;
+			M.active = (d->mur.active>>4) & 3u;
+			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, M);
+		}
+		else
+			HIP_LaunchMain(d, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs, S, d->mur_zf);
+		HIP_Launch(d, "mur_shell", mur_shell, d->mur_shell_count, 1, 1,
+		            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim,
+		            S, (const HIP_MurFace*)d->mur_dev, d->mur.active);
+		return;
+	}
+	HIP_LaunchMain(d, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
@@ -1005,8 +1928,991 @@ void GPU_Backend_HIP::UpdateCurrents()
 	HIP_GridDim B, E;
 	unsigned int threads_z;
 	d->MainRange(B, E, threads_z);
-	HIP_Launch(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	HIP_LaunchMain(d, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
 	            d->curr, (const float*)d->volt, (const void*)d->index, (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, B, E, d->zslabs);
+}
+
+/************************** windowed blocks (OPENEMS_HIP_WINDOW) **************************/
+
+// The timestep of the block about to run, for the window-capable extensions (see GPU_Extension::LaunchInWindow()):
+// written on the work stream before the block (outside a captured graph, whose arguments are frozen), so the
+// launches of the block read the value of its launch
+__global__ void set_step(int* step_base, int step)
+{
+	if (blockIdx.x*blockDim.x + threadIdx.x == 0)
+		*step_base = step;
+}
+
+// OPENEMS_HIP_WINDOW when it is not set: the windowed blocks with the tuner; "0" keeps the single step
+static const char* const HIP_WINDOW_DEFAULT = "auto";
+
+GPU_Backend_HIP::Impl::WindowKnob HIP_ParseWindowKnob(const char* text, unsigned int nx)
+{
+	GPU_Backend_HIP::Impl::WindowKnob k;
+	k.on = k.valid = k.automatic = k.tune = false;
+	k.T = k.W = k.B = 0;
+	k.text = text ? text : HIP_WINDOW_DEFAULT;
+	if (k.text.empty() || (k.text=="0"))
+		return k;
+	k.on = true;
+	if ((k.text=="auto") || (k.text=="rule"))
+	{
+		k.valid = k.automatic = true;
+		k.tune = (k.text=="auto");
+		k.T = 8;
+		return k;
+	}
+	// T,W[,B]
+	std::vector<std::string> f;
+	std::string::size_type a = 0;
+	while (true)
+	{
+		const std::string::size_type b = k.text.find(',', a);
+		f.push_back(k.text.substr(a, b==std::string::npos ? std::string::npos : b-a));
+		if (b==std::string::npos)
+			break;
+		a = b+1;
+	}
+	auto number = [](const std::string& v, unsigned int& out)
+	{
+		if (v.empty() || (v.size()>9) || (v.find_first_not_of("0123456789")!=std::string::npos))
+			return false;
+		out = (unsigned int)atoi(v.c_str());
+		return true;
+	};
+	if ((f.size()<2) || (f.size()>3) || !number(f[0], k.T))
+		return k;
+	if (f[1]=="NX")
+		k.W = nx;
+	else if (!number(f[1], k.W))
+		return k;
+	if ((f.size()==3) && !number(f[2], k.B))
+		return k;
+	k.valid = (k.T>0) && (k.T<=256) && (k.W>0);
+	return k;
+}
+
+unsigned int HIP_WindowRule(size_t l2_bytes, size_t plane_bytes, unsigned int T, unsigned int nx, size_t table_bytes,
+                            double margin, unsigned int halo)
+{
+	if ((plane_bytes==0) || (nx==0))
+		return std::max(nx, 1u);
+	double budget = margin*(double)l2_bytes;
+	if ((double)table_bytes<budget/3)
+		budget -= (double)table_bytes;
+	const double w = std::floor(budget/(double)plane_bytes) - (halo ? (double)halo : (T + 1.0));
+	const unsigned int W = (w<1) ? 1u : (unsigned int)std::min(w, (double)nx);
+	return std::max(1u, std::min(W, nx));
+}
+
+unsigned int HIP_WindowRuleTW(size_t l2_bytes, size_t plane_bytes, unsigned int& T, unsigned int nx, size_t table_bytes)
+{
+	// fewer than T planes a window: the next smaller T has a shorter halo and leaves more of the budget to the window
+	while (true)
+	{
+		const unsigned int W = HIP_WindowRule(l2_bytes, plane_bytes, T, nx, table_bytes);
+		if ((W>=T) || (W>=nx) || (T<=2))
+			return W;
+		T = (T>8) ? 8 : (T>4) ? 4 : 2;
+	}
+}
+
+unsigned int GPU_Backend_HIP::Impl::MurActive(unsigned int ts) const
+{
+	unsigned int active = 0;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (ts>=mur_planes[k].start_ts)
+			active |= 1u<<(2*mur_planes[k].ny + (mur_planes[k].line>0 ? 1 : 0));
+	return active;
+}
+
+unsigned int GPU_Backend_HIP::Impl::MurNextChange(unsigned int ts) const
+{
+	unsigned int next = UINT_MAX;
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].start_ts>ts)
+			next = std::min(next, mur_planes[k].start_ts);
+	return next;
+}
+
+void GPU_Backend_HIP::Impl::WindowVoltages(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1, unsigned int mur_active)
+{
+	const bool c = coeff_mode>0;
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	if ((mur_mode==1) && mur_active)
+	{
+		// the launches of UpdateVoltages() on the window: update_voltages_inner on the main range cut to the window,
+		// which skips the nodes outside the box [S.L, S.H) as before, then mur_shell on the shell nodes inside the
+		// window: the box [S.B, S.E) and the inner box cut to the window (the same shell, intersected)
+		mur.active = mur_active;
+		HIP_MurShell S = mur_shell;
+		HIP_MurZFaces M = mur_zf;
+		if (mur_zf_on)
+		{
+			S.L.nz = main_start.nz;
+			S.H.nz = main_stop.nz;
+			M.active = (mur_active>>4) & 3u;
+			HIP_LaunchMain(this, "update_voltages_inner", update_voltages_inner<true>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs, S, M);
+		}
+		else
+			HIP_LaunchMain(this, "update_voltages_inner", update_voltages_inner<false>, threads_z, E.ny-B.ny, E.nx-B.nx,
+			            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs, S, M);
+		HIP_MurShell W = S;
+		W.B.nx = std::max(S.B.nx, x0); W.E.nx = std::min(S.E.nx, x1);
+		W.B.ny = std::max(S.B.ny, y0); W.E.ny = std::min(S.E.ny, y1);
+		if ((W.E.nx<=W.B.nx) || (W.E.ny<=W.B.ny))
+			return;
+		W.L.nx = std::min(std::max(S.L.nx, W.B.nx), W.E.nx); W.H.nx = std::min(std::max(S.H.nx, W.L.nx), W.E.nx);
+		W.L.ny = std::min(std::max(S.L.ny, W.B.ny), W.E.ny); W.H.ny = std::min(std::max(S.H.ny, W.L.ny), W.E.ny);
+		const size_t count = (size_t)(W.E.nx-W.B.nx)*(W.E.ny-W.B.ny)*(W.E.nz-W.B.nz) - (size_t)(W.H.nx-W.L.nx)*(W.H.ny-W.L.ny)*(W.H.nz-W.L.nz);
+		HIP_Launch(this, "mur_shell", ::mur_shell, count, 1, 1,
+		            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim,
+		            W, (const HIP_MurFace*)mur_dev, mur_active);
+		return;
+	}
+	HIP_LaunchMain(this, "update_voltages", update_voltages, threads_z, E.ny-B.ny, E.nx-B.nx,
+	            volt, (const float*)curr, (const void*)index, (const float*)(c ? coeff : vv), (const float*)(c ? coeff : vi), coeff_mode, dim, B, E, zslabs);
+}
+
+void GPU_Backend_HIP::Impl::WindowCurrents(unsigned int x0, unsigned int x1, unsigned int y0, unsigned int y1)
+{
+	const bool c = coeff_mode>0;
+	HIP_GridDim B, E;
+	unsigned int threads_z;
+	MainRange(B, E, threads_z);
+	B.nx = std::max(B.nx, x0); E.nx = std::min(E.nx, x1);
+	B.ny = std::max(B.ny, y0); E.ny = std::min(E.ny, y1);
+	if ((E.nx<=B.nx) || (E.ny<=B.ny))
+		return;
+	HIP_LaunchMain(this, "update_currents", update_currents, threads_z, E.ny-B.ny, E.nx-B.nx,
+	            curr, (const float*)volt, (const void*)index, (const float*)(c ? coeff : ii), (const float*)(c ? coeff : iv), coeff_mode, dim, B, E, zslabs);
+}
+
+bool GPU_Backend_HIP::Impl::WindowPrepare()
+{
+	if (window_ready>=0)
+		return window_ready>0;
+	window_ready = 0;
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// the decisions the single step makes in the hooks and the first voltage update, before anything is captured
+	for (size_t k=0; k<window_exts.size(); ++k)
+		if (HIP_WindowHooks* h = dynamic_cast<HIP_WindowHooks*>(window_exts[k]))
+			h->WindowPrepare();
+	DecideShape();
+	DecideMurFused();
+	if (!mur_planes.empty() && (mur_mode!=1))
+	{
+		// the three launches per plane of mode 0 work on whole planes: not in the windows
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: refused: the Mur planes are not in the voltage update (Mur fused: 0)" << std::endl;
+		window_used = false;
+		return false;
+	}
+	// plane bytes: the fields and the coefficient index (or the full coefficient arrays) of one x plane
+	const size_t plane_bytes = (size_t)dim.ny*dim.nzd*(24 + CoeffBytesPerNode());
+	tune_plane_bytes = plane_bytes;
+	if (window.automatic)
+	{
+		win_T = window.T;
+		win_W = HIP_WindowRuleTW(l2_bytes, plane_bytes, win_T, dim.nx, coeff_table_bytes);
+		tune_rule_T = win_T;
+		tune_rule_W = win_W;
+		win_source = "rule";
+		if (window.tune)
+			WindowTunePrepare();
+	}
+	else
+	{
+		win_T = window.T;
+		win_W = std::min(window.W, dim.nx);
+		win_source = "forced";
+	}
+	win_B = window.B;
+	// a V frontier must not fall between the line and the shift line of a Mur plane on an x face (the thread of the
+	// shift line writes the line, mur_volt_component): snapped down below both (see WindowFrontiers())
+	win_forbidden.clear();
+	for (size_t k=0; k<mur_planes.size(); ++k)
+		if (mur_planes[k].ny==0)
+			for (unsigned int e=std::min(mur_planes[k].line, mur_planes[k].shift)+1; e<=std::max(mur_planes[k].line, mur_planes[k].shift); ++e)
+				win_forbidden.push_back(e);
+	window_graphs_on = !HIP_KernelTimes::Enabled();
+	if (verbose && (win_B>0))
+	{
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: B=" << win_B << " unused: the windows span all y lines (a slab of "
+		     << (4*win_T+1) << " planes is " << std::fixed << std::setprecision(1) << (4.0*win_T+1)*plane_bytes/1e6
+		     << " MB, L2 " << l2_bytes/(1024*1024) << " MiB)";
+		std::cout << line.str() << std::endl;
+	}
+	window_ready = 1;
+	return true;
+}
+
+void GPU_Backend_HIP::Impl::WindowFrontiers(unsigned int F, unsigned int L, std::vector<unsigned int>& eV, std::vector<unsigned int>& eI) const
+{
+	// Frontiers along x of a window: after its launches of step b the voltages of the planes below eV[b] and the
+	// currents of the planes below eI[b] are at step b of the block. The voltage update of plane x reads the currents
+	// of x-1 and x, the current update of x the voltages of x and x+1 (none on the last plane): so eI[b] = eV[b] - 1
+	// (all planes once eV[b] = nx), and eV[b+1] = eI[b] (the voltages of b+1 need the currents of b of x-1 and x; the
+	// currents of b that read a voltage are done before it changes). The window's front F (eV[0]) steps back one plane
+	// per timestep; a frontier that would split a Mur pair (win_forbidden) is snapped down, which keeps both rules.
+	const long long nx = dim.nx;
+	auto snap = [&](long long e)
+	{
+		e = std::max(0LL, std::min(e, nx));
+		while ((e>0) && (std::find(win_forbidden.begin(), win_forbidden.end(), (unsigned int)e)!=win_forbidden.end()))
+			--e;
+		return (unsigned int)e;
+	};
+	eV.assign(L, 0);
+	eI.assign(L, 0);
+	for (unsigned int b=0; b<L; ++b)
+	{
+		const long long cand = (b==0) ? (long long)F : std::min((long long)F - b, (long long)eI[b-1]);
+		eV[b] = snap(cand);
+		eI[b] = (eV[b]>=nx) ? (unsigned int)nx : (eV[b]>0 ? eV[b]-1 : 0);
+	}
+}
+
+void GPU_Backend_HIP::Impl::WindowBlock(unsigned int ts, unsigned int L, unsigned int W, GPU_Extension* host)
+{
+	// The windows march along x: window k covers the planes up to (k+1)*W at step 0 of the block, the last one all.
+	// Per window and step, the voltage half-step on the planes its V frontier newly covers, then the current half-step on
+	// those of its I frontier; each half-step in the hook order of Engine_GPU::VoltageHalfStep()/CurrentHalfStep() (pre
+	// in reverse, the update, post, apply), every hook restricted to the half-step's planes. A cell sees the operations
+	// of the single step in the same order; only the order across cells changes (see WindowFrontiers()).
+	const std::vector<GPU_Extension*>& X = window_exts;
+	const int count = (int)X.size();
+	const unsigned int nx = dim.nx, ny = dim.ny;
+	const unsigned int mur_active = (mur_mode==1) ? MurActive(ts) : 0;
+	HIP_WindowHooks* host_hooks = host ? dynamic_cast<HIP_WindowHooks*>(host) : NULL;
+	std::vector<unsigned int> pV(L, 0), pI(L, 0), eV, eI;
+	for (unsigned int k=0; ; ++k)
+	{
+		const unsigned long long Fk = (unsigned long long)(k+1)*W;
+		const bool last = Fk>=nx;
+		WindowFrontiers(last ? nx + L : (unsigned int)Fk, L, eV, eI);
+		for (unsigned int b=0; b<L; ++b)
+		{
+			if (eV[b]>pV[b])
+			{
+				const unsigned int x0 = pV[b], x1 = eV[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreVoltage, b, x0, x1, 0, ny);
+				WindowVoltages(x0, x1, 0, ny, mur_active);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostVoltage, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+				{
+					X[n]->LaunchInWindow(GPU_WindowApplyVoltage, b, x0, x1, 0, ny);
+					if (host_hooks && (X[n]==host))
+						host_hooks->HostStep(ts + b);
+				}
+			}
+			if (eI[b]>pI[b])
+			{
+				const unsigned int x0 = pI[b], x1 = eI[b];
+				for (int n=count-1; n>=0; --n)
+					X[n]->LaunchInWindow(GPU_WindowPreCurrent, b, x0, x1, 0, ny);
+				WindowCurrents(x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowPostCurrent, b, x0, x1, 0, ny);
+				for (int n=0; n<count; ++n)
+					X[n]->LaunchInWindow(GPU_WindowApplyCurrent, b, x0, x1, 0, ny);
+			}
+		}
+		pV = eV;
+		pI = eI;
+		if (last)
+			break;
+	}
+}
+
+void GPU_Backend_HIP::Impl::WindowRun(unsigned int start_ts, unsigned int n)
+{
+	if (n==0)
+		return;
+	const std::vector<GPU_Extension*>& X = window_exts;
+	std::vector<HIP_WindowHooks*> hooks(X.size(), NULL);
+	for (size_t k=0; k<X.size(); ++k)
+		hooks[k] = dynamic_cast<HIP_WindowHooks*>(X[k]);
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	// capture a block of L timesteps from ts into a graph (its launches are recorded, not run); false if that fails
+	auto capture = [&](unsigned int ts, unsigned int L, WindowGraph& g)
+	{
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		const unsigned long long l0 = launches;
+		std::string what;
+		hipError_t err = hipStreamBeginCapture(Stream(), hipStreamCaptureModeThreadLocal);
+		if (err==hipSuccess)
+		{
+			try
+			{
+				WindowBlock(ts, L, win_W, NULL);
+			}
+			catch (const std::exception& e)
+			{
+				what = e.what();
+			}
+			hipGraph_t graph = NULL;
+			err = hipStreamEndCapture(Stream(), &graph);
+			if (what.empty() && (err!=hipSuccess))
+				what = std::string("hipStreamEndCapture: ") + hipGetErrorString(err);
+			if (what.empty())
+			{
+				err = hipGraphInstantiateWithFlags(&g.exec, graph, 0);
+				if (err!=hipSuccess)
+					what = std::string("hipGraphInstantiate: ") + hipGetErrorString(err);
+			}
+			if (graph)
+				(void)hipGraphDestroy(graph);
+		}
+		else
+			what = std::string("hipStreamBeginCapture: ") + hipGetErrorString(err);
+		(void)hipGetLastError();
+		if (!what.empty())
+		{
+			std::cout << "GPU_Backend_HIP: window: graph capture failed (" << what << "), the same launches without graphs" << std::endl;
+			window_graphs_on = false;
+			return false;
+		}
+		g.launches = launches - l0;
+		g.capture_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if (verbose && window_logged)
+		{
+			std::ostringstream line;
+			line << "GPU_Backend_HIP: window: graph " << window_graphs.size()+1 << " for blocks of " << L << " steps (" << g.launches
+			     << " launches, captured in " << std::fixed << std::setprecision(1) << g.capture_ms << " ms)";
+			std::cout << line.str() << std::endl;
+		}
+		return true;
+	};
+	unsigned int ts = start_ts;
+	const unsigned int end = start_ts + n;
+	while (ts<end)
+	{
+		// the next timestep an extension needs the host in (run alone, over the whole grid)
+		unsigned int host_ts = UINT_MAX;
+		GPU_Extension* host = NULL;
+		for (size_t k=0; k<X.size(); ++k)
+			if (hooks[k])
+			{
+				const unsigned int h = hooks[k]->NextHostStep(ts);
+				if (h<host_ts)
+				{
+					host_ts = h;
+					host = X[k];
+				}
+			}
+		HIP_Launch(this, "set_step", set_step, 1, 1, 1, step_base, (int)ts);
+		unsigned int L = 1;
+		if (host_ts==ts)
+			WindowBlock(ts, 1, dim.nx, host);
+		else
+		{
+			L = std::min(win_T, end - ts);
+			if (host_ts!=UINT_MAX)
+				L = std::min(L, host_ts - ts);
+			if (mur_mode==1)
+			{
+				const unsigned int change = MurNextChange(ts);
+				if (change!=UINT_MAX)
+					L = std::min(L, change - ts);   // the active Mur planes are an argument of the launches
+			}
+			bool done = false;
+			if (window_graphs_on)
+			{
+				std::vector<unsigned int> key(3);
+				key[0] = L;
+				key[1] = win_W;
+				key[2] = (mur_mode==1) ? MurActive(ts) : 0;
+				std::map<std::vector<unsigned int>, WindowGraph>::iterator it = window_graphs.find(key);
+				if ((it==window_graphs.end()) && (window_graphs.size()<32))
+				{
+					WindowGraph g;
+					if (capture(ts, L, g))
+						it = window_graphs.insert(std::make_pair(key, g)).first;
+				}
+				if (it!=window_graphs.end())
+				{
+					HIP_Check(hipGraphLaunch(it->second.exec, Stream()), "hipGraphLaunch");
+					done = true;
+				}
+			}
+			if (!done)
+			{
+				const unsigned long long l0 = launches;
+				WindowBlock(ts, L, win_W, NULL);
+				if (L==win_T)
+					window_block_launches = launches - l0;
+			}
+		}
+		for (size_t k=0; k<X.size(); ++k)
+			X[k]->EndOfBlock(ts + L - 1);
+		ts += L;
+		++window_blocks;
+	}
+	window_steps += n;
+}
+
+float GPU_Backend_HIP::Impl::WindowTimedRun(unsigned int start_ts, unsigned int n)
+{
+	hipEvent_t start = NULL, stop = NULL;
+	HIP_Check(hipEventCreate(&start), "hipEventCreate");
+	HIP_Check(hipEventCreate(&stop), "hipEventCreate");
+	HIP_Check(hipEventRecord(start, Stream()), "hipEventRecord");
+	WindowRun(start_ts, n);
+	HIP_Check(hipEventRecord(stop, Stream()), "hipEventRecord");
+	HIP_Check(hipEventSynchronize(stop), "hipEventSynchronize");
+	float ms = 0;
+	HIP_Check(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
+	(void)hipEventDestroy(start);
+	(void)hipEventDestroy(stop);
+	return ms;
+}
+
+// The tuner of OPENEMS_HIP_WINDOW=auto: a short list of (T, W) candidates, each timed on the live grid with one warm-up
+// block (which captures its graphs) and HIP_TUNE_REPEATS timed pairs of blocks of its T (WindowTimedRun(); the fastest
+// pair counts, as interference only adds time), the three best refined once with W -25 % and +25 %, then the three best
+// timed again in turn (HIP_TUNE_FINAL_ROUNDS rounds, against a drift of the device between the candidates' turns), the
+// best measured one runs from then on; a near tie (HIP_TUNE_TIE) goes to the larger T, then the larger W. The
+// candidates run real timesteps, in the chunks the engine hands over: every schedule is bit-identical to the single
+// step (the frontiers of WindowFrontiers()), so the tune does not change the result and costs only the slower
+// candidates' time; nothing is copied or restored. The tune starts once the fields fill the grid (WindowTuneDefer()).
+static const unsigned int HIP_TUNE_MAX_CANDIDATES = 13;   // the first list (the refinement adds up to 6)
+static const unsigned int HIP_TUNE_MAX_CHUNKS = 16;       // a tune not done after these chunks keeps its best so far
+static const unsigned int HIP_TUNE_REPEATS = 3;           // timed pairs of blocks per candidate
+static const unsigned int HIP_TUNE_FINALISTS = 3;         // the best candidates timed again in turn
+static const unsigned int HIP_TUNE_FINAL_ROUNDS = 2;      // rounds of the finalists, HIP_TUNE_FINAL_PAIRS pairs each
+static const unsigned int HIP_TUNE_FINAL_PAIRS = 2;
+static const double HIP_TUNE_TIE = 0.01;                  // within this of the best: the larger T, then the larger W
+// the probe of the tune's start (WindowTuneDefer()): a buffer of incompressible values of this size against the fields
+static const size_t HIP_TUNE_PROBE_FLOATS = (size_t)64<<20;
+static const double HIP_TUNE_PROBE_RATIO = 1.10;          // the fields read this much faster than the buffer: compressed
+static const double HIP_TUNE_PROBE_GROWTH = 0.02;         // the read slowed down less than this since the last probe: filled
+static const unsigned int HIP_TUNE_MAX_DEFER_CHUNKS = 12; // the tune starts after these chunks at the latest
+static const double HIP_TUNE_ONE_WINDOW_MARGIN = 1.10;  // one window over all of x must be this much faster (WindowTuneFinish())
+
+// The probe of the tune's start (WindowTuneDefer()): the sum of n floats in fours, kept only when it equals a
+// sentinel, so that the loads stay; the threads stride over the buffer
+__global__ void tune_probe_read(const float* p, size_t n, float* out)
+{
+	const size_t threads = (size_t)gridDim.x*blockDim.x;
+	float s = 0;
+	for (size_t i=4*((size_t)blockIdx.x*blockDim.x + threadIdx.x); i+3<n; i+=4*threads)
+		s += p[i] + p[i+1] + p[i+2] + p[i+3];
+	if (s==-1.2345e38f)
+		out[0] = s;
+}
+
+// the reference buffer of the probe: a random mantissa in [1, 2) per value (incompressible)
+__global__ void tune_probe_fill(float* p, size_t n)
+{
+	const size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+	if (i>=n)
+		return;
+	unsigned int h = (unsigned int)i*2654435761u;
+	h ^= h>>15;
+	h *= 0x846ca68bu;
+	h ^= h>>16;
+	p[i] = __uint_as_float((h & 0x007FFFFFu) | 0x3F800000u);
+}
+
+bool GPU_Backend_HIP::Impl::WindowTuneDefer(unsigned int ts)
+{
+	// A GPU that compresses the near-zero fields of the first timesteps (the Arc B580: a PCB model of 28.7 Mcells
+	// starts at 7200 MC/s and settles at 5300 after 6000 timesteps) times the candidates in a state that ranks
+	// them differently from the filled grid. So the tune waits, with the rule's schedule, while a read of the
+	// fields runs faster than one of the reference buffer and the read still slows down from chunk to chunk; at
+	// most HIP_TUNE_MAX_DEFER_CHUNKS chunks (a grid that stays partly zero). Without room for the reference the
+	// tune starts at once.
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	if (tune_probe_done)
+		return false;
+	if (tune_defer_chunks>=HIP_TUNE_MAX_DEFER_CHUNKS)
+	{
+		Free(tune_probe_ref);
+		tune_probe_ref = NULL;
+		tune_probe_done = true;
+		return false;
+	}
+	const size_t nr = HIP_TUNE_PROBE_FLOATS;
+	const size_t nf = 3*numCellsD;
+	if (2*nf<nr/4)
+	{
+		// fields of less than a quarter of the reference (64 MB): their read is too short against the launch to
+		// compare, and the tune on the first timesteps costs little there
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: the fields are smaller than the probe's reference, the tune starts at timestep " << ts << std::endl;
+		tune_probe_done = true;
+		return false;
+	}
+	if (tune_probe_ref==NULL)
+	{
+		tune_probe_ref = TryAlloc<float>(nr + 4);
+		if (tune_probe_ref==NULL)
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: no device memory for the probe's reference, the tune starts at timestep " << ts << std::endl;
+			tune_probe_done = true;
+			return false;
+		}
+		HIP_Launch(this, "tune_probe_fill", tune_probe_fill, nr, 1, 1, tune_probe_ref, nr);
+	}
+	// the fields (voltages and currents) and the reference in turn, the fastest of three each (the host clock
+	// between two synchronizations)
+	const float* ref = tune_probe_ref;
+	float* out = tune_probe_ref + nr;
+	const size_t threads = (size_t)1<<18;
+	double ms_fields = -1, ms_ref = -1;
+	for (unsigned int r=0; r<3; ++r)
+	{
+		Flush();
+		std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, (const float*)volt, nf, out);
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, (const float*)curr, nf, out);
+		Flush();
+		const double mf = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		t0 = std::chrono::steady_clock::now();
+		HIP_Launch(this, "tune_probe_read", tune_probe_read, threads, 1, 1, ref, nr, out);
+		Flush();
+		const double mr = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if ((ms_fields<0) || (mf<ms_fields))
+			ms_fields = mf;
+		if ((ms_ref<0) || (mr<ms_ref))
+			ms_ref = mr;
+	}
+	if ((ms_fields<=0) || (ms_ref<=0))
+		return false;
+	const double fields_gbs = 2.0*nf*sizeof(float)/(ms_fields*1e6);
+	const double ref_gbs = (double)nr*sizeof(float)/(ms_ref*1e6);
+	const double ratio = fields_gbs/ref_gbs;
+	const double growth = (tune_probe_ms>0) ? ms_fields/tune_probe_ms - 1.0 : 1.0;
+	const bool wait = (ratio>HIP_TUNE_PROBE_RATIO) && (growth>HIP_TUNE_PROBE_GROWTH);
+	tune_probe_ms = ms_fields;
+	tune_probe_ratio = ratio;
+	if (verbose)
+	{
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: probe at timestep " << ts << ": the fields read at " << std::fixed << std::setprecision(0)
+		     << fields_gbs << " GB/s, the reference at " << ref_gbs << " GB/s (" << std::setprecision(2) << ratio << "x";
+		if (tune_defer_chunks>0)
+			line << ", the read " << std::setprecision(1) << growth*100 << " % slower than at the last probe";
+		line << "): the tune " << (wait ? "waits (the rule's schedule)" : "starts");
+		std::cout << line.str() << std::endl;
+	}
+	if (wait)
+	{
+		++tune_defer_chunks;
+		return true;
+	}
+	Free(tune_probe_ref);
+	tune_probe_ref = NULL;
+	tune_probe_done = true;
+	return false;
+}
+
+void GPU_Backend_HIP::Impl::WindowTunePrepare()
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	tune_cands.clear();
+	tune_state = 0;
+	// the candidates: the rule (its T and W), then T in {8, 16, 4, 2} with the halo of T+1 planes at 0.65, 0.45 and
+	// 0.85 of L2; equal pairs once, at most HIP_TUNE_MAX_CANDIDATES
+	auto add = [&](unsigned int T, unsigned int W)
+	{
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if ((tune_cands[k].T==T) && (tune_cands[k].W==W))
+				return;
+		if (tune_cands.size()<HIP_TUNE_MAX_CANDIDATES)
+		{
+			WindowCandidate c = {T, W, -1, -1};
+			tune_cands.push_back(c);
+		}
+	};
+	add(tune_rule_T, tune_rule_W);
+	// one window over all of x, the single step's work in graphs: the fastest where the L2 gains less than the small
+	// extension kernels of many windows cost (H100, A100: each window runs them again, a few us each)
+	add(16, dim.nx);
+	static const unsigned int Ts[] = {8, 16, 4, 2};
+	static const double margins[] = {0.65, 0.45, 0.85};
+	for (unsigned int t=0; t<4; ++t)
+		for (unsigned int m=0; m<3; ++m)
+			add(Ts[t], HIP_WindowRule(l2_bytes, tune_plane_bytes, Ts[t], dim.nx, coeff_table_bytes, margins[m], Ts[t] + 1));
+	unsigned int steps = 0;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		steps += (1 + 2*HIP_TUNE_REPEATS)*tune_cands[k].T;
+	tune_final.clear();
+	tune_final_round = tune_final_pos = 0;
+	tune_defer_chunks = 0;
+	tune_probe_done = false;
+	tune_probe_ms = tune_probe_ratio = 0;
+	tune_start_ts = 0;
+	tune_state = 1;
+	win_source = "untuned";
+	if (verbose)
+		std::cout << "GPU_Backend_HIP: window: tuning on " << steps << " timesteps once the fields fill the grid (" << tune_cands.size()
+		          << " candidates of a warm-up block and " << HIP_TUNE_REPEATS << " timed pairs of blocks, then the three best with W -/+25 %,"
+		          << " then the three best " << HIP_TUNE_FINAL_ROUNDS << " more rounds in turn; real timesteps, each candidate bit-identical)" << std::endl;
+}
+
+void GPU_Backend_HIP::Impl::WindowDropGraphs(unsigned int keep_W)
+{
+	for (std::map<std::vector<unsigned int>, WindowGraph>::iterator it=window_graphs.begin(); it!=window_graphs.end(); )
+		if (it->first[1]!=keep_W)
+		{
+			(void)hipGraphExecDestroy(it->second.exec);
+			window_graphs.erase(it++);
+		}
+		else
+			++it;
+}
+
+unsigned int GPU_Backend_HIP::Impl::WindowTune(unsigned int start_ts, unsigned int n)
+{
+	unsigned int used = 0;
+	bool timed_any = false;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		timed_any = timed_any || (tune_cands[k].mcs>=0);
+	if ((tune_state==1) && !timed_any && !tune_probe_done && WindowTuneDefer(start_ts))
+	{
+		// the fields still fill the grid: this chunk runs the rule's schedule
+		win_T = tune_rule_T;
+		win_W = tune_rule_W;
+		WindowDropGraphs(win_W);
+		return 0;
+	}
+	if (!timed_any)
+		tune_start_ts = start_ts;
+	++tune_chunks;
+	// one candidate: a warm-up block of its T (captures the graphs of its W), then timed pairs of blocks; the fastest
+	// pair counts (the host's interference only adds time), the slowest is kept for the spread
+	auto time_candidate = [&](WindowCandidate& c, unsigned int pairs)
+	{
+		win_T = c.T;
+		win_W = c.W;
+		WindowRun(start_ts + used, c.T);
+		used += c.T;
+		tune_steps += c.T;
+		for (unsigned int p=0; p<pairs; ++p)
+		{
+			const float ms = WindowTimedRun(start_ts + used, 2*c.T);
+			const double mcs = (ms>0) ? (double)numCells*2.0*c.T/((double)ms*1e3) : 0;
+			if ((c.mcs<0) || (mcs>c.mcs))
+				c.mcs = mcs;
+			if ((c.mcs_lo<0) || (mcs<c.mcs_lo))
+				c.mcs_lo = mcs;
+			tune_ms += ms;
+			tune_steps += 2*c.T;
+			used += 2*c.T;
+		}
+		WindowDropGraphs(UINT_MAX);   // at most 32 graphs: the next candidate starts empty
+	};
+	while (tune_state>0)
+	{
+		if (tune_state==3)
+		{
+			// the finalists' rounds, in turn
+			while (tune_final_round<HIP_TUNE_FINAL_ROUNDS)
+			{
+				if (tune_final_pos>=tune_final.size())
+				{
+					++tune_final_round;
+					tune_final_pos = 0;
+					continue;
+				}
+				WindowCandidate& c = tune_cands[tune_final[tune_final_pos]];
+				if ((1 + 2*HIP_TUNE_FINAL_PAIRS)*c.T>n-used)
+					break;   // the rest of the chunk is too short: the next chunk continues
+				time_candidate(c, HIP_TUNE_FINAL_PAIRS);
+				++tune_final_pos;
+			}
+			if (tune_final_round>=HIP_TUNE_FINAL_ROUNDS)
+				WindowTuneFinish(true);
+			break;
+		}
+		// the first candidate not measured yet that fits into the rest of the chunk
+		int next = -1;
+		bool pending = false;
+		for (size_t k=0; k<tune_cands.size(); ++k)
+			if (tune_cands[k].mcs<0)
+			{
+				pending = true;
+				if ((1 + 2*HIP_TUNE_REPEATS)*tune_cands[k].T<=n-used)
+				{
+					next = (int)k;
+					break;
+				}
+			}
+		if (!pending)
+		{
+			if (tune_state==2)
+			{
+				// the finalists: the best measured, timed again in turn
+				std::vector<size_t> order(tune_cands.size());
+				for (size_t k=0; k<order.size(); ++k)
+					order[k] = k;
+				std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {return tune_cands[a].mcs>tune_cands[b].mcs;});
+				tune_final.assign(order.begin(), order.begin() + std::min((size_t)HIP_TUNE_FINALISTS, order.size()));
+				tune_final_round = 0;
+				tune_final_pos = 0;
+				tune_state = 3;
+				continue;
+			}
+			// the refinement: the three best measured, each with W -25 % and +25 % (at least one plane apart)
+			std::vector<WindowCandidate> best = tune_cands;
+			std::stable_sort(best.begin(), best.end(), [](const WindowCandidate& a, const WindowCandidate& b) {return a.mcs>b.mcs;});
+			tune_state = 2;
+			for (size_t k=0; (k<3) && (k<best.size()); ++k)
+			{
+				const unsigned int W = best[k].W;
+				if (W>=dim.nx)
+					continue;   // one window over all of x is not refined (W -25 % is two windows, not a better one)
+				const unsigned int lo = std::max(1u, std::min(W - 1, (unsigned int)std::lround(0.75*W)));
+				const unsigned int hi = std::min(dim.nx, std::max(W + 1, (unsigned int)std::lround(1.25*W)));
+				const unsigned int ws[2] = {lo, hi};
+				for (unsigned int j=0; j<2; ++j)
+				{
+					if ((ws[j]<1) || (ws[j]>dim.nx) || (ws[j]==W))
+						continue;
+					bool known = false;
+					for (size_t m=0; m<tune_cands.size(); ++m)
+						known = known || ((tune_cands[m].T==best[k].T) && (tune_cands[m].W==ws[j]));
+					if (!known)
+					{
+						WindowCandidate c = {best[k].T, ws[j], -1, -1};
+						tune_cands.push_back(c);
+					}
+				}
+			}
+			continue;
+		}
+		if (next<0)
+			break;   // the rest of the chunk is too short for the next candidate
+		time_candidate(tune_cands[next], HIP_TUNE_REPEATS);
+	}
+	if ((tune_state>0) && (tune_chunks>=HIP_TUNE_MAX_CHUNKS))
+		WindowTuneFinish(false);
+	if (tune_state>0)
+	{
+		// the rest of this chunk: the best so far once the rule (the first candidate) is measured, the rule until then
+		win_T = tune_rule_T;
+		win_W = tune_rule_W;
+		double best = -1;
+		for (size_t k=0; (k<tune_cands.size()) && (tune_cands[0].mcs>=0); ++k)
+			if (tune_cands[k].mcs>best)
+			{
+				best = tune_cands[k].mcs;
+				win_T = tune_cands[k].T;
+				win_W = tune_cands[k].W;
+			}
+		WindowDropGraphs(win_W);
+	}
+	return used;
+}
+
+void GPU_Backend_HIP::Impl::WindowTuneFinish(bool complete)
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	tune_state = 0;
+	Free(tune_probe_ref);
+	tune_probe_ref = NULL;
+	int best = -1;
+	unsigned int measured = 0;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		if (tune_cands[k].mcs>=0)
+		{
+			++measured;
+			if ((best<0) || (tune_cands[k].mcs>tune_cands[best].mcs))
+				best = (int)k;
+		}
+	// a tune the chunks cut short moves away from the rule only when the rule (the first candidate) was timed too
+	const bool rule_timed = !tune_cands.empty() && (tune_cands[0].mcs>=0);
+	if ((best<0) || (!complete && !rule_timed))
+	{
+		win_T = tune_rule_T;
+		win_W = tune_rule_W;
+		win_source = "rule";
+		if (verbose)
+		{
+			std::cout << "GPU_Backend_HIP: window: not tuned, the first " << tune_chunks << " chunks were too short for the "
+			          << (1 + 2*HIP_TUNE_REPEATS)*win_T << " timesteps of the rule's candidate (" << measured << " of " << tune_cands.size()
+			          << " candidates timed): the rule, T=" << win_T << " W=" << win_W << std::endl;
+		}
+		WindowDropGraphs(win_W);
+		return;
+	}
+	// the best windowed candidate: a near tie (HIP_TUNE_TIE) goes to the larger T (fewer blocks a timestep), then
+	// the larger W (fewer windows at the same T), the same bits either way
+	int windowed = -1;
+	double top = -1;
+	for (size_t k=0; k<tune_cands.size(); ++k)
+		if ((tune_cands[k].mcs>=0) && (tune_cands[k].W<dim.nx))
+			top = std::max(top, tune_cands[k].mcs);
+	for (size_t k=0; k<tune_cands.size(); ++k)
+	{
+		const WindowCandidate& c = tune_cands[k];
+		if ((c.mcs<0) || (c.W>=dim.nx) || (c.mcs<(1.0 - HIP_TUNE_TIE)*top))
+			continue;
+		if ((windowed<0) || (c.T>tune_cands[windowed].T) || ((c.T==tune_cands[windowed].T) && (c.W>tune_cands[windowed].W)))
+			windowed = (int)k;
+	}
+	// one window over all of x only when it beats the best windowed candidate clearly: where the timed blocks
+	// barely discriminate (an Arc B580 through chipStar: 6180 against 6088 MC/s timed, 1343 against 2146 run) a near
+	// tie must not drop the run to the single step's work; on an H100 and an A100 it wins by 20 and 28 %
+	if ((windowed>=0) && ((tune_cands[best].W<dim.nx) || (tune_cands[best].mcs<HIP_TUNE_ONE_WINDOW_MARGIN*tune_cands[windowed].mcs)))
+		best = windowed;
+	win_T = tune_cands[best].T;
+	win_W = tune_cands[best].W;
+	win_source = "tuned";
+	WindowDropGraphs(win_W);
+	if (verbose)
+	{
+		std::ostringstream line;
+		line << std::fixed << std::setprecision(0);
+		line << "GPU_Backend_HIP: window: tuned T=" << win_T << " W=" << win_W << " B=0 shape=" << shape_block.x << "x" << shape_block.y
+		     << " " << tune_cands[best].mcs << " MC/s (candidates:";
+		for (size_t k=0; k<tune_cands.size(); ++k)
+		{
+			line << (k ? "; " : " ") << tune_cands[k].T << "," << tune_cands[k].W << " ";
+			if (tune_cands[k].mcs>=0)
+			{
+				// the slowest and the fastest sample
+				if (tune_cands[k].mcs_lo<tune_cands[k].mcs)
+					line << tune_cands[k].mcs_lo << "..";
+				line << tune_cands[k].mcs;
+			}
+			else
+				line << "-";
+		}
+		line << ")";
+		std::cout << line.str() << std::endl;
+		std::ostringstream cost;
+		cost << "GPU_Backend_HIP: window: the tune ran " << tune_steps << " timesteps from timestep " << tune_start_ts << " in "
+		     << tune_chunks << " chunk" << (tune_chunks>1 ? "s" : "");
+		if (tune_defer_chunks>0)
+			cost << " after " << tune_defer_chunks << " chunk" << (tune_defer_chunks>1 ? "s" : "") << " of the rule's schedule while the fields filled the grid";
+		cost << " (" << measured << " of " << tune_cands.size() << " candidates, timed blocks "
+		     << std::fixed << std::setprecision(1) << tune_ms << " ms)" << (complete ? "" : ", stopped: the chunks were too short for the rest");
+		std::cout << cost.str() << std::endl;
+	}
+}
+
+bool GPU_Backend_HIP::SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal)
+{
+	const bool verbose = g_settings.GetVerboseLevel()>1;
+	d->window_used = false;
+	d->window_exts.clear();
+	if (!d->window.on)
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: off" << std::endl;
+		return false;
+	}
+	if (!refusal.empty())
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: refused: " << refusal << std::endl;
+		return false;
+	}
+	if (!d->window.valid || (d->step_base==NULL))
+	{
+		if (verbose)
+			std::cout << "GPU_Backend_HIP: window: invalid value " << d->window.text << " (0, auto, rule or T,W[,B]), single-step" << std::endl;
+		return false;
+	}
+	for (size_t n=0; n<exts.size(); ++n)
+		if (!exts[n]->WindowCapable())
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: refused: an extension is not window-capable" << std::endl;
+			return false;
+		}
+	// the windowed blocks run the separate kernels; the fused step would be decided at the first voltage update
+	const char* fused_env = getenv("OPENEMS_HIP_FUSED_STEP");
+	const bool fused = (d->fused_step>0) || ((d->fused_step<0) && (d->fused_blockers==0) && !(fused_env && (atoi(fused_env)==0)));
+	// auto keeps the fused step where it folds the UPML regions into its kernel and the rule's window covers all of x:
+	// one window has no L2 gain, and the windowed blocks run the regions as separate kernels (RTX 5090, bench pml S:
+	// 19406 MC/s windowed against 23839 fused; ideal S, without regions, gains 5 % from the windows' graphs)
+	// (the UPML extensions decide their fusion at their first hook, after this: the regions of the usual layout fuse)
+	const char* upml_env = getenv("OPENEMS_HIP_UPML_FUSION");
+	if (fused && d->window.tune && !d->upml.empty() && !(upml_env && (atoi(upml_env)==0)))
+	{
+		const size_t plane_bytes = (size_t)d->dim.ny*d->dim.nzd*(24 + d->CoeffBytesPerNode());
+		unsigned int T = d->window.T;
+		const unsigned int W = HIP_WindowRuleTW(d->l2_bytes, plane_bytes, T, d->dim.nx, d->coeff_table_bytes);
+		if (W>=d->dim.nx)
+		{
+			if (verbose)
+				std::cout << "GPU_Backend_HIP: window: auto keeps the fused step: one window covers the grid (W=" << W << " of "
+				          << d->dim.nx << " planes) and its " << d->upml.size() << " UPML regions go into the fused kernel" << std::endl;
+			return false;
+		}
+	}
+	d->window_exts = exts;
+	d->window_used = true;
+	if (d->fused_step<0)
+		d->fused_step = 0;
+	if (verbose && fused)
+		std::cout << "GPU_Backend_HIP: window: separate updates, the fused step is not used on the windowed path" << std::endl;
+	return true;
+}
+
+bool GPU_Backend_HIP::IterateWindowed(unsigned int start_ts, unsigned int n)
+{
+	if (!d->window_used)
+		return false;
+	if (d->fused_step>0)
+		return false;   // decided before the windowed blocks: the fields are in its double buffers
+	if (!d->WindowPrepare())
+		return false;
+	++d->window_chunks;
+	unsigned int tuned = 0;
+	if (d->tune_state>0)
+		tuned = d->WindowTune(start_ts, n);   // real timesteps: the candidates' blocks
+	d->WindowRun(start_ts + tuned, n - tuned);
+	if (!d->window_logged && (d->tune_state==0) && (tuned<n) && (g_settings.GetVerboseLevel()>1))
+	{
+		// after the first chunk: the launches of a block of T steps (with its set_step), the graphs so far
+		d->window_logged = true;
+		// the launches per step of the longest block (a graph's, or the last block of T steps without one)
+		unsigned long long per_block = d->window_block_launches;
+		unsigned int per_len = d->win_T;
+		double capture_ms = 0;
+		for (std::map<std::vector<unsigned int>, Impl::WindowGraph>::const_iterator it=d->window_graphs.begin(); it!=d->window_graphs.end(); ++it)
+		{
+			if ((per_block==0) || (it->first[0]>per_len) || ((it->first[0]==per_len) && (it->second.launches>0)))
+			{
+				per_block = it->second.launches;
+				per_len = it->first[0];
+			}
+			capture_ms += it->second.capture_ms;
+		}
+		const unsigned int nx = d->dim.nx;
+		std::ostringstream line;
+		line << "GPU_Backend_HIP: window: T=" << d->win_T << " W=" << d->win_W << " B=" << d->win_B << " planes=" << nx
+		     << " halo=" << d->win_T+1 << " windows=" << (nx + d->win_W - 1)/d->win_W << " launches/step=";
+		if (per_block)
+			line << std::fixed << std::setprecision(1) << (per_block + 1.0)/per_len;
+		else
+			line << "?";
+		line << " graphs=" << d->window_graphs.size();
+		if (!d->window_graphs.empty())
+			line << " (captured in " << std::fixed << std::setprecision(1) << capture_ms << " ms)";
+		else if (HIP_KernelTimes::Enabled())
+			line << " (kernel times: plain launches)";
+		line << " (" << d->win_source << ", " << d->dim.ny*(size_t)d->dim.nzd*(24 + d->CoeffBytesPerNode())
+		     << " bytes per plane, coefficient table " << d->coeff_table_bytes << " bytes, L2 " << d->l2_bytes/(1024*1024) << " MiB, " << d->window_exts.size() << " window-capable extensions)";
+		std::cout << line.str() << std::endl;
+	}
+	return true;
 }
 
 static void CheckSize(size_t host_count, size_t device_count)
@@ -1015,11 +2921,22 @@ static void CheckSize(size_t host_count, size_t device_count)
 		throw std::runtime_error("GPU_Backend_HIP: host and device field size mismatch");
 }
 
+// OPENEMS_HIP_ZPAD: \a lines z lines of the host layout (stride nz) from or to the device layout (stride nzd), the padding untouched
+static void CopyLines(GPU_Backend_HIP::Impl* d, void* dst, const void* src, size_t lines, hipMemcpyKind kind, const char* what)
+{
+	const size_t host_pitch = d->dim.nz*sizeof(float), dev_pitch = d->dim.nzd*sizeof(float);
+	const bool to_host = (kind==hipMemcpyDeviceToHost);
+	HIP_Check(hipMemcpy2DAsync(dst, to_host ? host_pitch : dev_pitch, src, to_host ? dev_pitch : host_pitch, host_pitch, lines, kind, d->Stream()), what);
+}
+
 void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, volt.data(), d->volt, volt.size()/d->dim.nz, hipMemcpyDeviceToHost, "download");
+	else
+		HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 }
 
@@ -1027,7 +2944,10 @@ void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, curr.data(), d->curr, curr.size()/d->dim.nz, hipMemcpyDeviceToHost, "download");
+	else
+		HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 }
 
@@ -1035,7 +2955,10 @@ void GPU_Backend_HIP::UploadVoltages(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt
 {
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(d->volt, volt.data(), volt.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->volt, volt.data(), volt.size()/d->dim.nz, hipMemcpyHostToDevice, "upload");
+	else
+		HIP_Check(hipMemcpyAsync(d->volt, volt.data(), volt.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
 	d->Flush();
 }
 
@@ -1043,7 +2966,10 @@ void GPU_Backend_HIP::UploadCurrents(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr
 {
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
-	HIP_Check(hipMemcpyAsync(d->curr, curr.data(), curr.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
+	if (d->dim.nzd!=d->dim.nz)
+		CopyLines(d, d->curr, curr.data(), curr.size()/d->dim.nz, hipMemcpyHostToDevice, "upload");
+	else
+		HIP_Check(hipMemcpyAsync(d->curr, curr.data(), curr.size()*sizeof(float), hipMemcpyHostToDevice, d->Stream()), "upload");
 	d->Flush();
 }
 
@@ -1051,6 +2977,21 @@ bool GPU_Backend_HIP::DownloadRange(bool currents, size_t offset, size_t count, 
 {
 	if (offset+count > 3*d->numCells)
 		return false;
+	if (d->dim.nzd!=d->dim.nz)
+	{
+		// OPENEMS_HIP_ZPAD: a part of one z line, or whole z lines (the caller, Engine_GPU, asks for one line);
+		// else the host falls back
+		const size_t nz = d->dim.nz;
+		const float* src = (currents ? d->curr : d->volt) + d->Dev(offset);
+		if (offset%nz + count <= nz)
+			HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
+		else if ((offset%nz==0) && (count%nz==0))
+			CopyLines(d, dst, src, count/nz, hipMemcpyDeviceToHost, "range download");
+		else
+			return false;
+		d->Flush();
+		return true;
+	}
 	const float* src = (currents ? d->curr : d->volt) + offset;
 	HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
 	d->Flush();
@@ -1259,13 +3200,20 @@ GPU_Extension* GPU_Backend_HIP::CreateExtension(Engine_Extension* eng_ext, Engin
 	if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
 	    && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
 		d->fused_blockers++;
+	// in the extension order of the engine (see Impl::ext_log)
+	const Impl::ExtRecord record = {eng_ext, d->volt_modified.size(), 0, d->ext_nodes.size(), 0};
 	for (size_t n=0; n<sizeof(HIP_EXTENSIONS)/sizeof(HIP_EXTENSIONS[0]); ++n)
 	{
 		if (HIP_EXTENSIONS[n]==NULL)
 			continue;
 		GPU_Extension* gpu_ext = HIP_EXTENSIONS[n](d, eng_ext, eng);
 		if (gpu_ext)
+		{
+			d->ext_log.push_back(record);
+			d->ext_log.back().vm_end = d->volt_modified.size();
+			d->ext_log.back().nodes_end = d->ext_nodes.size();
 			return gpu_ext;
+		}
 	}
 	d->fused_blockers++;   // host fallback
 	return NULL;

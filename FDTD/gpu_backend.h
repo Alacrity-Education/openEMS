@@ -32,6 +32,10 @@ class Operator;
 class Engine;
 class Engine_Extension;
 
+//! The hook of a timestep a window-capable extension runs in a windowed block, see GPU_Extension::LaunchInWindow()
+enum GPU_WindowPhase {GPU_WindowPreVoltage, GPU_WindowPostVoltage, GPU_WindowApplyVoltage,
+                      GPU_WindowPreCurrent, GPU_WindowPostCurrent, GPU_WindowApplyCurrent};
+
 //! Device implementation of an engine extension, see GPU_Backend::CreateExtension()
 /*!
   Engine_GPU calls it through the same hooks and in the same order as the engine
@@ -54,6 +58,23 @@ public:
 
 	//! Called after each IterateTS() of the engine, with the host mirror up to date
 	virtual void Synchronize() {}
+
+	//! This extension can run inside a windowed block (see GPU_Backend::IterateWindowed()): LaunchInWindow() does its work for the nodes of a range
+	virtual bool WindowCapable() const {return false;}
+	//! The hook \a phase for the nodes [x0,x1) x [y0,y1) (all z) at timestep (block base + \a step_in_block)
+	/*!
+	  Device work only: the block may be captured once and replayed, so the step is
+	  not a host value; the block base is in device memory, written by the backend
+	  before the block runs. Host work per timestep belongs in EndOfBlock().
+	  */
+	virtual void LaunchInWindow(GPU_WindowPhase phase, unsigned int step_in_block, unsigned int x0, unsigned int x1,
+	                            unsigned int y0, unsigned int y1) {UNUSED(phase); UNUSED(step_in_block); UNUSED(x0); UNUSED(x1); UNUSED(y0); UNUSED(y1);}
+	//! Host work after a windowed block whose last timestep is \a ts (the number GetNumberOfTimesteps() returns during its hooks)
+	/*!
+	  Called once per block, after all its device work was queued; a backend running
+	  blocks of one timestep calls it after every timestep.
+	  */
+	virtual void EndOfBlock(unsigned int ts) {UNUSED(ts);}
 };
 
 //! Coupling of a cylindrical multi-grid level and its sub-grid, see Engine_GPU_CylinderMultiGrid
@@ -238,6 +259,20 @@ public:
 	  alongside it and holds the data the device implementation is built from.
 	  */
 	virtual GPU_Extension* CreateExtension(Engine_Extension* eng_ext, Engine* eng) {UNUSED(eng_ext); UNUSED(eng); return NULL;}
+
+	//! The device extensions of the engine in its extension order, for IterateWindowed(); returns whether IterateWindowed() will run
+	/*!
+	  Called once, before the first timestep. \a refusal is empty if the engine can
+	  run windowed blocks (every extension WindowCapable(), no host fallback, no
+	  multi-grid), else why not; the backend decides and logs the result.
+	  */
+	virtual bool SetWindowExtensions(const std::vector<GPU_Extension*>& exts, const std::string& refusal) {UNUSED(exts); UNUSED(refusal); return false;}
+	//! Run \a n timesteps from timestep \a start_ts as windowed blocks, with the extensions of SetWindowExtensions()
+	/*!
+	  Returns false if this backend or this run cannot, then the engine steps as
+	  before. Must leave the fields as \a n single steps would.
+	  */
+	virtual bool IterateWindowed(unsigned int start_ts, unsigned int n) {UNUSED(start_ts); UNUSED(n); return false;}
 };
 
 #endif // GPU_BACKEND_H

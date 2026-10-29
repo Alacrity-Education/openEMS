@@ -34,6 +34,93 @@ there are unreleased changes. It becomes the next release entry.
   structure closed by PEC. Away from DC the spectrum is the same; below about
   f0-fc it falls to zero at DC. With `f0=0` the pulse is the derivative of the
   Gaussian, with its peak at about 0.47*fc and its -20dB edge at 1.3*fc.
+- The HIP backend runs the Mur ABC inside the voltage update, with
+  bit-identical results: the voltages of the Mur planes (the boundary line and
+  the line next to it) are updated in one launch with their Mur values, beside
+  the main update of the other nodes (two launches per timestep instead of one
+  plus three per plane). A grid where this does not apply (a Mur plane through
+  a UPML region, TF/SF, steady-state detection, or a material or lumped element
+  on a plane) runs the separate launches, which `--verbose=2` prints. On an
+  RTX 5090 a PCB model of 28.7 Mcells with Mur on all six faces settles at
+  8929 MC/s instead of 7963 (+12 %), a model of 3.1 Mcells at 10405 instead
+  of 9758 (+6.6 %).
+  The interior of the two z faces is updated inside the main voltage update
+  as well, where the Mur line and its shift line are lanes of one warp and
+  exchange their values through warp shuffles (bit-identical; a grid with
+  fewer than 6 z lines, no Mur plane on a z face, or the two lines in
+  different warps keeps them in the shell launch). On an RTX 5090 the PCB
+  model settles at 12822 MC/s instead of 10602 with the z faces in the kernel
+  (2.24 ms a step instead of 2.71), the model of 3.1 Mcells at 11854 instead
+  of 10394.
+- The HIP backend runs conducting sheets that lie on z planes as dense state
+  per sheet plane: one launch per half-step for all planes and both
+  dispersion orders, the in-plane components only, instead of two launches
+  per order over a position list with all three components. The results are
+  bit-identical; a sheet that does not fit (positions off the z planes, more
+  than 32 planes, orders on different positions) keeps the position list,
+  which `--verbose=2` prints. On an RTX 5090 a PCB model of 28.7 Mcells with
+  four copper layers (2.5 million sheet cells) settles at 10602 MC/s instead
+  of 8929 (+19 %, 2.71 ms a step instead of 3.21); a model of 3.06 Mcells
+  gains 1.3 %, where the sheet kernels shrink from 56 to 30 us a step but the
+  main voltage update loses the cache warming the old kernels gave it. A
+  version with the sheet update inside the voltage kernel was bit-identical
+  and no faster.
+- The HIP backend stores the z lines of its device layout with a stride
+  rounded up to a multiple of 64 on grids where extensions such as Mur ABC or
+  conducting sheets block the fused step, so that every line starts on the
+  same alignment (`OPENEMS_HIP_ZPAD=auto`, the default; `0` off); it keeps the
+  unpadded layout where the padding would more than double the z lines or the
+  padded grid would take more than half of the free device memory. It also
+  times the block of its separate main kernels on the live grid at the first
+  timestep (`OPENEMS_HIP_SHAPE=auto`, the default; `0` the former block;
+  `cN` or `TZxTY` forced), among them a compact layout that runs the z lines
+  of a plane one after the other in blocks of 128 or 256 threads, so that a z
+  line of 44 nodes takes 44 lanes instead of two warps. The
+  results are bit-identical; the fused step keeps the unpadded layout. On an
+  RTX 5090 a model of 3.06 Mcells (40 z lines, Mur and sheets) runs at 11572
+  MC/s instead of 10226 (+13 %), its two main kernels taking 172 us a step
+  instead of 232.
+- The HIP backend runs its timesteps as blocks of T steps marched along x in
+  windows of W planes that stay in the L2 cache, each block captured once as
+  a graph and replayed (`OPENEMS_HIP_WINDOW=auto`, the default; `0` one
+  timestep at a time, `rule` without the tuner, `T,W` forced). The voltage and current frontiers step back one plane per
+  timestep, so every cell is updated once per step from the values the
+  single step would give it: the results are bit-identical. Grids with
+  TF/SF, Debye materials, absorbing sheets, cylindrical
+  coordinates, multi-grids or Mur planes outside the voltage update keep the
+  single step. On an RTX 5090 a model of 3.06 Mcells (Mur, four sheet
+  planes) runs at 21806 MC/s instead of 13901 (+57 %, T=8, W=143), a PCB model
+  of 28.7 Mcells at 22944 instead of 13877 (+65 %, T=8, W=34). `auto` tunes
+  T and W on the first few hundred timesteps of a run (real timesteps, each
+  candidate bit-identical; the model of 3.06 Mcells: T=16, W=193, 23906
+  MC/s, +9.3 % over T=8, W=143); every run tunes, `rule` or `T,W` skip it.
+  One window over all of x is among the candidates: on an H100 and an A100 the
+  L2 gains less than the windows' extra launches cost, and `auto` runs the PCB
+  model 1.12x and 1.23x faster with it.
+  `auto` keeps the fused step on grids where it folds the UPML regions into
+  its kernel and one window covers the grid (no L2 gain there). The
+  environment knobs of the HIP backend are listed with their defaults and
+  measured effects at the top of `FDTD/hip/gpu_backend_hip.hip`.
+- The tuner of the HIP backend's windowed blocks starts once the fields
+  fill the grid, times every candidate three times and counts the fastest,
+  times the three best again in turn, and gives a tie within 1 % to the
+  larger T, then the larger W, as the SYCL backend's. A probe at the start
+  of each chunk reads the fields and a 256 MB buffer of random mantissas
+  with the same kernel; the rule's schedule runs while the fields read more
+  than 10 % faster than the buffer and the read still slows down by more
+  than 2 % from probe to probe, at most 12 chunks; fields under 64 MB tune
+  at once. A GPU that compresses the near-zero fields of the first
+  timesteps times the candidates in a state that ranks them differently
+  from the filled grid: through chipStar on an Arc B580 the probe reads a
+  model of 3.06 Mcells at 3.2x at timestep 0 and starts the tune at
+  timestep 2400, as the SYCL backend does on that GPU. NVIDIA GPUs do not
+  compress (0.8x to 1.07x at timestep 0) and tune at once: on an H100 a
+  PCB model of 28.7 Mcells keeps one window over all of x and its speed
+  (17,430 MC/s, three runs on three GPUs at once, the timed figure 2 %
+  above the settled speed); on two RTX 5080s held at a 250 W power cap
+  each card repeats its own pick (T = 16 with W = 27 on one, 34 on the
+  other, 3 of 3 runs each), the faster of the two on that card. The
+  results are bit-identical.
 
 ### Fixed
 

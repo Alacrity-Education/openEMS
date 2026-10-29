@@ -120,6 +120,18 @@ After installation, follow the official tutorials to run your first simulation:
 
 ---
 
+## GPU engine knobs
+
+The GPU engine (`--engine=gpu`) picks its code paths by itself; environment
+variables override the choices for comparisons and development, and
+`--verbose=2` prints what was decided. Every setting gives the same results
+unless its description says otherwise. The HIP backend's knobs
+(`OPENEMS_HIP_*`: the windowed blocks `WINDOW`; `ZPAD`, `SHAPE`, `FUSED_STEP`,
+`FUSED_TZ/TY/XC`, `INDEX`, `UPML_FUSION`, `KERNEL_TIMES`) are listed with their defaults and measured
+effects at the top of `FDTD/hip/gpu_backend_hip.hip`. The tuner of
+`OPENEMS_HIP_WINDOW=auto` runs at the start of every run; `rule` or a forced
+`T,W` skip it.
+
 ## Testing
 
 **Octave smoke-test** (fastest sanity check):

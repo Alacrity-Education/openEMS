@@ -69,10 +69,10 @@ __device__ __forceinline__ void upml_fused_volt_node(float* volt_out, const floa
                                                      unsigned int x, unsigned int y, unsigned int z)
 {
 	const unsigned int gx = R.sx + x, gy = R.sy + y, gz = R.sz + z;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, gx, gy, gz);
-	const size_t xm = (gx>0) ? (size_t)N.ny*N.nz : 0;
-	const size_t ym = (gy>0) ? N.nz : 0;
+	const size_t xm = (gx>0) ? (size_t)N.ny*N.nzd : 0;
+	const size_t ym = (gy>0) ? N.nzd : 0;
 	const size_t zm = (gz>0) ? 1 : 0;
 	const HIP_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
@@ -100,7 +100,7 @@ __device__ __forceinline__ void upml_fused_curr_node(float* curr_out, const floa
                                                      unsigned int x, unsigned int y, unsigned int z)
 {
 	const unsigned int gx = R.sx + x, gy = R.sy + y, gz = R.sz + z;
-	const size_t sn = (size_t)N.nx*N.ny*N.nz;
+	const size_t sn = (size_t)N.nx*N.ny*N.nzd;
 	const size_t i  = nijk(N, 0, gx, gy, gz);
 	const bool update = (gx+1<N.nx) && (gy+1<N.ny) && (gz+1<N.nz);
 	const size_t cells = (size_t)R.lx*R.ly*R.lz;
@@ -109,8 +109,8 @@ __device__ __forceinline__ void upml_fused_curr_node(float* curr_out, const floa
 	HIP_MainCoeff C = {A.ca, A.cb, 0};
 	if (update)
 	{
-		const size_t xp = (size_t)N.ny*N.nz;
-		const size_t yp = N.nz;
+		const size_t xp = (size_t)N.ny*N.nzd;
+		const size_t yp = N.nzd;
 		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6);
 		curl[0] = (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
 		curl[1] = (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
@@ -141,10 +141,10 @@ __device__ __forceinline__ void upml_volt_value(const float* volt, const float* 
                                                 unsigned int gx, unsigned int gy, unsigned int gz, bool write, float out[3])
 {
 	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
-	const I xm = (gx>0) ? (I)N.ny*N.nz : 0;
-	const I ym = (gy>0) ? N.nz : 0;
+	const I xm = (gx>0) ? (I)N.ny*N.nzd : 0;
+	const I ym = (gy>0) ? N.nzd : 0;
 	const I zm = (gz>0) ? 1 : 0;
 	const HIP_MainCoeffT<I> C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 0);
 	const I cells = (I)R.lx*R.ly*R.lz;
@@ -175,7 +175,7 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
                                                 unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
 {
 	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
-	const I sn = (I)N.nx*N.ny*N.nz;
+	const I sn = (I)N.nx*N.ny*N.nzd;
 	const I i  = nijk<I>(N, 0, gx, gy, gz);
 	const I cells = (I)R.lx*R.ly*R.lz;
 	const UPMLCoeffT<I> U = upml_coeff<I>(A, (x*R.ly + y)*R.lz + z, cells, 9);
@@ -227,6 +227,10 @@ struct HIP_ZSlabs
 {
 	unsigned int z_lo, z_hi;       //!< main update nodes: z_lo <= z < z_hi, below: slab lo, above: slab hi
 	unsigned int t_lo, t_int;      //!< threads along z of slab lo and of the main update nodes, whole warps (0: no padding)
+	//! the thread layout of the main kernels (see main_thread()): 0 two-dimensional blocks; else the threads along z of
+	//! one y row (the row length), the rows one after the other in one-dimensional blocks, and compact_m = 2^32 / compact
+	//! rounded up (the row of thread t is __umulhi(t, compact_m))
+	unsigned int compact, compact_m;
 	UPMLRegion R_lo, R_hi;
 	UPMLFusedArgs volt_lo, volt_hi, curr_lo, curr_hi;
 };
