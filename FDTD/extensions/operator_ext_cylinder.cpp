@@ -87,8 +87,11 @@ bool Operator_Ext_Cylinder::BuildExtension()
 
 		for (unsigned int i=0; i<m_Op->GetNumberOfLines(1,true); ++i)
 		{
-			m_Op->EC_C[2][m_Op->MainOp->SetPos(0,i,pos[2])] = C;
-			m_Op->EC_G[2][m_Op->MainOp->SetPos(0,i,pos[2])] = G;
+			// the coefficients stay those of the circuit values before
+			const unsigned int node[3] = {0, i, pos[2]};
+			m_Op->FreezeCoeffs(node);
+			const double ec[4] = {C, G, 0, 0};
+			m_Op->SetEC(2, node, (1u<<Operator::EC_CAP) | (1u<<Operator::EC_CON), ec, true);   // the material dumps keep the material of the node
 		}
 
 		//search for metal on z-axis
@@ -101,8 +104,9 @@ bool Operator_Ext_Cylinder::BuildExtension()
 				m_Op->SetVV(2,0,0,pos[2], 0);
 				vv_R0[pos[2]] = 0;
 				vi_R0[pos[2]] = 0;
-				m_Op->EC_C[2][m_Op->MainOp->SetPos(0,0,pos[2])] = 0;
-				m_Op->EC_G[2][m_Op->MainOp->SetPos(0,0,pos[2])] = 0;
+				const unsigned int axis[3] = {0, 0, pos[2]};
+				const double ec[4] = {0, 0, 0, 0};
+				m_Op->SetEC(2, axis, (1u<<Operator::EC_CAP) | (1u<<Operator::EC_CON), ec, true);   // the material dumps keep the material of the node
 			}
 		}
 	}

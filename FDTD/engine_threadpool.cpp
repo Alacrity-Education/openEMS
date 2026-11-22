@@ -1,0 +1,578 @@
+/*
+*	Copyright (C) 2010 Sebastian Held (sebastian.held@gmx.de)
+*	Copyright (C) 2026 Thorsten Liebig (Thorsten.Liebig@gmx.de)
+*
+*	This program is free software: you can redistribute it and/or modify
+*	it under the terms of the GNU General Public License as published by
+*	the Free Software Foundation, either version 3 of the License, or
+*	(at your option) any later version.
+*
+*	This program is distributed in the hope that it will be useful,
+*	but WITHOUT ANY WARRANTY; without even the implied warranty of
+*	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*	GNU General Public License for more details.
+*
+*	You should have received a copy of the GNU General Public License
+*	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+#include "engine_threadpool.h"
+#include "engine.h"
+#include "extensions/engine_extension.h"
+#include "tools/denormal.h"
+#include "tools/useful.h"
+
+using std::cout;
+using std::endl;
+
+//! One worker thread of Engine_ThreadPool
+class Engine_ThreadPool_Worker
+{
+public:
+	Engine_ThreadPool_Worker(Engine_ThreadPool* pool, unsigned int threadID) : m_pool(pool), m_threadID(threadID) {}
+	void operator()();
+
+protected:
+	Engine_ThreadPool* m_pool;
+	unsigned int m_threadID;
+};
+
+void Engine_ThreadPool_Worker::operator()()
+{
+	// speed up the calculation of denormal floating point values (flush-to-zero)
+	Denormal::Disable();
+
+	const size_t numGrids = m_pool->m_Grids.size();
+	while (!m_pool->m_stopThreads)
+	{
+		// wait for start
+		m_pool->m_startBarrier->wait();
+
+		if (m_pool->m_stopThreads)
+			return;
+
+		unsigned int flat = m_pool->m_iterTS;
+		if (m_pool->m_Blocked)
+		{
+			// blocks as long as the timesteps left and the extensions allow (Engine_Extension::NeedsFlatStep()),
+			// the rest as single flat steps; every thread finds the same lengths
+			unsigned int ts = m_pool->m_Eng->numTS;
+			unsigned int left = m_pool->m_iterTS;
+			while (left>0)
+			{
+				const unsigned int k = m_pool->BlockLength(ts, left);
+				if (k>=2)
+				{
+					const std::vector<Engine_BlockedPlan>& plans = m_pool->BlockedPlans();
+					const Engine_BlockedPlan& plan = plans[plans.front().k - k];
+					for (const auto& phase : plan.phases)
+					{
+						if (m_threadID<phase.size())
+							for (const Engine_Step& step : phase[m_threadID])
+								m_pool->BlockedStep(step, ts + step.t);
+						m_pool->m_IterateBarrier->wait();
+					}
+					if (m_threadID == 0)
+						m_pool->m_TS_blocked += k;
+				}
+				else
+				{
+					// a flat step at the count the hooks read
+					if (m_threadID == 0)
+					{
+						m_pool->m_Eng->numTS = ts;
+						++m_pool->m_TS_flat;
+					}
+					m_pool->m_IterateBarrier->wait();
+					m_pool->VoltageHalfStep(0, m_threadID);
+					m_pool->CurrentHalfStep(0, m_threadID);
+				}
+				ts += std::max(k, 1u);
+				left -= std::max(k, 1u);
+				m_pool->m_IterateBarrier->wait();
+			}
+			if (m_threadID == 0)
+				m_pool->m_Eng->numTS = ts;
+			flat = 0;
+		}
+		else if (m_threadID == 0)
+			m_pool->m_TS_flat += flat;   // the flat sweep, e.g. after the trials chose it
+
+		for (unsigned int iter=0; iter<flat; ++iter)
+		{
+			for (size_t g=0; g<numGrids; ++g)
+				m_pool->VoltageHalfStep(g, m_threadID);
+			m_pool->SyncSubGrids(m_threadID, true);
+
+			for (size_t g=0; g<numGrids; ++g)
+				m_pool->CurrentHalfStep(g, m_threadID);
+			m_pool->SyncSubGrids(m_threadID, false);
+
+			if (m_threadID == 0)
+				for (size_t g=0; g<numGrids; ++g)
+					++m_pool->m_Grids[g]->numTS; // only the first thread increments numTS
+		}
+
+		m_pool->m_stopBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::VoltageHalfStep(size_t g, unsigned int threadID)
+{
+	Engine* eng = m_Grids[g];
+	// pre voltage stuff...
+	DoPreVoltageUpdates(eng, threadID);
+
+	//voltage updates
+	if (threadID<m_Plans[g].GetNumThreads())
+		for (const Engine_Box& box : m_Plans[g].volt[threadID])
+			eng->UpdateVoltages(box);
+
+	m_IterateBarrier->wait();
+
+	//post voltage stuff...
+	DoPostVoltageUpdates(eng, threadID);
+	Apply2Voltages(eng, threadID);
+}
+
+void Engine_ThreadPool::CurrentHalfStep(size_t g, unsigned int threadID)
+{
+	Engine* eng = m_Grids[g];
+	//pre current stuff
+	DoPreCurrentUpdates(eng, threadID);
+
+	//current updates
+	if (threadID<m_Plans[g].GetNumThreads())
+		for (const Engine_Box& box : m_Plans[g].curr[threadID])
+			eng->UpdateCurrents(box);
+
+	m_IterateBarrier->wait();
+
+	//post current stuff
+	DoPostCurrentUpdates(eng, threadID);
+	Apply2Current(eng, threadID);
+}
+
+void Engine_ThreadPool::Trial(unsigned int iterTS, double seconds)
+{
+	m_TrialTS += iterTS;
+	m_TrialSeconds += seconds;
+	if (m_TrialSeconds < m_Choice.trialSeconds)
+		return;
+	const int n = m_Choice.candidates.size();   // the trials 0..n-1 the candidates, n the flat sweep
+	const int start = m_Choice.start;
+	if (m_Trial>=0)
+		m_TrialSpeed[m_Trial] = m_TrialTS/m_TrialSeconds;
+	m_TrialTS = 0;
+	m_TrialSeconds = 0;
+	// the next trial: a line search along the candidates from the start (Engine_BlockedChoice), then the flat sweep
+	int next = n;
+	if (m_Trial<0)
+		next = start;
+	else if (m_Trial<n)
+	{
+		const int c = m_Trial;
+		int from = c;
+		if (c==start)
+			m_TrialDir = (start+1<n) ? 1 : -1;
+		else if (m_TrialSpeed[c] <= m_TrialSpeed[c-m_TrialDir])
+		{
+			// slower than the one before: done, unless it was the first step, then from the start the other way
+			if ((m_TrialDir>0) && (c==start+1))
+			{
+				m_TrialDir = -1;
+				from = start;
+			}
+			else
+				m_TrialDir = 0;
+		}
+		if ((m_TrialDir!=0) && (from+m_TrialDir>=0) && (from+m_TrialDir<n))
+			next = from+m_TrialDir;
+	}
+	if (m_Trial<n)
+	{
+		m_Trial = next;
+		SetActive((next<n) ? next : -1);
+		return;
+	}
+	// done: the fastest of those tried
+	int best = n;
+	for (int t=0; t<n; ++t)
+		if (m_TrialSpeed[t] > m_TrialSpeed[best])
+			best = t;
+	SetActive((best<n) ? best : -1);
+	m_Trying = false;
+	m_Eng->MarkTrialsEnd();
+	if (g_settings.GetVerboseLevel()>0)
+	{
+		// in MC/s like the progress of the run
+		const double cells = m_Eng->Op->GetNumberCells();
+		// on its own stream, setprecision would stay set on cout
+		std::ostringstream line;
+		line << "Multithreaded engine: tried" << std::fixed << std::setprecision(1);
+		for (int t=0; t<=n; ++t)
+			if (m_TrialSpeed[t]>0)
+				line << ((t<n) ? " tile " + std::to_string(t+1) : std::string(", flat")) << " "
+				     << m_TrialSpeed[t]*cells*1e-6 << " MC/s";
+		line << "; running " << ((best<n) ? "tile " + std::to_string(best+1) : std::string("flat"));
+		cout << line.str() << endl;
+	}
+}
+
+void Engine_ThreadPool::CheckPlanBox(const Engine* eng, const Engine_Box& box, bool currents)
+{
+	if (!eng->CanUpdateBox(box, currents))
+		throw std::logic_error("Engine_ThreadPool: a box of the plan the engine cannot update");
+}
+
+unsigned int Engine_ThreadPool::BlockLength(unsigned int ts, unsigned int left) const
+{
+	const unsigned int kmax = std::min(left, BlockedPlans().front().k);
+	unsigned int k = 0;
+	while (k<kmax)
+	{
+		bool flat = false;
+		for (const Engine_Extension* ext : m_Eng->m_Eng_exts)
+			flat = flat || ext->NeedsFlatStep(ts+k);
+		if (flat)
+			break;
+		++k;
+	}
+	return k;
+}
+
+void Engine_ThreadPool::BlockedStep(const Engine_Step& step, unsigned int ts)
+{
+	std::vector<Engine_Extension*>& exts = m_Eng->m_Eng_exts;
+	// the order of the flat half step, restricted to the box
+	if (step.volt)
+	{
+		for (int n=exts.size()-1; n>=0; --n)
+			exts[n]->DoPreVoltageUpdatesBox(step.box, ts);
+		m_Eng->UpdateVoltages(step.box);
+		for (size_t n=0; n<exts.size(); ++n)
+			exts[n]->DoPostVoltageUpdatesBox(step.box, ts);
+		for (size_t n=0; n<exts.size(); ++n)
+			exts[n]->Apply2VoltagesBox(step.box, ts);
+	}
+	else
+	{
+		// the extensions see the last line of an axis too, which has no current update but
+		// gets their current hooks in the flat sweep: exactly one box per step reaches it
+		Engine_Box hook = step.box;
+		for (int a=0; a<3; ++a)
+			if (hook.stop[a]+1==m_Eng->numLines[a])
+				hook.stop[a] = m_Eng->numLines[a];
+		for (int n=exts.size()-1; n>=0; --n)
+			exts[n]->DoPreCurrentUpdatesBox(hook, ts);
+		m_Eng->UpdateCurrents(step.box);
+		for (size_t n=0; n<exts.size(); ++n)
+			exts[n]->DoPostCurrentUpdatesBox(hook, ts);
+		for (size_t n=0; n<exts.size(); ++n)
+			exts[n]->Apply2CurrentBox(hook, ts);
+	}
+}
+
+void Engine_ThreadPool::SyncSubGrids(unsigned int threadID, bool voltages)
+{
+	if (m_Grids.size()<2)
+		return;
+	m_IterateBarrier->wait();   // all grids done
+	if (threadID==0)
+		for (size_t g=m_Grids.size()-1; g-->0; )
+		{
+			if (voltages)
+				m_Grids[g]->SyncSubGridVoltages();
+			else
+				m_Grids[g]->SyncSubGridCurrents();
+		}
+	m_IterateBarrier->wait();   // coupling done
+}
+
+// ----------------------------------------------------------------------------
+
+Engine_ThreadPool::Engine_ThreadPool(Engine* eng, unsigned int numThreads)
+{
+	m_Eng = eng;
+	m_thread_group = NULL;
+	m_startBarrier = NULL;
+	m_stopBarrier = NULL;
+	m_IterateBarrier = NULL;
+	m_iterTS = 0;
+	m_Blocked = false;
+	m_Active = -1;
+	m_Trying = false;
+	m_Trial = -1;
+	m_TrialDir = 1;
+	m_TrialSeconds = 0;
+	m_TrialTS = 0;
+	m_TrialRate = 0;
+	m_TS_blocked = m_TS_flat = 0;
+	m_max_numThreads = AvailableThreads();
+	m_last_speed = 0;
+	m_opt_speed = false;
+	m_stopThreads = false;
+
+	for (Engine* g=eng; g; g=g->GetSubGridEngine())
+		m_Grids.push_back(g);
+
+	if ((numThreads == 0) && (eng->DefaultThreads()>0))
+		numThreads = std::min(eng->DefaultThreads(), m_max_numThreads);   // e.g. all physical cores
+	else if (numThreads == 0)
+	{
+		m_opt_speed = true;
+		numThreads = 1;
+	}
+	else if (numThreads > m_max_numThreads)
+		numThreads = m_max_numThreads;
+	m_numThreads = 0;
+
+	ChangeNumThreads(numThreads);
+}
+
+Engine_ThreadPool::~Engine_ThreadPool()
+{
+	if (!m_Choice.candidates.empty() && (g_settings.GetVerboseLevel()>0))
+		cout << "Multithreaded engine: " << m_TS_blocked << " timesteps in blocks, " << m_TS_flat << " flat" << endl;
+	StopThreads();
+	delete m_IterateBarrier;
+	delete m_startBarrier;
+	delete m_stopBarrier;
+}
+
+void Engine_ThreadPool::StopThreads()
+{
+	if (m_thread_group==NULL)
+		return;
+	m_thread_group->interrupt_all();
+	m_thread_group->join_all(); // wait for termination
+	delete m_thread_group;
+	m_thread_group = NULL;
+}
+
+void Engine_ThreadPool::ChangeNumThreads(unsigned int numThreads)
+{
+	StopThreads();
+
+	m_numThreads = numThreads;
+
+	if (g_settings.GetVerboseLevel()>0)
+		cout << "Multithreaded engine using " << m_numThreads << " threads. Utilization: (";
+
+	// the plan of each grid; the utilization reported is the one of the engine itself
+	m_Plans.clear();
+	for (size_t g=0; g<m_Grids.size(); ++g)
+	{
+		Engine* eng = m_Grids[g];
+		// the lines along x the operator updates: all, but on the outer grid of a cylindrical multi-grid not
+		// those its sub-grid covers (they are interpolated from it)
+		unsigned int one = 1;
+		std::vector<unsigned int> start, stop;
+		eng->Op->CalcStartStopLines(one, start, stop);
+		const unsigned int first[3] = {start.empty() ? 0 : start[0], 0, 0};
+		m_Plans.push_back(Engine_Plan::Flat(eng->numLines, m_numThreads, eng->GetSplitAxis(), first));
+		if (g==0)
+			m_numThreads = m_Plans[0].GetNumThreads();   // the engine itself may use fewer threads (few lines)
+	}
+	if (g_settings.GetVerboseLevel()>0)
+	{
+		const int a = m_Eng->GetSplitAxis();
+		for (unsigned int n=0; n<m_numThreads; n++)
+		{
+			const Engine_Box& box = m_Plans[0].volt[n].front();
+			cout << box.stop[a]-box.start[a] << ((n == m_numThreads-1) ? ")" : ";");
+		}
+	}
+	if (g_settings.GetVerboseLevel()>0)
+		cout << endl;
+
+	// the blocked plans, on a single grid only: the start candidate, others and the flat sweep tried at the start
+	m_Choice = Engine_BlockedChoice();
+	const bool blocked = (m_Grids.size()==1) && m_Eng->BuildBlockedPlans(m_numThreads, m_Choice) && !m_Choice.candidates.empty();
+	SetActive(blocked ? (int)m_Choice.start : -1);
+	m_Trying = blocked && (m_Choice.trialSeconds>0);
+	if (m_Trying)
+		m_Eng->MarkTrialsStart();
+	m_Trial = -1;
+	m_TrialDir = 1;
+	m_TrialSpeed.assign(m_Choice.candidates.size()+1, 0);
+	m_TrialSeconds = 0;
+	m_TrialTS = 0;
+	m_TrialRate = 0;
+
+	// every box of the plans must be one its engine can update: checked once here, not per update
+	for (size_t g=0; g<m_Grids.size(); ++g)
+		for (unsigned int t=0; t<m_Plans[g].GetNumThreads(); ++t)
+		{
+			for (const Engine_Box& box : m_Plans[g].volt[t])
+				CheckPlanBox(m_Grids[g], box, false);
+			for (const Engine_Box& box : m_Plans[g].curr[t])
+				CheckPlanBox(m_Grids[g], box, true);
+		}
+	for (const std::vector<Engine_BlockedPlan>& plans : m_Choice.candidates)
+	{
+		// the workers pick the plan of k as plans[kmax-k] (BlockLength()): every k from kmax down to 2
+		for (size_t i=0; i<plans.size(); ++i)
+			if (plans[i].k != plans.front().k-i)
+				throw std::logic_error("Engine_ThreadPool: a candidate of blocked plans without every k down to 2");
+		if (plans.empty() || (plans.back().k!=2))
+			throw std::logic_error("Engine_ThreadPool: a candidate of blocked plans without every k down to 2");
+	}
+	for (const std::vector<Engine_BlockedPlan>& plans : m_Choice.candidates)
+		for (const Engine_BlockedPlan& plan : plans)
+			for (const auto& phase : plan.phases)
+				for (const auto& steps : phase)
+					for (const Engine_Step& step : steps)
+						CheckPlanBox(m_Eng, step.box, !step.volt);
+
+	delete m_IterateBarrier;
+	// make sure all threads are waiting
+	m_IterateBarrier = new Engine_SpinBarrier(m_numThreads); // numThread workers
+
+	delete m_startBarrier;
+	m_startBarrier = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+
+	delete m_stopBarrier;
+	m_stopBarrier = new boost::barrier(m_numThreads+1); // numThread workers + 1 controller
+
+	m_thread_group = new boost::thread_group();
+	for (unsigned int n=0; n<m_numThreads; n++)
+	{
+		boost::thread *t = new boost::thread( Engine_ThreadPool_Worker(this,n) );
+		m_thread_group->add_thread( t );
+	}
+
+	for (size_t g=0; g<m_Grids.size(); ++g)
+		for (size_t n=0; n<m_Grids[g]->m_Eng_exts.size(); ++n)
+			m_Grids[g]->m_Eng_exts.at(n)->SetNumberOfThreads(m_numThreads);
+}
+
+unsigned int Engine_ThreadPool::TrialChunk() const
+{
+	const unsigned int step = m_Blocked ? BlockedPlans().front().k : 1;
+	// the warm-up has no speed to go by yet
+	unsigned int n = 16;
+	if (m_TrialRate>0)
+	{
+		// the rest of the trial running at its own speed so far, else at the speed of the one before; and a few
+		// blocks at the start of a trial, where a single one on a large model times the switch more than the candidate
+		const double rate = ((m_TrialTS>0) && (m_TrialSeconds>0)) ? m_TrialTS/m_TrialSeconds : m_TrialRate;
+		const double rest = std::max(m_Choice.trialSeconds - m_TrialSeconds, 0.0);
+		n = (unsigned int)std::min(std::ceil(rest*rate), 1e6);
+		n = std::max(n, (m_TrialTS>0) ? step : 4*step);
+	}
+	// whole blocks: no flat step or short block at the end of each chunk
+	return (n+step-1)/step*step;
+}
+
+void Engine_ThreadPool::IterateTS(unsigned int iterTS)
+{
+	// while trying, in chunks of about the rest of the trial: a trial must not last as long as
+	// the caller's interval, which the processing sets and can be a long time on a large model
+	while (iterTS>0)
+	{
+		const unsigned int n = m_Trying ? std::min(iterTS, TrialChunk()) : iterTS;
+		iterTS -= n;
+
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+		m_iterTS = n;
+		m_startBarrier->wait(); // start the threads
+		m_stopBarrier->wait(); // wait for the threads to finish <n> time steps
+		if (m_Trying)
+		{
+			const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			if (seconds>0)
+				m_TrialRate = n/seconds;
+			Trial(n, seconds);
+		}
+
+		// the grids from their sub-grids, the innermost first
+		for (size_t g=m_Grids.size()-1; g-->0; )
+			m_Grids[g]->InterpolateFromSubGrid();
+	}
+}
+
+void Engine_ThreadPool::NextInterval(float curr_speed)
+{
+	if (!m_opt_speed) return;
+	if (curr_speed<m_last_speed)
+	{
+		ChangeNumThreads(m_numThreads-1);
+		cout << "Multithreaded Engine: Best performance found using " << m_numThreads << " threads." << std::endl;
+		m_opt_speed = false;
+	}
+	else if (m_numThreads<m_max_numThreads)
+	{
+		m_last_speed = curr_speed;
+		ChangeNumThreads(m_numThreads+1);
+	}
+}
+
+void Engine_ThreadPool::DoPreVoltageUpdates(Engine* eng, int threadID)
+{
+	//execute extensions in reverse order -> highest priority gets access to the voltages last
+	for (int n=eng->m_Eng_exts.size()-1; n>=0; --n)
+	{
+		eng->m_Eng_exts.at(n)->DoPreVoltageUpdates(threadID);
+		m_IterateBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::DoPostVoltageUpdates(Engine* eng, int threadID)
+{
+	//execute extensions in normal order -> highest priority gets access to the voltages first
+	for (size_t n=0; n<eng->m_Eng_exts.size(); ++n)
+	{
+		eng->m_Eng_exts.at(n)->DoPostVoltageUpdates(threadID);
+		m_IterateBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::Apply2Voltages(Engine* eng, int threadID)
+{
+	//execute extensions in normal order -> highest priority gets access to the voltages first
+	for (size_t n=0; n<eng->m_Eng_exts.size(); ++n)
+	{
+		eng->m_Eng_exts.at(n)->Apply2Voltages(threadID);
+		m_IterateBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::DoPreCurrentUpdates(Engine* eng, int threadID)
+{
+	//execute extensions in reverse order -> highest priority gets access to the currents last
+	for (int n=eng->m_Eng_exts.size()-1; n>=0; --n)
+	{
+		eng->m_Eng_exts.at(n)->DoPreCurrentUpdates(threadID);
+		m_IterateBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::DoPostCurrentUpdates(Engine* eng, int threadID)
+{
+	//execute extensions in normal order -> highest priority gets access to the currents first
+	for (size_t n=0; n<eng->m_Eng_exts.size(); ++n)
+	{
+		eng->m_Eng_exts.at(n)->DoPostCurrentUpdates(threadID);
+		m_IterateBarrier->wait();
+	}
+}
+
+void Engine_ThreadPool::Apply2Current(Engine* eng, int threadID)
+{
+	//execute extensions in normal order -> highest priority gets access to the currents first
+	for (size_t n=0; n<eng->m_Eng_exts.size(); ++n)
+	{
+		eng->m_Eng_exts.at(n)->Apply2Current(threadID);
+		m_IterateBarrier->wait();
+	}
+}

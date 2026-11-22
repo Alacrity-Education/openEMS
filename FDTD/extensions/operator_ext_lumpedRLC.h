@@ -32,8 +32,8 @@
 class Operator_Ext_LumpedRLC : public Operator_Extension
 {
 	friend class Engine_Ext_LumpedRLC;
-	friend class HIP_Ext_LumpedRLC;
-	friend class Metal_Ext_LumpedRLC;
+	friend class CellModel;   // its edges in fused dispersive materials
+	friend class GPU_Ext_LumpedRLC;
 public:
 	Operator_Ext_LumpedRLC(Operator* op);
 
@@ -46,7 +46,6 @@ public:
 	virtual Engine_Extension* CreateEngineExtention();
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
-	virtual bool IsGPUSave() const {return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
 
 	virtual std::string GetExtensionName() const
@@ -69,13 +68,18 @@ protected:
 	FDTD_FLOAT		*v_RLC_i2v;
 
 	// Series circuit coefficients
-	FDTD_FLOAT		*v_RLC_vv2;		// Coefficient for [n-2] time of Vd update in Vd equation
-	FDTD_FLOAT		*v_RLC_vj1;		// Coefficient for [n-1] time of J update in Vd equation
-	FDTD_FLOAT		*v_RLC_vj2;		// Coefficient for [n-2] time of J update in Vd equation
-	FDTD_FLOAT		*v_RLC_vvd;		// Coefficient to multiply all Vd in the Vd update equation
-	FDTD_FLOAT		*v_RLC_ib0;		// Inverse of beta_0
-	FDTD_FLOAT		*v_RLC_b1;		// beta_1
-	FDTD_FLOAT		*v_RLC_b2;		// beta_2
+	// Vd[n] = vvd*(V + vv1*Vd[n-1] + vv2*Vd[n-2] + vj1*J[n-1] + vj2*J[n-2]), V the engine's update
+	FDTD_FLOAT		*v_RLC_vvd;
+	FDTD_FLOAT		*v_RLC_vv1;
+	FDTD_FLOAT		*v_RLC_vv2;
+	FDTD_FLOAT		*v_RLC_vj1;
+	FDTD_FLOAT		*v_RLC_vj2;
+	// J[n] = jv0*Vd[n] + jv1*Vd[n-1] + jv2*Vd[n-2] + jj1*J[n-1] + jj2*J[n-2]
+	FDTD_FLOAT		*v_RLC_jv0;
+	FDTD_FLOAT		*v_RLC_jv1;
+	FDTD_FLOAT		*v_RLC_jv2;
+	FDTD_FLOAT		*v_RLC_jj1;
+	FDTD_FLOAT		*v_RLC_jj2;
 
 	// Additional containers
 	int				*v_RLC_dir;

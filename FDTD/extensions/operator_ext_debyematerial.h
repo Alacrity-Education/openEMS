@@ -59,8 +59,8 @@
 class Operator_Ext_DebyeMaterial : public Operator_Ext_Dispersive
 {
 	friend class Engine_Ext_DebyeMaterial;
-	friend class HIP_Ext_DebyeMaterial;
-	friend class Metal_Ext_DebyeMaterial;
+	friend class CellModel;   // fuses the cells into the engine update
+	friend class GPU_Ext_Dispersive;
 public:
 	Operator_Ext_DebyeMaterial(Operator* op);
 	virtual ~Operator_Ext_DebyeMaterial();
@@ -73,7 +73,6 @@ public:
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
-	virtual bool IsGPUSave() const {return true;}
 
 	virtual std::string GetExtensionName() const
 	{

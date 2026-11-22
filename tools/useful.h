@@ -18,6 +18,8 @@
 #ifndef USEFUL_H
 #define USEFUL_H
 
+#include <cstddef>
+#include <functional>
 #include <vector>
 #include <string>
 
@@ -33,8 +35,31 @@ double CalcNyquistFrequency(unsigned int nyquist, double dT);
 //! applies or cannot be determined (non-Linux). Limited further by SetThreadLimit().
 unsigned int AvailableThreads();
 
+//! The physical cores among the CPUs of this process (SMT siblings counted once), at most MachineThreads(); MachineThreads() if the system does not say
+unsigned int PhysicalCores();
+
 //! Limit AvailableThreads() to n threads (the numThreads option); 0 removes the limit
 void SetThreadLimit(unsigned int n);
+
+//! The memory this process can still allocate without swapping, in bytes; 0 if the system does not say
+/*!
+  Linux: MemAvailable of /proc/meminfo, limited by a cgroup memory limit (a container, a batch
+  job). Windows: the available physical memory. macOS: the physical memory, as the free and
+  inactive pages leave out what the memory compressor and the file cache give way to.
+  OPENEMS_AVAILABLE_MEMORY (bytes) replaces it, for testing.
+  */
+size_t AvailableMemory();
+
+//! Run \a fn(thread, begin, end) on up to \a numThreads threads, [0, \a count) split into consecutive ranges in thread order
+/*!
+  Fewer threads if \a count is smaller, on the calling thread if only one; \a thread numbers
+  them from 0, so results kept per thread and joined in thread order are in the order of
+  the serial loop. An exception of a thread is rethrown after all have ended.
+  */
+void ParallelFor(size_t count, unsigned int numThreads, const std::function<void(unsigned int thread, size_t begin, size_t end)>& fn);
+
+//! Run \a fn(thread, i) for each i in [0, \a count) on up to \a numThreads threads, the items handed out one by one as the threads get done (for items of uneven cost); an exception is rethrown as by ParallelFor()
+void ParallelForEach(size_t count, unsigned int numThreads, const std::function<void(unsigned int thread, size_t i)>& fn);
 
 //! Calculate an optimal job distribution to a given number of threads. Will return a vector with the jobs for each thread.
 std::vector<unsigned int> AssignJobs2Threads(unsigned int jobs, unsigned int nrThreads, bool RemoveEmpty=false);

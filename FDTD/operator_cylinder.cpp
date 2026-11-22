@@ -16,8 +16,6 @@
 */
 
 #include "engine.h"
-#include "engine_cylinder.h"
-#include "engine_gpu.h"
 #include "Common/processfields.h"
 #include "operator_cylinder.h"
 #include "extensions/operator_extension.h"
@@ -30,52 +28,27 @@ using std::endl;
 
 Operator_Cylinder* Operator_Cylinder::New(unsigned int numThreads)
 {
-	cout << "Create cylindrical FDTD operator" << endl;
 	Operator_Cylinder* op = new Operator_Cylinder();
-	op->setNumThreads(numThreads);
+	op->SetNumThreads(numThreads);
 	op->Init();
 	return op;
 }
 
-Operator_Cylinder::Operator_Cylinder() : Operator_Multithread()
+Operator_Cylinder::Operator_Cylinder() : Operator()
 {
 	m_MeshType = CYLINDRICAL;
 	m_Cyl_Ext = NULL;
-	m_GPU_Backend = NULL;
-	m_GPU_Parent = NULL;
 }
 
 Operator_Cylinder::~Operator_Cylinder()
 {
-	delete m_GPU_Backend;
-}
-
-void Operator_Cylinder::SetGPUBackend(GPU_Backend* backend, GPU_Backend* parent)
-{
-	if (backend!=m_GPU_Backend)
-		delete m_GPU_Backend;
-	m_GPU_Backend = backend;
-	m_GPU_Parent = parent;
-}
-
-
-Engine* Operator_Cylinder::CreateEngine()
-{
-	if (UseGPU())
-	{
-		m_Engine = Engine_GPU::New(this, TakeGPUBackend(), m_GPU_Parent);
-		return m_Engine;
-	}
-	//! create a special cylindrical-engine
-	m_Engine = Engine_Cylinder::New(this, m_orig_numThreads);
-	return m_Engine;
 }
 
 void Operator_Cylinder::Init()
 {
 	CC_closedAlpha = false;
 	CC_R0_included = false;
-	Operator_Multithread::Init();
+	Operator::Init();
 }
 
 double Operator_Cylinder::GetRawDiscDelta(int ny, const int pos) const
@@ -85,23 +58,32 @@ double Operator_Cylinder::GetRawDiscDelta(int ny, const int pos) const
 	if (CC_closedAlpha && ny==1 && (pos==(int)numLines[ny]-1))
 		return (discLines[1][2] - discLines[1][1]);
 
-	return Operator_Multithread::GetRawDiscDelta(ny,pos);
+	return Operator::GetRawDiscDelta(ny,pos);
 }
 
-double Operator_Cylinder::GetMaterial(
-	int ny,
-	const double* coords,
-	int MatType,
-	std::vector<CSPrimitives*> vPrims,
-	bool markAsUsed
-) const
+void Operator_Cylinder::WrapAlpha(const double coords[3], double wrapped[3]) const
 {
-	double l_coords[] = {coords[0],coords[1],coords[2]};
+	wrapped[0] = coords[0];
+	wrapped[1] = coords[1];
+	wrapped[2] = coords[2];
 	if (CC_closedAlpha && (coords[1]>GetDiscLine(1,0,false)+2*PI))
-		l_coords[1]-=2*PI;
+		wrapped[1] -= 2*PI;
 	if (CC_closedAlpha && (coords[1]<GetDiscLine(1,0,false)))
-		l_coords[1] += 2*PI;
-	return Operator_Multithread::GetMaterial(ny,l_coords,MatType,vPrims,markAsUsed);
+		wrapped[1] += 2*PI;
+}
+
+double Operator_Cylinder::GetMaterial(int ny, const double* coords, int MatType, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const
+{
+	double l_coords[3];
+	WrapAlpha(coords, l_coords);
+	return Operator::GetMaterial(ny,l_coords,MatType,vPrims,markAsUsed);
+}
+
+void Operator_Cylinder::GetMaterials(int ny, const double* coords, int type1, int type2, double& val1, double& val2, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed) const
+{
+	double l_coords[3];
+	WrapAlpha(coords, l_coords);
+	Operator::GetMaterials(ny,l_coords,type1,type2,val1,val2,vPrims,markAsUsed);
 }
 
 int Operator_Cylinder::CalcECOperator( DebugFlags debugFlags )
@@ -109,7 +91,7 @@ int Operator_Cylinder::CalcECOperator( DebugFlags debugFlags )
 	// debugs only work with the native vector dumps
 	bool natDump = g_settings.NativeFieldDumps();
 	g_settings.SetNativeFieldDumps(true);
-	int rc = Operator_Multithread::CalcECOperator(debugFlags);
+	int rc = Operator::CalcECOperator(debugFlags);
 	// reset original settings
 	g_settings.SetNativeFieldDumps(natDump);
 	return rc;
@@ -127,13 +109,13 @@ double Operator_Cylinder::CalcTimestep()
 inline unsigned int Operator_Cylinder::GetNumberOfLines(int ny, bool full) const
 {
 	if (full)
-		return Operator_Multithread::GetNumberOfLines(ny, full);
+		return Operator::GetNumberOfLines(ny, full);
 
 	//this is necessary for a correct field processing... cylindrical engine has to reset this by adding +1
 	if (CC_closedAlpha && ny==1)
-		return Operator_Multithread::GetNumberOfLines(ny, true)-2;
+		return Operator::GetNumberOfLines(ny, true)-2;
 
-	return Operator_Multithread::GetNumberOfLines(ny, full);
+	return Operator::GetNumberOfLines(ny, full);
 }
 
 bool Operator_Cylinder::GetClosedMeshLines(int ny, unsigned int &first, unsigned int &last) const
@@ -155,7 +137,7 @@ std::string Operator_Cylinder::GetDirName(int ny) const
 
 bool Operator_Cylinder::GetYeeCoords(int ny, unsigned int pos[3], double* coords, bool dualMesh) const
 {
-	bool ret = Operator_Multithread::GetYeeCoords(ny,pos,coords,dualMesh);
+	bool ret = Operator::GetYeeCoords(ny,pos,coords,dualMesh);
 
 	if (CC_closedAlpha && (coords[1]>=GetDiscLine(1,0,false)+2*PI))
 		coords[1]-=2*PI;
@@ -169,7 +151,7 @@ double Operator_Cylinder::GetNodeWidth(int ny, const unsigned int pos[3], bool d
 {
 	if ((ny<0) || (ny>2)) return 0.0;
 	if (pos[ny]>=numLines[ny]) return 0.0;
-	double width = Operator_Multithread::GetEdgeLength(ny,pos,!dualMesh);
+	double width = Operator::GetEdgeLength(ny,pos,!dualMesh);
 	if (ny==1)
 		width *= GetDiscLine(0,pos[0],dualMesh);
 	return width;
@@ -193,7 +175,7 @@ double Operator_Cylinder::GetNodeArea(int ny, const unsigned int pos[3], bool du
 	if (pos[0]>=numLines[0]) return 0.0;
 	if (ny==2)
 	{
-		double da = Operator_Multithread::GetEdgeLength(1,pos,dualMesh)/gridDelta;
+		double da = Operator::GetEdgeLength(1,pos,dualMesh)/gridDelta;
 		double r1,r2;
 
 		if (dualMesh)
@@ -213,7 +195,7 @@ double Operator_Cylinder::GetNodeArea(int ny, const unsigned int pos[3], bool du
 			return da/2* (pow(r2,2) - pow(r1,2));
 	}
 
-	return Operator_Multithread::GetNodeArea(ny,pos,dualMesh);
+	return Operator::GetNodeArea(ny,pos,dualMesh);
 }
 
 double Operator_Cylinder::GetNodeArea(int ny, const int pos[3], bool dualMesh) const
@@ -230,7 +212,7 @@ double Operator_Cylinder::GetNodeArea(int ny, const int pos[3], bool dualMesh) c
 
 double Operator_Cylinder::GetEdgeLength(int ny, const unsigned int pos[3], bool dualMesh) const
 {
-	double length = Operator_Multithread::GetEdgeLength(ny,pos,dualMesh);
+	double length = Operator::GetEdgeLength(ny,pos,dualMesh);
 	if (ny!=1)
 		return length;
 	return length * GetDiscLine(0,pos[0],dualMesh);
@@ -277,6 +259,40 @@ double Operator_Cylinder::GetEdgeArea(int ny, const unsigned int pos[3], bool du
 	return GetEdgeLength(1,pos,!dualMesh) * GetEdgeLength(2,pos,!dualMesh);
 }
 
+void Operator_Cylinder::GetECGeometry(int n, bool dual, const unsigned int pos[3], double& area, double& delta) const
+{
+	// GetEdgeLength() and GetEdgeArea() of this class from the tables of the mesh (GetDiscLine() reads them too),
+	// in the same order of operations, without the calls through GetNodeArea() and GetNodeWidth()
+	const std::vector<double>* length = m_EdgeLengthTable[dual];      // Operator::GetEdgeLength()
+	const std::vector<double>* other  = m_EdgeLengthTable[!dual];
+	delta = length[n][pos[n]];
+	if (n==1)
+		delta *= m_LineTable[dual][0][pos[0]];
+	if (n==0)        // GetEdgeLength(1,pos,!dual) * GetEdgeLength(2,pos,!dual)
+		area = other[1][pos[1]] * m_LineTable[!dual][0][pos[0]] * other[2][pos[2]];
+	else if (n==1)   // Operator::GetNodeArea(1): GetNodeWidth(2) * GetNodeWidth(0)
+		area = other[2][pos[2]] * other[0][pos[0]];
+	else             // GetNodeArea(2): the ring segment
+	{
+		const double da = length[1][pos[1]]/gridDelta;
+		double r1, r2;
+		if (dual)
+		{
+			r1 = m_LineTable[0][0][pos[0]]*gridDelta;
+			r2 = r1 + m_EdgeLengthTable[0][0][pos[0]];
+		}
+		else
+		{
+			r2 = m_LineTable[1][0][pos[0]]*gridDelta;
+			r1 = r2 - m_EdgeLengthTable[1][0][pos[0]];
+		}
+		if (r1<=0)
+			area = da/2 * pow(r2,2);
+		else
+			area = da/2* (pow(r2,2) - pow(r1,2));
+	}
+}
+
 double Operator_Cylinder::FitToAlphaRange(double a_coord, bool fullMesh) const
 {
 	double min = GetDiscLine(1,0);
@@ -319,20 +335,20 @@ bool Operator_Cylinder::GetCellCenterMaterialAvgCoord(const int pos[3], double c
 {
 	if (!CC_closedAlpha || ((pos[1]>=0) && (pos[1]<(int)numLines[1]-2)))
 	{
-		return Operator_Multithread::GetCellCenterMaterialAvgCoord(pos, coord);
+		return Operator::GetCellCenterMaterialAvgCoord(pos, coord);
 	}
 	if ((pos[0]<0) || (pos[2]<0))
 		return false;
 	int l_pos[3] = {pos[0], 0, pos[2]};
 	l_pos[1] = MapAlphaIndex2Range(pos[1]);
-	return Operator_Multithread::GetCellCenterMaterialAvgCoord(l_pos, coord);
+	return Operator::GetCellCenterMaterialAvgCoord(l_pos, coord);
 }
 
 unsigned int Operator_Cylinder::SnapToMeshLine(int ny, double coord, bool &inside, bool dualMesh, bool fullMesh) const
 {
 	if (ny==1)
 		coord=FitToAlphaRange(coord);
-	return Operator_Multithread::SnapToMeshLine(ny, coord, inside, dualMesh, fullMesh);
+	return Operator::SnapToMeshLine(ny, coord, inside, dualMesh, fullMesh);
 }
 
 int Operator_Cylinder::SnapBox2Mesh(const double* start, const double* stop, unsigned int* uiStart, unsigned int* uiStop, bool dualMesh, bool fullMesh, int SnapMethod, bool* bStartIn, bool* bStopIn) const
@@ -355,12 +371,12 @@ int Operator_Cylinder::SnapBox2Mesh(const double* start, const double* stop, uns
 
 	double l_start[3] = {start[0], a_start, start[2]};
 	double l_stop[3]  = {stop[0] , a_stop , stop[2] };
-	return Operator_Multithread::SnapBox2Mesh(l_start, l_stop, uiStart, uiStop, dualMesh, fullMesh, SnapMethod, bStartIn, bStopIn);
+	return Operator::SnapBox2Mesh(l_start, l_stop, uiStart, uiStop, dualMesh, fullMesh, SnapMethod, bStartIn, bStopIn);
 }
 
 int Operator_Cylinder::SnapLine2Mesh(const double* start, const double* stop, unsigned int* uiStart, unsigned int* uiStop, bool dualMesh, bool fullMesh) const
 {
-	int ret = Operator_Multithread::SnapLine2Mesh(start, stop, uiStart, uiStop, dualMesh, fullMesh);
+	int ret = Operator::SnapLine2Mesh(start, stop, uiStart, uiStop, dualMesh, fullMesh);
 
 	if ((stop[1]>start[1]) && (uiStop[1]<uiStart[1]) && (uiStop[1]==0))
 		uiStop[1] = GetNumberOfLines(1, fullMesh)-1-(int)CC_closedAlpha;
@@ -408,7 +424,7 @@ Grid_Path Operator_Cylinder::FindPath(double start[], double stop[])
 	{
 		l_start[1] = a_start;
 		l_stop[1] = a_stop;
-		return Operator_Multithread::FindPath(l_start, l_stop);
+		return Operator::FindPath(l_start, l_stop);
 	}
 
 	// if a-stop fitted to disc range is now smaller than a-start, it must step over the a-bounds...
@@ -568,7 +584,7 @@ bool Operator_Cylinder::SetupCSXGrid(CSRectGrid* grid)
 		CC_R0_included = CC_closedAlpha;  //needed for correct ec-calculation, deactivate if closed cylinder is false... --> E_r = 0 anyways
 	}
 
-	if (Operator_Multithread::SetupCSXGrid(grid)==false)
+	if (Operator::SetupCSXGrid(grid)==false)
 		return false;
 
 	if (CC_closedAlpha || CC_R0_included)
@@ -592,13 +608,13 @@ void Operator_Cylinder::ApplyMagneticBC(bool* dirs)
 	{
 		dirs[0]=0;  //no PMC in r_min directions...
 	}
-	Operator_Multithread::ApplyMagneticBC(dirs);
+	Operator::ApplyMagneticBC(dirs);
 }
 
 void Operator_Cylinder::AddExtension(Operator_Extension* op_ext)
 {
 	if (op_ext->IsCylinderCoordsSave(CC_closedAlpha, CC_R0_included))
-		Operator_Multithread::AddExtension(op_ext);
+		Operator::AddExtension(op_ext);
 	else
 	{
 		cerr << "Operator_Cylinder::AddExtension: Warning: Operator extension \"" << op_ext->GetExtensionName() << "\" is not compatible with cylinder-coords!! skipping...!" << endl;

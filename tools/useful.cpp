@@ -20,12 +20,32 @@
 #include <cstdlib>
 #include <cmath>
 #include <climits>
+#include <cstdint>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
 #include <thread>
+#include <algorithm>
+#include <atomic>
+#include <exception>
+#include <mutex>
 #ifdef __linux__
 #include <sched.h>
+#include <set>
+#include <utility>
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <vector>
 #endif
 #include <boost/algorithm/string.hpp>
 #include <iostream>
@@ -113,22 +133,24 @@ unsigned int CgroupV2QuotaAt(const std::string& dir)
 	return (unsigned int)std::ceil(std::atof(quota.c_str())/period);
 }
 
+//! This process' cgroup v2 path, empty without the unified hierarchy
+std::string OwnCgroupV2Path()
+{
+	std::ifstream self("/proc/self/cgroup");
+	std::string line;
+	while (std::getline(self, line))
+		if (line.compare(0, 3, "0::")==0) // unified hierarchy: "0::<path>"
+			return line.substr(3);
+	return "";
+}
+
 //! CPUs of a cgroup v2 CPU quota (rounded up), 0 if there is none. cgroup v2 quotas
 //! are hierarchical (a parent's quota always constrains its children), so this
 //! walks from this process' own cgroup up to the mount root and returns the
 //! tightest limit found.
 unsigned int CgroupV2Quota()
 {
-	std::ifstream self("/proc/self/cgroup");
-	std::string line, rel;
-	while (std::getline(self, line))
-	{
-		if (line.compare(0, 3, "0::")==0) // unified hierarchy: "0::<path>"
-		{
-			rel = line.substr(3);
-			break;
-		}
-	}
+	const std::string rel = OwnCgroupV2Path();
 	if (rel.empty())
 		return 0;
 
@@ -153,6 +175,48 @@ unsigned int CgroupCPUQuota()
 {
 	unsigned int q = CgroupV2Quota();
 	return (q>0) ? q : CgroupV1Quota();
+}
+
+//! The number in a cgroup file, false if it is missing or "max"
+bool CgroupValue(const std::string& file, double& value)
+{
+	std::ifstream f(file);
+	std::string s;
+	if (!(f >> s) || (s=="max"))
+		return false;
+	value = std::atof(s.c_str());
+	return true;
+}
+
+//! The memory left under the cgroup memory limits of this process, SIZE_MAX without one: cgroup v2
+//! from its own cgroup up to the root (a parent's limit holds for its children), cgroup v1 its own
+size_t CgroupMemoryLeft()
+{
+	double left = -1;
+	auto limit = [&left](const std::string& max, const std::string& used) {
+		double m = 0, u = 0;
+		if (!CgroupValue(max, m) || (m>=4e18))   // v1 writes "no limit" as about 2^63
+			return;
+		CgroupValue(used, u);
+		const double l = (m>u) ? m-u : 0;
+		if ((left<0) || (l<left))
+			left = l;
+	};
+	const std::string root = "/sys/fs/cgroup";
+	const std::string rel = OwnCgroupV2Path();
+	if (!rel.empty())
+		for (std::string dir = root + rel; ; )
+		{
+			limit(dir + "/memory.max", dir + "/memory.current");
+			if (dir==root)
+				break;
+			size_t slash = dir.find_last_of('/');
+			dir = (slash>root.size()) ? dir.substr(0, slash) : root;
+		}
+	const std::string rel1 = OwnCgroupV1Path("memory");
+	if (!rel1.empty())
+		limit(root + "/memory" + rel1 + "/memory.limit_in_bytes", root + "/memory" + rel1 + "/memory.usage_in_bytes");
+	return (left<0) ? SIZE_MAX : (size_t)left;
 }
 #endif
 }
@@ -190,6 +254,83 @@ unsigned int MachineThreads()
 }
 }
 
+unsigned int PhysicalCores()
+{
+	static unsigned int cores = 0;
+	if (cores)
+		return cores;
+	unsigned int n = 0;
+#if defined(__linux__)
+	// the distinct (package, core) of the CPUs this process may run on
+	cpu_set_t set;
+	if (sched_getaffinity(0, sizeof(set), &set)==0)
+	{
+		std::set< std::pair<int, int> > distinct;
+		for (int cpu=0; cpu<CPU_SETSIZE; ++cpu)
+		{
+			if (!CPU_ISSET(cpu, &set))
+				continue;
+			const std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+			std::ifstream fp(dir + "physical_package_id"), fc(dir + "core_id");
+			int package = 0, core = 0;
+			if (!(fp >> package) || !(fc >> core))
+			{
+				distinct.clear();
+				break;   // no topology: the threads
+			}
+			distinct.insert(std::make_pair(package, core));
+		}
+		n = distinct.size();
+	}
+#elif defined(__APPLE__)
+	int count = 0;
+	size_t size = sizeof(count);
+	if ((sysctlbyname("hw.physicalcpu", &count, &size, NULL, 0)==0) && (count>0))
+		n = count;
+#elif defined(_WIN32)
+	DWORD len = 0;
+	GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+	if (len>0)
+	{
+		std::vector<char> buf(len);
+		if (GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf.data(), &len))
+			for (DWORD off=0; off<len; off+=((SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf.data()+off))->Size)
+				++n;
+	}
+#endif
+	const unsigned int threads = MachineThreads();   // the affinity and the cgroup quota
+	cores = ((n>0) && (n<threads)) ? n : threads;
+	return cores;
+}
+
+size_t AvailableMemory()
+{
+	if (const char* env = getenv("OPENEMS_AVAILABLE_MEMORY"))   // for testing
+		return (size_t)strtoull(env, NULL, 10);
+#if defined(__linux__)
+	std::ifstream f("/proc/meminfo");
+	std::string key, rest;
+	unsigned long long kb = 0;
+	while (f >> key >> kb)
+	{
+		if (key=="MemAvailable:")
+			return std::min<unsigned long long>(kb*1024, CgroupMemoryLeft());
+		std::getline(f, rest);
+	}
+	return 0;
+#elif defined(_WIN32)
+	MEMORYSTATUSEX status;
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) ? (size_t)status.ullAvailPhys : 0;
+#elif defined(__APPLE__)
+	uint64_t mem = 0;
+	size_t size = sizeof(mem);
+	return (sysctlbyname("hw.memsize", &mem, &size, NULL, 0)==0) ? (size_t)mem : 0;
+#else
+	return 0;
+#endif
+}
+
 unsigned int AvailableThreads()
 {
 	const unsigned int n = MachineThreads();
@@ -199,6 +340,70 @@ unsigned int AvailableThreads()
 void SetThreadLimit(unsigned int n)
 {
 	g_ThreadLimit = n;
+}
+
+namespace
+{
+//! run fn(t) for t in [0, numThreads), t 0 on the calling thread, the others on threads of their own; the first exception rethrown after all ended
+void RunThreads(unsigned int numThreads, const std::function<void(unsigned int)>& fn)
+{
+	std::vector<std::thread> threads;
+	std::exception_ptr error;
+	std::mutex error_mutex;
+	auto run = [&](unsigned int t) {
+		try
+		{
+			fn(t);
+		}
+		catch (...)
+		{
+			std::lock_guard<std::mutex> lock(error_mutex);
+			if (!error)
+				error = std::current_exception();
+		}
+	};
+	for (unsigned int t=1; t<numThreads; ++t)
+		threads.push_back(std::thread(run, t));
+	run(0);
+	for (std::thread& th : threads)
+		th.join();
+	if (error)
+		std::rethrow_exception(error);
+}
+}
+
+void ParallelFor(size_t count, unsigned int numThreads, const std::function<void(unsigned int thread, size_t begin, size_t end)>& fn)
+{
+	if (count==0)
+		return;
+	numThreads = (unsigned int)std::min<size_t>(std::max(1u, numThreads), count);
+	if (numThreads==1)
+	{
+		fn(0, 0, count);
+		return;
+	}
+	RunThreads(numThreads, [&](unsigned int t) {
+		// the first count%numThreads ranges one longer
+		const size_t q = count/numThreads, r = count%numThreads;
+		const size_t begin = t*q + std::min<size_t>(t, r);
+		fn(t, begin, begin + q + ((t<r) ? 1 : 0));
+	});
+}
+
+void ParallelForEach(size_t count, unsigned int numThreads, const std::function<void(unsigned int thread, size_t i)>& fn)
+{
+	if (count==0)
+		return;
+	numThreads = (unsigned int)std::min<size_t>(std::max(1u, numThreads), count);
+	std::atomic<size_t> next(0);
+	auto work = [&](unsigned int t) {
+		for (size_t i=next++; i<count; i=next++)
+			fn(t, i);
+	};
+	if (numThreads==1)
+		work(0);
+	else
+		RunThreads(numThreads, work);
 }
 
 std::vector<unsigned int> AssignJobs2Threads(unsigned int jobs, unsigned int nrThreads, bool RemoveEmpty)

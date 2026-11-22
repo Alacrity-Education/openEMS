@@ -201,8 +201,8 @@ grid on
 
 smithchart
 S11 = squeeze(S(1,1,:));
-plot( real(S11), imag(S11) );
-legend( 'S_{11}' );
+h = plot( real(S11), imag(S11) );
+legend( h, 'S_{11}' );   % not the grid of the smith chart, plotted before
 title( ['performance of the coupler for a termination resistance of R=' num2str(R)] );
 axis( [-1 1 -1 1] );
 
@@ -223,10 +223,10 @@ else
     hg = hggroup;
     set( h,'Parent',hg );
     hold on
-    plot( hg, 0.25+0.75*sin(0:0.01:2*pi), 0.75*cos(0:0.01:2*pi), 'Color', color );
-    plot( hg, 0.5+0.5*sin(0:0.01:2*pi), 0.5*cos(0:0.01:2*pi), 'Color', color );
-    plot( hg, 0.75+0.25*sin(0:0.01:2*pi), 0.25*cos(0:0.01:2*pi), 'Color', color );
-    plot( hg, [-1 1], [0 0], 'Color', color );
+    set( plot( 0.25+0.75*sin(0:0.01:2*pi), 0.75*cos(0:0.01:2*pi), 'Color', color ), 'Parent', hg );
+    set( plot( 0.5+0.5*sin(0:0.01:2*pi), 0.5*cos(0:0.01:2*pi), 'Color', color ), 'Parent', hg );
+    set( plot( 0.75+0.25*sin(0:0.01:2*pi), 0.25*cos(0:0.01:2*pi), 'Color', color ), 'Parent', hg );
+    set( plot( [-1 1], [0 0], 'Color', color ), 'Parent', hg );
     axis equal
     axis off
 end

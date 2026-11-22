@@ -26,8 +26,7 @@ class Operator_Cylinder;
 class Operator_Ext_Cylinder : public Operator_Extension
 {
 	friend class Engine_Ext_Cylinder;
-	friend class HIP_Ext_Cylinder;
-	friend class Metal_Ext_Cylinder;
+	friend class GPU_Ext_Cylinder;
 	friend class Operator_Ext_LorentzMaterial;
 	friend class Operator_Ext_DebyeMaterial;
 public:
@@ -40,7 +39,6 @@ public:
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
-	virtual bool IsGPUSave() const {return true;}
 
 	virtual std::string GetExtensionName() const
 	{
@@ -48,6 +46,9 @@ public:
 	}
 
 	virtual void ShowStat(std::ostream &ostr) const;
+
+	//! The mesh closes in alpha: the engine extension couples the first and the last alpha planes
+	bool ClosedAlpha() const {return CC_closedAlpha;}
 
 protected:
 	Operator_Cylinder* m_Op_Cyl;

@@ -30,11 +30,27 @@ The pipeline, and where each part lives:
    `Operator`, one `Engine`, one `ProcessingArray`, and the engine-type choice.
 2. **`Operator`** (`FDTD/operator.h`, `Common/operator_base.h`) pre-computes the
    equivalent-circuit coefficients (`vv`, `vi`, `ii`, `iv`) for every Yee cell in
-   `CalcECOperator()`, and holds the mesh (`discLines[]`). Subclasses specialise
-   it: `Operator_SSE`/`_SSE_Compressed` (SIMD layout),
-   `Operator_Cylinder`/`_CylinderMultiGrid`, `Operator_Multithread`.
+   `CalcECOperator()`, and holds the mesh (`discLines[]`). The circuit values
+   (C, G, L, R) they come from are the effective material of a node, kept once
+   per distinct value (`EC_Table`, `FDTD/ec_table.h`), times the geometry of the
+   edge: read them with `GetEC()`, change them with `SetEC()`. The coefficients live
+   in an `Operator_Coeffs` (`FDTD/operator_coeffs.h`) in the layout the engine
+   reads: basic or compressed SSE, chosen by `SetEngineType()` with the
+   engine; the CPU and GPU engines build their cell model (`FDTD/cell_model.h`)
+   from them. The subclasses are the mesh geometry:
+   `Operator_Cylinder`/`_CylinderMultiGrid`.
 3. **`Engine`** (`FDTD/engine.h`) time-steps those coefficients —
-   `UpdateVoltages`/`UpdateCurrents` over `volt_ptr`/`curr_ptr`.
+   `UpdateVoltages`/`UpdateCurrents` over `volt_ptr`/`curr_ptr`. The CPU
+   engines are `Engine` (basic), `Engine_sse` (compressed SSE, the default)
+   and `Engine_CPU` (the cell model, temporal blocking); they run on the
+   worker threads of an `Engine_ThreadPool`, which calls the thread-aware
+   extension hooks with a `threadID`. `Engine_GPU` runs on a device backend
+   (`FDTD/gpu_backend.h`: HIP, SYCL, Metal, and the reference backend on the
+   CPU); the SYCL one runs on the CPU too (`ONEAPI_DEVICE_SELECTOR=opencl:cpu`),
+   which is how CI tests it.
+   A cylindrical multi-grid level holds the engine of its
+   sub-grid and an `Engine_SubGridCoupling` (`Engine::SetSubGrid()`), for every
+   engine type.
 4. **`Processing`** subclasses (`Common/`) sample the running simulation through
    an `Engine_Interface_Base` and write HDF5/VTK. The interface is what keeps
    probes and dumps independent of which engine is running.
@@ -63,12 +79,16 @@ current-side equivalents.
   declaration order is not a contract.
 - An extension that touches the engine's fields must work for every engine
   subclass, not just the basic one.
-- For the GPU engine that means a device implementation in every backend (HIP,
-  Metal): one extension without one moves all extensions to the host and copies
-  both fields every half-step, which makes GPU runs slow. A change to an
-  extension's update is made in the host, HIP and Metal versions alike;
-  `python/Tests/GPU_Engine.py` compares them with the CPU, but only on a
-  machine with that GPU (CI has none).
+- For the GPU engine that means a device implementation, written once for
+  every backend: a class in `FDTD/gpu_ext.cpp` and its per-point operation in
+  `FDTD/kernels/ext_ops.h`. The GPU engine refuses a model with an extension
+  without one: a new extension implements it from the start.
+  A change to an extension's update is made in the engine extension and in its
+  device operation alike; `python/Tests/Engine_Compare.py` compares them, on
+  any machine through the reference backend (`--engine=gpu-reference`).
+- The CPU and GPU engines fuse the UPML and the dispersive materials into
+  their main update (`FDTD/cell_model.h`, `FDTD/engine_cpu_kernels.inc`,
+  `FDTD/kernels/cell_update.h`): a change to those updates goes there too.
 
 Modifying `Operator`/`Engine` directly is for changes that genuinely belong to
 the core scheme, and those need discussion first.
@@ -99,8 +119,9 @@ CSXCAD and fparser must already be installed into the prefix you build against.
 mkdir -p build && cd build
 cmake .. -DCMAKE_INSTALL_PREFIX=~/opt/openEMS \
          -DFPARSER_ROOT_DIR=~/opt/openEMS \
-         -DCSXCAD_ROOT_DIR=~/opt/openEMS
+         -DCSXCAD_ROOT_DIR=~/opt/openEMS -DOPENEMS_BUILD_TESTS=ON
 make -j$(nproc) && make install
+ctest --output-on-failure          # C++ unit tests, off by default
 ```
 
 Local path overrides belong in `localConfig.cmake` (gitignored) rather than in
@@ -140,14 +161,17 @@ not verification.
 - **Tests**: add a focused test for behaviour that could silently regress —
   `TESTSUITE/` for solver behaviour and for the `matlab/` layer (see
   `TESTSUITE/README.md` for the test contract), `python/Tests/test_*.py` for
-  anything reachable from Python (`python/Tests/README.md` for that contract). A few tests that each catch something distinct beat
+  anything reachable from Python (`python/Tests/README.md` for that contract),
+  `tests/` for C++-only logic (array layouts, schedules). A few tests that each catch something distinct beat
   many that overlap. Numerical tests need a stated tolerance, not an exact
   comparison.
 - **Changelog**: a change a user can notice — new or removed API, changed
   behaviour, a fix for something that bit someone, a new build requirement —
   gets a bullet under `## Unreleased` in `CHANGELOG.md` **in the same commit**,
   creating that section if it is absent. Internal refactoring, CI and test-only
-  changes get none. Use only the subsections you need, in the order `Added`,
+  changes get none. Write for users: what they notice, in a few lines, with no
+  implementation details; those belong in the commit message. Use only the
+  subsections you need, in the order `Added`,
   `Changed`, `Fixed`, `Build`, `Upgrade notes`; `Upgrade notes` is prose, for
   what a bullet cannot carry — a rename, a behaviour change that breaks existing
   scripts, a rebuild requirement. Never write a version heading by hand: the

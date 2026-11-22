@@ -15,12 +15,21 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 
 #include "engine_gpu.h"
+#include "cell_model.h"
+#include "gpu_cell_model.h"
+#include "gpu_ext.h"
 #include "gpu_backend.h"
+#include "engine_subgrid.h"
 #include "extensions/engine_extension.h"
+#include "extensions/engine_ext_absorbing_bc.h"
+#include "extensions/engine_ext_cylinder.h"
 #include "extensions/operator_extension.h"
 
 using std::cout;
@@ -29,9 +38,10 @@ using std::endl;
 
 //! \brief construct an Engine_GPU instance
 //! it's the responsibility of the caller to free the returned pointer
-Engine_GPU* Engine_GPU::New(const Operator* op, GPU_Backend* backend, GPU_Backend* parent)
+Engine_GPU* Engine_GPU::New(const Operator* op, GPU_Backend* backend, GPU_Backend* parent, const std::function<void()>& modelBuilt)
 {
 	Engine_GPU* e = new Engine_GPU(op, backend, parent);
+	e->m_ModelBuilt = modelBuilt;
 	try
 	{
 		e->Init();
@@ -50,7 +60,6 @@ Engine_GPU::Engine_GPU(const Operator* op, GPU_Backend* backend, GPU_Backend* pa
 	m_type = GPU;
 	// ours from here on, Reset() frees it even if Init() fails
 	m_Backend = backend;
-	m_FieldsOnHost = true;
 	m_SharedMemory = false;
 	m_SnapshotsUsed = false;
 	m_SnapshotGatherSet = false;
@@ -69,9 +78,6 @@ Engine_GPU::~Engine_GPU()
 
 void Engine_GPU::Init()
 {
-	// allocates the host mirror and creates the extensions
-	Engine::Init();
-
 	// a sub-grid shares the device work stream of its parent grid
 	if (m_ParentBackend)
 		m_Backend = m_ParentBackend->NewSubGridBackend();
@@ -86,53 +92,403 @@ void Engine_GPU::Init()
 		if (m_DumpPath)
 			cout << "Engine_GPU: OPENEMS_GPU_DUMPS=" << path << ": field dumps " << (m_DumpPath==1 ? "without device sums" : "on the host") << endl;
 	}
-	if (!m_Backend->Init(Op))
-		throw std::runtime_error("Engine_GPU::Init: GPU backend initialization failed");
+	// the cell model of the CPU engine along z (the ArrayNIJK layout); its fused extensions
+	// (UPML, dispersive materials) are part of the main updates, their engine extensions go.
+	// The memory peak as in Engine_CPU::Init(): the operator's coefficients go once the model
+	// is built, the model is expanded and uploaded (and freed) before the host mirror comes
+	CellModel model(Op);
+	model.Analyse(true);
+	model.Build(2, 0, 1);
+	if (Op->GetDebugFlags() & Operator::debugOperator)
+		model.Dump("cellmodel_dump");
+	if (m_ModelBuilt)
+	{
+		m_ModelBuilt();
+		m_ModelBuilt = nullptr;
+	}
+	{
+		const GPU_CellModel expanded(model, numLines);
+		m_NodeBytes = expanded.NodeBytes();
+		if (!m_Backend->Init(Op, expanded))
+			throw std::runtime_error("Engine_GPU::Init: GPU backend initialization failed");
+	}
+	// allocates the host mirror and creates the extensions
+	Engine::Init();
+	model.DropFused(m_Eng_exts);
+	model.FreeFused();
 
 	// with unified memory the host mirror is a view of the device fields
-	m_SharedMemory = m_Backend->GetSharedVoltages() && m_Backend->GetSharedCurrents();
+	m_SharedMemory = m_Backend->GetShared(false) && m_Backend->GetShared(true);
 	if (m_SharedMemory)
 	{
-		volt_ptr->InitView("volt", {numLines[0], numLines[1], numLines[2]}, m_Backend->GetSharedVoltages());
-		curr_ptr->InitView("curr", {numLines[0], numLines[1], numLines[2]}, m_Backend->GetSharedCurrents());
+		volt_ptr->InitView("volt", {numLines[0], numLines[1], numLines[2]}, m_Backend->GetShared(false));
+		curr_ptr->InitView("curr", {numLines[0], numLines[1], numLines[2]}, m_Backend->GetShared(true));
 	}
 
-	// the fields stay on the device only if every extension has a device implementation
-	std::vector<std::string> host_exts;
-	for (size_t n=0; n<m_Eng_exts.size(); ++n)
+	// every extension on the device (a device implementation of each, gpu_ext.h): the fields stay there
+	std::string missing;
+	for (Engine_Extension* eng_ext : m_Eng_exts)
 	{
-		Engine_Extension* eng_ext = m_Eng_exts.at(n);
-		GPU_Extension* gpu_ext = NULL;
-		if (eng_ext->GetOperatorExtension()->IsGPUSave())
-			gpu_ext = m_Backend->CreateExtension(eng_ext, this);
+		GPU_Extension* gpu_ext = GPU_CreateExtension(eng_ext, m_Backend, numLines);
 		if (gpu_ext)
 			m_GPU_exts.push_back(gpu_ext);
 		else
-			host_exts.push_back(eng_ext->GetExtensionName());
+			missing += (missing.empty() ? "" : ", ") + eng_ext->GetExtensionName();
 	}
-
-	m_FieldsOnHost = !host_exts.empty();
-	if (m_FieldsOnHost)
-	{
-		// all or nothing: with one extension on the host, both fields are uploaded
-		// before every main update, which would overwrite what a device extension
-		// did to them
-		ClearGPUExtensions();
-		cout << "Engine_GPU: extensions run on the host copy of the fields (host fallback)" << endl;
-		cerr << "Engine_GPU::Init: Warning: extensions without a GPU implementation run on the host, the fields are copied every timestep:" << endl;
-		for (size_t n=0; n<host_exts.size(); ++n)
-			cerr << "\t" << host_exts.at(n) << endl;
-	}
-	else if (g_settings.GetVerboseLevel()>1)
-		cout << "Engine_GPU: all extensions run on the device" << endl;
+	if (!missing.empty())
+		throw std::runtime_error("Engine_GPU: no device implementation (gpu_ext.h) of the " + missing);
+	m_BlockingPrepared = false;
 }
 
-void Engine_GPU::ForceHostFallback()
+void Engine_GPU::PrepareBlocking()
 {
-	if (m_FieldsOnHost)
+	m_BlockCandidates.clear();
+	m_Block = -1;
+	m_Trial = -1;
+	m_FlatSplit = false;
+	// as Engine_CPU: tiles given (no trials then, unless asked for), or the cache size to choose them from
+	std::vector< std::pair<unsigned int, unsigned int> > given;   // (k, W)
+	const bool explicitTile = Engine_TilesFromEnv("OPENEMS_GPU_TBLOCK", given);
+	m_TrialSeconds = Engine_NumberFromEnv("OPENEMS_GPU_TRIAL", given.empty() ? 0.3 : 0, true);
+	// tiles of whole planes, cut along x (wM the lines of y), and tiles cut along x and y as well, for planes too large for
+	// the cache: those do not grow with the cross-section. Not along y with a cylinder (its hooks need the whole alpha
+	// axis, y; cutting z, the fast axis, instead was slower than whole planes, measured at 100 and 200 million cells)
+	// or a local absorber normal to y
+	const int S = 0, M = 1;
+	bool cutM = true;
+	for (size_t n=0; n<m_Eng_exts.size(); ++n)
+		if (dynamic_cast<const Engine_Ext_Cylinder*>(m_Eng_exts[n]))
+			cutM = false;
+	struct Tile {unsigned int k, wS, wM;};
+	std::vector<Tile> tiles;
+	std::string why;
+	if (explicitTile && given.empty())
+		why = "OPENEMS_GPU_TBLOCK=0";
+	else if (m_SubGrid || m_ParentBackend)
+		why = "a cylindrical multi-grid";
+	// a local absorber needs its sheet and the next line along its normal in one box
+	// (Engine_CPU blocks along its normal instead, Engine_CPU::ChooseLayout())
+	for (size_t n=0; n<m_Eng_exts.size() && why.empty(); ++n)
+		if (const Engine_Ext_Absorbing_BC* abc = dynamic_cast<const Engine_Ext_Absorbing_BC*>(m_Eng_exts[n]))
+		{
+			if (abc->GetNormalAxis()==S)
+				why = "a local absorber normal to x";
+			else if (abc->GetNormalAxis()==M)
+				cutM = false;
+		}
+	if (why.empty())
+		for (const std::pair<unsigned int, unsigned int>& t : given)
+			tiles.push_back(Tile{t.first, t.second, cutM ? t.second : numLines[M]});
+
+	std::string skipFused;   // why the fused step is not worth trying
+	if (why.empty() && !explicitTile)
+	{
+		// the tile: what the main updates read of its lines (GPU_CellModel::NodeBytes()) in the last-level cache. Of
+		// its size, if the backend tells it (or OPENEMS_GPU_CACHE): whole planes in 1/2, 3/4 and all of it, square
+		// tiles in 1/8, 1/4 and 1/2 (they drift along two axes, measured: smaller ones faster); else of 8 to 256 MiB.
+		// The trials keep the fastest
+		std::string source;
+		double cache = (double)m_Backend->CacheBytes(source);
+		if (const double mib = Engine_NumberFromEnv("OPENEMS_GPU_CACHE", 0, false))
+		{
+			cache = mib*1048576.0;
+			source = "OPENEMS_GPU_CACHE";
+		}
+		std::vector<double> planeBudgets, squareBudgets;
+		if (cache>0)
+		{
+			planeBudgets = {0.5*cache, 0.75*cache, cache};
+			squareBudgets = {0.125*cache, 0.25*cache, 0.5*cache};
+		}
+		else
+			for (double mib=8; mib<=256; mib*=2)
+			{
+				planeBudgets.push_back(mib*1048576.0);
+				squareBudgets.push_back(mib*1048576.0/4);
+			}
+		if (g_settings.GetVerboseLevel()>0)
+		{
+			if (cache>0)
+				cout << "Engine_GPU: last-level cache " << cache/1048576.0 << " MiB, " << source << endl;
+			else
+				cout << "Engine_GPU: last-level cache unknown, tiles for 8 to 256 MiB" << endl;
+		}
+		const double line = (double)numLines[2]*m_NodeBytes;   // along z, which every tile spans
+		auto add = [&](std::vector<Tile>& list, unsigned int wS, unsigned int wM) {
+			const unsigned int k = std::min(8u, (std::min(wS, wM)>0) ? (std::min(wS, wM)-1)/2 : 0);
+			const unsigned int count = Engine_BlockedPlan::TileCount(numLines[S], wS)*Engine_BlockedPlan::TileCount(numLines[M], wM);
+			if ((k>=2) && (count>=2) && (list.empty() || (list.back().wS!=wS)))
+				list.push_back(Tile{k, wS, wM});
+		};
+		std::vector<Tile> planes, squares;
+		for (double bytes : planeBudgets)
+			add(planes, (unsigned int)(bytes/(line*numLines[M])), numLines[M]);
+		// squares only where whole planes hold fewer than 8 timesteps: else those are as fast or faster (measured)
+		if (cutM && (planes.empty() || (planes.back().k<8)))
+			for (double bytes : squareBudgets)
+			{
+				const unsigned int w = (unsigned int)std::sqrt(bytes/line);
+				if (w<numLines[M])
+					add(squares, w, w);
+			}
+		// the first is the start without trials: the middle square if any, else the smallest plane
+		if (!squares.empty())
+		{
+			const size_t mid = squares.size()/2;
+			tiles.push_back(squares[mid]);
+			squares.erase(squares.begin()+mid);
+		}
+		tiles.insert(tiles.end(), squares.begin(), squares.end());
+		tiles.insert(tiles.end(), planes.begin(), planes.end());
+		if (tiles.empty())
+			why = "the model fits the cache, or the smallest tile is too large for it";
+		// a tile of the full depth streams the fields once per 8 timesteps, the fused step once per timestep:
+		// with the cache known to hold one, the fused step cannot win, so neither its memory nor its trial
+		else if ((cache>0) && std::any_of(tiles.begin(), tiles.end(), [](const Tile& t) {return t.k>=8;}))
+			skipFused = "the cache holds tiles of 8 timesteps";
+	}
+	PrepareFused(skipFused);
+	// the flat sweep: the fused step against the two updates, unless OPENEMS_GPU_FUSED=1 asks for it
+	m_FlatTrial = m_Fused && !m_FusedForced;
+	if (!why.empty())
+	{
+		if (g_settings.GetVerboseLevel()>0)
+			cout << "Engine_GPU: no temporal blocking: " << why << endl;
+		if (m_FlatTrial && (m_TrialSeconds>0))
+		{
+			if (g_settings.GetVerboseLevel()>0)
+				cout << "Engine_GPU: trying the fused step and the two updates" << endl;
+			StartTrials();
+		}
 		return;
-	ClearGPUExtensions();
-	m_FieldsOnHost = true;
+	}
+	for (const Tile& t : tiles)
+	{
+		std::vector<Engine_BlockedPlan> plans;
+		for (unsigned int k=t.k; k>=2; --k)
+			plans.push_back(Engine_BlockedPlan::Parallelograms(numLines, S, M, t.wS, t.wM, k));
+		m_BlockCandidates.push_back(plans);
+	}
+	if (g_settings.GetVerboseLevel()>0)
+	{
+		cout << "Engine_GPU: temporal blocking along " << (char)('x'+S) << " and " << (char)('x'+M) << ", tiles to try (timesteps:lines)";
+		for (size_t c=0; c<tiles.size(); ++c)
+		{
+			const Engine_BlockedPlan& plan = m_BlockCandidates[c].front();
+			cout << " " << c+1 << ") " << tiles[c].k << ":" << tiles[c].wS << "x" << std::min(tiles[c].wM, numLines[M]) << " ("
+			     << plan.tiles[0] << "x" << plan.tiles[1] << " tiles)";
+		}
+		cout << (m_TrialSeconds>0 ? (m_FlatTrial ? ", the fused step and the two updates" : ", and the flat sweep") : "") << endl;
+	}
+	m_Block = 0;
+	if ((m_TrialSeconds<=0) && m_Fused)
+	{
+		// a tile without trials: the flat steps are rare
+		m_Backend->ReleaseFused();
+		m_Fused = false;
+	}
+	if (m_TrialSeconds>0)
+		StartTrials();
+}
+
+void Engine_GPU::StartTrials()
+{
+	MarkTrialsStart();
+	m_Trial = 0;
+	m_TrialSteps = 0;
+	m_TrialSpeed.assign(m_BlockCandidates.size() + 1 + (m_FlatTrial ? 1 : 0), 0);
+	m_TrialTime = 0;
+	m_TrialMark = -1;
+	m_TrialWarm = true;
+	m_Block = m_BlockCandidates.empty() ? -1 : 0;
+	m_FlatSplit = false;
+}
+
+void Engine_GPU::PrepareFused(const std::string& skip)
+{
+	m_Fused = false;
+	const char* env = getenv("OPENEMS_GPU_FUSED");
+	m_FusedForced = env && (std::string(env)=="1");
+	if ((env && (std::string(env)=="0")) || m_SubGrid || m_ParentBackend)
+		return;
+	if (!skip.empty() && !m_FusedForced)
+	{
+		if (g_settings.GetVerboseLevel()>0)
+			cout << "Engine_GPU: no fused step: " << skip << endl;
+		return;
+	}
+	// the currents that wait for the hooks between the main updates: those the hooks read or
+	// write, and those whose curl reads a voltage they write (the voltages at the node and
+	// above: a current of node i reads the voltages at i, i+sx, i+sy and i+sz)
+	std::vector<uint64_t> volt, late;
+	for (const GPU_Extension* ext : m_GPU_exts)
+		if (!ext->MidStepNodes(volt, late))
+		{
+			if (g_settings.GetVerboseLevel()>0)
+				cout << "Engine_GPU: no fused step: an extension does not tell the nodes of its hooks" << endl;
+			return;
+		}
+	const uint64_t sz = 1, sy = numLines[2], sx = (uint64_t)numLines[1]*numLines[2];
+	for (uint64_t v : volt)
+	{
+		late.push_back(v);
+		if (v/sx > 0)
+			late.push_back(v-sx);
+		if ((v/sy)%numLines[1] > 0)
+			late.push_back(v-sy);
+		if (v%numLines[2] > 0)
+			late.push_back(v-sz);
+	}
+	std::sort(late.begin(), late.end());
+	late.erase(std::unique(late.begin(), late.end()), late.end());
+	m_Fused = m_Backend->PrepareFused(late);
+	if (m_Fused && (g_settings.GetVerboseLevel()>0))
+		cout << "Engine_GPU: fused step, " << late.size() << " late currents" << endl;
+}
+
+template <typename Update>
+void Engine_GPU::DeviceHalfStep(bool currents, const Engine_Box& box, unsigned int ts, Update update)
+{
+	// the extensions see the last line of an axis too, which has no current update (as Engine_ThreadPool::BlockedStep())
+	Engine_Box hook = box;
+	if (currents)
+		for (int a=0; a<3; ++a)
+			if (hook.stop[a]+1==numLines[a])
+				hook.stop[a] = numLines[a];
+	for (size_t n=m_GPU_exts.size(); n-->0; )
+		m_GPU_exts[n]->Hook(currents, GPU_PRE, hook, ts);
+	update();
+	for (GPU_Extension* ext : m_GPU_exts)
+		ext->Hook(currents, GPU_POST, hook, ts);
+	for (GPU_Extension* ext : m_GPU_exts)
+		ext->Hook(currents, GPU_APPLY, hook, ts);
+}
+
+void Engine_GPU::FusedStep()
+{
+	DeviceHalfStep(false, Domain(), numTS, [this]() {m_Backend->FusedUpdate();});
+	DeviceHalfStep(true, Domain(), numTS, [this]() {m_Backend->SeamUpdate();});
+}
+
+unsigned int Engine_GPU::BlockLength(unsigned int left, unsigned int kmax) const
+{
+	kmax = std::min(left, kmax);
+	unsigned int k = 0;
+	while (k<kmax)
+	{
+		bool flat = false;
+		for (const GPU_Extension* ext : m_GPU_exts)
+			flat = flat || ext->NeedsFlatStep(numTS+k);
+		if (flat)
+			break;
+		++k;
+	}
+	return k;
+}
+
+void Engine_GPU::RunBlock(const Engine_BlockedPlan& plan)
+{
+	for (const std::vector< std::vector<Engine_Step> >& phase : plan.phases)
+		for (const Engine_Step& step : phase.at(0))
+			BlockedStep(step, numTS + step.t);
+	for (unsigned int t=0; t<plan.k; ++t)
+		NextTimestep();
+}
+
+void Engine_GPU::BlockedStep(const Engine_Step& step, unsigned int ts)
+{
+	if (step.volt)
+		DeviceHalfStep(false, step.box, ts, [&]() {m_Backend->UpdateVoltages(step.box);});
+	else
+		DeviceHalfStep(true, step.box, ts, [&]() {m_Backend->UpdateCurrents(step.box);});
+}
+
+static double WallSeconds()
+{
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Engine_GPU::TrialClock(bool run)
+{
+	if ((m_Trial<0) || (run==(m_TrialMark>=0)))
+		return;
+	m_Backend->Synchronize();
+	const double now = WallSeconds();
+	if (run)
+		m_TrialMark = now;
+	else
+	{
+		m_TrialTime += now - m_TrialMark;
+		m_TrialMark = -1;
+	}
+}
+
+void Engine_GPU::TrialProgress(unsigned int steps)
+{
+	if (m_Trial<0)
+		return;
+	if (m_TrialWarm)
+	{
+		// the first steps of a candidate are not timed (the warm-up of its kernels and caches)
+		TrialClock(false);
+		m_TrialTime = 0;
+		m_TrialSteps = 0;
+		m_TrialWarm = false;
+		TrialClock(true);
+		return;
+	}
+	m_TrialSteps += steps;
+	// the launches are asynchronous: the host would queue far more than the trial's time of work (a few
+	// hundred timesteps fit in the queue of HIP, seconds of a large model), so it waits for the device after
+	// every block or flat step of a trial (a few 10 us; the candidates of a model small enough for that to
+	// matter are flat steps alike)
+	m_Backend->Synchronize();
+	if (m_TrialTime + WallSeconds()-m_TrialMark < m_TrialSeconds)
+		return;
+	TrialClock(false);
+	m_TrialSpeed[m_Trial] = m_TrialSteps/std::max(m_TrialTime, 1e-9);
+	++m_Trial;
+	m_TrialTime = 0;
+	m_TrialWarm = true;
+	// the candidates: the tiles, the flat sweep (the fused step, if prepared), the two updates (m_FlatTrial)
+	const int tiles = m_BlockCandidates.size();
+	if (m_Trial<(int)m_TrialSpeed.size())
+	{
+		TrialClock(true);
+		m_Block = (m_Trial<tiles) ? m_Trial : -1;
+		m_FlatSplit = (m_Trial==tiles+1);
+		return;
+	}
+	// all tried: the fastest
+	int best = 0;
+	for (size_t c=1; c<m_TrialSpeed.size(); ++c)
+		if (m_TrialSpeed[c]>m_TrialSpeed[best])
+			best = c;
+	m_Block = (best<tiles) ? best : -1;
+	m_Trial = -1;
+	m_FlatSplit = false;
+	MarkTrialsEnd();
+	if (m_Fused && ((m_Block>=0) || (best==tiles+1)))
+	{
+		// the memory of the fused step back (the flat steps of the blocked runs are rare)
+		m_Backend->ReleaseFused();
+		m_Fused = false;
+	}
+	if (g_settings.GetVerboseLevel()>0)
+	{
+		const double cells = (double)numLines[0]*numLines[1]*numLines[2]/1e6;
+		auto name = [&](int c) {
+			if (c<tiles)
+				return "tile " + std::to_string(c+1);
+			if (!m_FlatTrial)
+				return std::string("the flat sweep");
+			return std::string((c==tiles) ? "the fused step" : "the two updates");
+		};
+		cout << "Engine_GPU: tried";
+		for (size_t c=0; c<m_TrialSpeed.size(); ++c)
+			cout << (c ? ", " : " ") << name(c) << " " << (int)(m_TrialSpeed[c]*cells) << " MC/s";
+		cout << "; running " << name(best) << endl;
+	}
 }
 
 void Engine_GPU::ClearGPUExtensions()
@@ -144,6 +500,8 @@ void Engine_GPU::ClearGPUExtensions()
 
 void Engine_GPU::Reset()
 {
+	// the sub-grid backend shares the work stream of ours, the coupling refers to both
+	ClearSubGrid();
 	// the device extensions refer to the backend and to the engine extensions
 	ClearGPUExtensions();
 	delete m_Backend;
@@ -156,7 +514,7 @@ void Engine_GPU::VoltagesToHost()
 	if (m_SharedMemory)
 		m_Backend->Synchronize();
 	else
-		m_Backend->DownloadVoltages(*volt_ptr);
+		m_Backend->Download(false, *volt_ptr);
 	m_StaleVolt.stale = false;
 	m_StaleVolt.lines.clear();
 }
@@ -166,7 +524,7 @@ void Engine_GPU::CurrentsToHost()
 	if (m_SharedMemory)
 		m_Backend->Synchronize();
 	else
-		m_Backend->DownloadCurrents(*curr_ptr);
+		m_Backend->Download(true, *curr_ptr);
 	m_StaleCurr.stale = false;
 	m_StaleCurr.lines.clear();
 }
@@ -201,15 +559,13 @@ FDTD_FLOAT Engine_GPU::ReadStale(bool currents, unsigned int n, unsigned int x, 
 	if (!field.full_last_batch && (field.lines.size()<MAX_STALE_LINES))
 	{
 		std::vector<FDTD_FLOAT> line(numLines[2]);
-		if (m_Backend->DownloadRange(currents, key*numLines[2], numLines[2], line.data()))
-		{
-			const FDTD_FLOAT value = line.at(z);
-			field.lines[key].swap(line);
-			return value;
-		}
+		m_Backend->DeviceDownload(line.data(), m_Backend->DeviceField(currents) + key*numLines[2], numLines[2]*sizeof(FDTD_FLOAT));
+		const FDTD_FLOAT value = line.at(z);
+		field.lines[key].swap(line);
+		return value;
 	}
 
-	// many lines (or no range download): the whole field
+	// many lines: the whole field
 	if (currents)
 		self->CurrentsToHost();
 	else
@@ -229,13 +585,10 @@ void Engine_GPU::MarkStale(StaleField& field)
 
 bool Engine_GPU::SnapshotFields(const FDTD_FLOAT* &volt, const FDTD_FLOAT* &curr)
 {
-	// not with the fields on the host (host fallback of extensions): the dumps read them there
-	if (m_FieldsOnHost)
-		return false;
 	if (m_DumpPath>=2)
 		return false;
-	// not for a sub-grid: the dumps read the base grid, which FinishBatch() of
-	// Engine_GPU_CylinderMultiGrid gave the sub-grid fields on the work stream before
+	// not for a sub-grid: the dumps read the base grid, which FinishBatch() gave the
+	// sub-grid fields on the work stream before
 	if (m_ParentBackend)
 		return false;
 	// A snapshot has a fixed cost (a separate command buffer or stream, the background thread), which
@@ -285,8 +638,7 @@ bool Engine_GPU::AddSnapshotGather(bool h_field, const Engine_GatherRegion& regi
 
 int Engine_GPU::AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count)
 {
-	// not with the fields on the host (host fallback of extensions): the dumps read them there
-	if (m_FieldsOnHost || (m_DumpPath>=1))
+	if (m_DumpPath>=1)
 		return -1;
 	const int id = m_Backend->AddFieldDFT(h_field, region, count);
 	if ((id>=0) && !m_FieldDFTUsed)
@@ -306,101 +658,97 @@ void Engine_GPU::UpdateHostMirror()
 		CurrentsToHost();
 }
 
-// with shared memory the host only writes while the device is idle (after a
-// Synchronize()), and the writes are visible to all work committed later
-void Engine_GPU::VoltagesToDevice()
-{
-	if (!m_SharedMemory)
-		m_Backend->UploadVoltages(*volt_ptr);
-}
-
-void Engine_GPU::CurrentsToDevice()
-{
-	if (!m_SharedMemory)
-		m_Backend->UploadCurrents(*curr_ptr);
-}
-
 bool Engine_GPU::IterateTS(unsigned int iterTS)
 {
-	for (unsigned int iter=0; iter<iterTS; ++iter)
+	// at the first call: a sub-grid is attached after Init() (Operator_CylinderMultiGrid::CreateEngine())
+	if (!m_BlockingPrepared)
 	{
-		VoltageHalfStep();
-		CurrentHalfStep();
-		NextTimestep();
+		PrepareBlocking();
+		m_BlockingPrepared = true;
 	}
+	TrialClock(true);
+	unsigned int done = 0;
+	while (done<iterTS)
+	{
+		// a block of k timesteps (temporal blocking), or one flat timestep
+		unsigned int k = 0;
+		if (m_Block>=0)
+		{
+			const std::vector<Engine_BlockedPlan>& plans = m_BlockCandidates[m_Block];
+			k = BlockLength(iterTS-done, plans.front().k);
+			if (k>=2)
+				RunBlock(plans[plans.front().k - k]);
+		}
+		if (k<2)
+		{
+			k = 1;
+			// an extension that needs the whole domain between the main updates (the steady-state
+			// check reads the energy of all fields) gets the two main updates
+			bool fused = m_Fused && !m_FlatSplit;
+			for (size_t n=0; n<m_GPU_exts.size() && fused; ++n)
+				fused = !m_GPU_exts[n]->NeedsFlatStep(numTS);
+			if (fused)
+				FusedStep();
+			else
+			{
+				VoltageHalfStep();
+				CurrentHalfStep();
+			}
+			NextTimestep();
+		}
+		done += k;
+		TrialProgress(k);
+	}
+	TrialClock(false);
 	FinishBatch();
 	return true;
 }
 
-// The fast path runs all extensions on the device, in the same order as the host
-// extensions (see Engine).
-// Host fallback: any hook may write either field, including the pre-update hooks
-// (the UPML swaps its flux into the fields before the main update), so both
-// fields are uploaded before and the updated one downloaded after each main update.
+// A sub-grid follows in every half step, then the coupling of the two (the order
+// of Engine_ThreadPool: the innermost coupling first).
 
 void Engine_GPU::VoltageHalfStep()
 {
-	if (!m_FieldsOnHost)
-	{
-		for (int n=m_GPU_exts.size()-1; n>=0; --n)
-			m_GPU_exts.at(n)->DoPreVoltageUpdates();
-		m_Backend->UpdateVoltages();
-		for (size_t n=0; n<m_GPU_exts.size(); ++n)
-			m_GPU_exts.at(n)->DoPostVoltageUpdates();
-		for (size_t n=0; n<m_GPU_exts.size(); ++n)
-			m_GPU_exts.at(n)->Apply2Voltages();
-		return;
-	}
+	DeviceHalfStep(false, Domain(), numTS, [this]() {m_Backend->UpdateVoltages(Domain());});
 
-	DoPreVoltageUpdates();
-	VoltagesToDevice();
-	CurrentsToDevice();
-	m_Backend->UpdateVoltages();
-	VoltagesToHost();
-	DoPostVoltageUpdates();
-	Apply2Voltages();
+	if (m_SubGrid)
+	{
+		static_cast<Engine_GPU*>(m_SubGrid)->VoltageHalfStep();
+		SyncSubGridVoltages();
+	}
 }
 
 void Engine_GPU::CurrentHalfStep()
 {
-	if (!m_FieldsOnHost)
-	{
-		for (int n=m_GPU_exts.size()-1; n>=0; --n)
-			m_GPU_exts.at(n)->DoPreCurrentUpdates();
-		m_Backend->UpdateCurrents();
-		for (size_t n=0; n<m_GPU_exts.size(); ++n)
-			m_GPU_exts.at(n)->DoPostCurrentUpdates();
-		for (size_t n=0; n<m_GPU_exts.size(); ++n)
-			m_GPU_exts.at(n)->Apply2Current();
-		return;
-	}
+	DeviceHalfStep(true, Domain(), numTS, [this]() {m_Backend->UpdateCurrents(Domain());});
 
-	DoPreCurrentUpdates();
-	VoltagesToDevice();
-	CurrentsToDevice();
-	m_Backend->UpdateCurrents();
-	CurrentsToHost();
-	DoPostCurrentUpdates();
-	Apply2Current();
+	if (m_SubGrid)
+	{
+		static_cast<Engine_GPU*>(m_SubGrid)->CurrentHalfStep();
+		SyncSubGridCurrents();
+	}
 }
 
 bool Engine_GPU::CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy) const
 {
-	// in the host fallback the host mirror holds the latest fields
-	if (m_FieldsOnHost)
-		return false;
 	return m_Backend->CalcFastEnergy(numNodes, E_energy, H_energy);
 }
 
 void Engine_GPU::NextTimestep()
 {
 	++numTS;
+	if (m_SubGrid)
+		static_cast<Engine_GPU*>(m_SubGrid)->NextTimestep();
 }
 
 void Engine_GPU::FinishBatch()
 {
-	if (m_FieldsOnHost)
-		return;   // the host mirror is up to date after every half-step
+	// the sub-grid first fills itself from its own sub-grids (see Engine_ThreadPool::IterateTS())
+	if (m_SubGrid)
+	{
+		static_cast<Engine_GPU*>(m_SubGrid)->FinishBatch();
+		InterpolateFromSubGrid();
+	}
 	if (m_SharedMemory)
 	{
 		// the host mirror is the device memory
@@ -416,6 +764,4 @@ void Engine_GPU::FinishBatch()
 		// speed of the run: the kernels run asynchronously
 		m_Backend->Synchronize();
 	}
-	for (size_t n=0; n<m_GPU_exts.size(); ++n)
-		m_GPU_exts.at(n)->Synchronize();
 }

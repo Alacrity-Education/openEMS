@@ -18,10 +18,10 @@
 """The benchmark cases: each one isolates one cost of the solver.
 
 A case is written to an openEMS XML file at a given size, which sets the cell
-count. The number of timesteps is practically unlimited: bench.py stops each
-run after a fixed time, so every engine and machine runs equally long. Changing
-a case or a size changes the results: bump `CASES_VERSION`, results of
-different versions are not compared.
+count: a name of SIZES, or a number of million cells. The number of timesteps
+is practically unlimited: bench.py stops each run after a fixed time, so every
+engine and machine runs equally long. Changing a case or a size changes the
+results: bump `CASES_VERSION`, results of different versions are not compared.
 
 All cases use a sinusoidal excitation: its energy never decays, so no run
 stops early on the end criteria (an end criteria of 0 in the XML means the
@@ -36,19 +36,50 @@ from CSXCAD import ContinuousStructure
 from CSXCAD.CSProperties import CSPropLorentzMaterial, CSPropDebyeMaterial
 from openEMS import openEMS
 
-CASES_VERSION = 2
+CASES_VERSION = 5
 
-SIZES = ('XS', 'S', 'M', 'L')
+SIZES = ('XS', 'S', 'M', 'L', 'XL')
 DEFAULT_SIZES = ('S', 'M')
 
 # stopped by bench.py long before
 NRTS = 1e9
 
-# mesh lines per direction of the Cartesian cases: ~50 k, 1 M, 8 M, 30 M cells
-LINES = {'XS': 37, 'S': 100, 'M': 200, 'L': 311}
+# mesh lines per direction of the Cartesian cases: ~50 k, 1 M, 8 M, 30 M, 100 M cells
+LINES = {'XS': 37, 'S': 100, 'M': 200, 'L': 311, 'XL': 464}
 
 # r, alpha and z cells of the cylindrical case, about the same cell counts
-CYL_CELLS = {'XS': (40, 32, 40), 'S': (125, 64, 125), 'M': (250, 128, 250), 'L': (390, 192, 390)}
+CYL_CELLS = {'XS': (40, 32, 40), 'S': (125, 64, 125), 'M': (250, 128, 250), 'L': (390, 192, 390),
+             'XL': (585, 292, 585)}
+
+MIN_MCELLS = 0.05   # a size given as a number: million cells, at least XS
+
+
+def check_size(size):
+    """ None if `size` is a name of SIZES or a number of million cells, else why not """
+    if size in SIZES:
+        return None
+    try:
+        mc = float(size)
+    except ValueError:
+        return 'not one of {} nor a number of million cells'.format(', '.join(SIZES))
+    if not mc >= MIN_MCELLS:   # also NaN
+        return 'less than {} million cells'.format(MIN_MCELLS)
+    return None
+
+
+def _lines(size):
+    """ mesh lines per direction of the Cartesian cases """
+    if size in LINES:
+        return LINES[size]
+    return int(round((float(size) * 1e6) ** (1 / 3)))
+
+
+def _cyl_cells(size):
+    """ r, alpha and z cells of the cylindrical case, half as many alpha as r and z cells """
+    if size in CYL_CELLS:
+        return CYL_CELLS[size]
+    n = int(round((2 * float(size) * 1e6) ** (1 / 3)))
+    return n, 2 * int(round(n / 4)), n
 
 unit = 1e-3     # drawing unit: mm, the uniform meshes have 1 mm cells
 f0   = 5e9      # excitation frequency, 60 mm wavelength
@@ -65,9 +96,11 @@ def _setup(bc, **kw):
 
 
 def _uniform(CSX, size):
-    """ a cube of 1 mm cells centred at the origin, returns its half width """
-    n = LINES[size]
-    lines = np.arange(n) - (n - 1) / 2
+    """ a cube of 1 mm cells around the origin, returns its half width. The lines
+        are integers, so the dipole and the probes sit on the mesh: with an even
+        number of lines the cube is half a cell off centre """
+    n = _lines(size)
+    lines = np.arange(n) - n // 2
     mesh = CSX.GetGrid()
     for d in 'xyz':
         mesh.AddLine(d, lines)
@@ -77,8 +110,8 @@ def _uniform(CSX, size):
 def _dipole(CSX):
     """ a short z-directed soft source at the origin with field probes two cells away """
     CSX.AddExcitation('dipole', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -1], [0, 0, 1])
-    CSX.AddProbe('et', p_type=2).AddPoint([2, 1, 0])
-    CSX.AddProbe('ht', p_type=3).AddPoint([-1, 2, 1])
+    CSX.AddProbe('E_probe', p_type=2).AddPoint([2, 1, 0])
+    CSX.AddProbe('H_probe', p_type=3).AddPoint([-1, 2, 1])
 
 
 def _vacuum(size, bc):
@@ -115,7 +148,7 @@ def inhomogeneous(size):
     """ graded mesh, dielectric, lossy and metal objects, a microstrip line between two
         lumped ports, PML: many distinct coefficients and the usual extensions """
     FDTD, CSX = _setup(['PML_8'] * 6)
-    lines = _graded(LINES[size])
+    lines = _graded(_lines(size))
     mesh = CSX.GetGrid()
     for d in 'xyz':
         mesh.AddLine(d, lines)
@@ -138,13 +171,16 @@ def inhomogeneous(size):
     CSX.AddMaterial('lossy', epsilon=6, kappa=0.5).AddBox([0.2*E, -0.6*E, 0.2*E], [0.6*E, -0.2*E, 0.6*E])
     metal.AddBox([-0.7*E, -0.2*E, -0.5*E], [-0.6*E, 0.2*E, -0.2*E], priority=10)
 
-    CSX.AddProbe('et', p_type=2).AddPoint([0, 0, -h/2])
+    CSX.AddProbe('E_probe', p_type=2).AddPoint([0, 0, -h/2])
     return FDTD
 
 
 def dispersive(size):
-    """ uniform mesh, a Lorentz and a Debye block, Mur ABC: the dispersive material extensions """
-    FDTD, CSX = _setup(['MUR'] * 6)
+    """ uniform mesh, a Lorentz and a Debye block, PEC: the dispersive material extensions.
+        PEC, not Mur: the fringe fields of the blocks made Mur's ABC grow, at every distance
+        tried (6 cells at XS, 15 at M) within the timesteps a run makes; the losses of both
+        materials keep the field in the closed box bounded """
+    FDTD, CSX = _setup(['PEC'] * 6)
     E = _uniform(CSX, size)
 
     lorentz = CSPropLorentzMaterial(CSX.GetParameterSet(), order=1)
@@ -163,11 +199,43 @@ def dispersive(size):
     return FDTD
 
 
+def antenna(size):
+    """ graded mesh, a patch on a substrate fed by a lumped port, a lossy Debye block above
+        it (tissue), PML; with the dumps of a typical antenna model: an NF2FF box in the
+        frequency domain and a time-domain E-field plane """
+    FDTD, CSX = _setup(['PML_8'] * 6)
+    lines = _graded(_lines(size))
+    mesh = CSX.GetGrid()
+    for d in 'xyz':
+        mesh.AddLine(d, lines)
+    E = lines[-1]
+
+    h = 1.5
+    feed = lines[np.argmin(np.abs(lines + 0.15*E))]   # on a mesh line, like the ports of inhomogeneous
+    CSX.AddMaterial('substrate', epsilon=3.66).AddBox([-0.5*E, -0.5*E, -h], [0.5*E, 0.5*E, 0])
+    metal = CSX.AddMetal('metal')
+    metal.AddBox([-0.5*E, -0.5*E, -h], [0.5*E, 0.5*E, -h], priority=10)
+    metal.AddBox([-0.3*E, -0.3*E, 0], [0.3*E, 0.3*E, 0], priority=10)
+    FDTD.AddLumpedPort(1, 50, [feed, -1, -h], [feed, 1, 0], 'z', excite=1, priority=5)
+
+    tissue = CSPropDebyeMaterial(CSX.GetParameterSet(), order=1, epsilon=40, kappa=0.7)
+    tissue.SetName('tissue')
+    tissue.SetDispersiveMaterialProperty(0, eps_delta=10, eps_relax=1/(2*np.pi*4e9))
+    CSX.AddProperty(tissue)
+    tissue.AddBox([-0.4*E, -0.4*E, 0.3*E], [0.4*E, 0.4*E, 0.5*E], priority=10)
+
+    FDTD.CreateNF2FFBox(frequency=[f0])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-E, 0, -E], [E, 0, E])
+    return FDTD
+
+
 def cylindrical(size):
-    """ closed cylindrical mesh including r=0, a dielectric ring, PEC/Mur: the cylinder
-        operator and extension """
+    """ closed cylindrical mesh including r=0, a dielectric tube, PEC/Mur: the cylinder
+        operator and extension. The tube runs through both Mur ends: a first-order Mur
+        ABC loads an evanescent TM field with a negative resistance, and the ends of a
+        shorter tube reflect that field back to it, so the fields grew exponentially """
     FDTD, CSX = _setup(['PEC', 'PEC', 'PEC', 'PEC', 'MUR', 'MUR'], CoordSystem=1)
-    nr, na, nz = CYL_CELLS[size]
+    nr, na, nz = _cyl_cells(size)
     mesh = CSX.GetGrid()
     mesh.AddLine('r', np.arange(nr))
     mesh.AddLine('a', np.linspace(-np.pi, np.pi, na + 1))
@@ -175,10 +243,10 @@ def cylindrical(size):
     R = nr - 1
     Z = (nz - 1) / 2
 
-    CSX.AddMaterial('ring', epsilon=4).AddBox([0.4*R, -np.pi, -0.6*Z], [0.6*R, np.pi, 0.6*Z])
+    CSX.AddMaterial('tube', epsilon=4).AddBox([0.4*R, -np.pi, -Z], [0.6*R, np.pi, Z])
     CSX.AddExcitation('line', exc_type=0, exc_val=[0, 0, 1]).AddBox([3, 0, -1], [3, 0, 1])
-    CSX.AddProbe('et', p_type=2).AddPoint([5, 0.2, 0])
-    CSX.AddProbe('ht', p_type=3).AddPoint([2, -0.3, 1])
+    CSX.AddProbe('E_probe', p_type=2).AddPoint([5, 0.2, 0])
+    CSX.AddProbe('H_probe', p_type=3).AddPoint([2, -0.3, 1])
     return FDTD
 
 
@@ -187,11 +255,9 @@ CASES = {
     'pml':           pml,
     'inhomogeneous': inhomogeneous,
     'dispersive':    dispersive,
+    'antenna':       antenna,
     'cylindrical':   cylindrical,
 }
-
-# the engine choice of the CPU engines has no effect on a cylindrical mesh
-CARTESIAN_ONLY_ENGINES = ('basic', 'sse', 'sse-compressed')
 
 
 def write_case(name, size, xml_file):

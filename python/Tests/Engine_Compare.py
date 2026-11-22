@@ -1,0 +1,901 @@
+# -*- coding: utf-8 -*-
+"""
+ Engine comparison test — every engine against the basic engine
+
+ Each case is a small model run with several engines; all probe files and all
+ HDF5 field dumps are compared with those of engine='basic':
+
+   engine='gpu-reference'  the GPU engine's host backend: the kernels of the
+                           device backends on the CPU, on its own copy of the
+                           fields and of the cell model; compared with the CPU
+                           engine on the same model (cpu-ref below)
+   engine='gpu'            a device backend (Metal on macOS, HIP, SYCL), if a GPU is
+                           there: its float arithmetic may round differently
+                           (e.g. fused multiply-add), so within a tolerance
+   engine='cpu'            cell runs and factorised coefficients, the UPML and
+                           the dispersive materials fused into its update:
+                           within the tolerance, once on its flat sweep and
+                           once with temporal blocking forced, which must be
+                           bit-identical to the flat sweep
+   engine='multithreaded'  (cylindrical and multi-grid cases) bit-identical
+
+ Together the cases use the excitation, UPML, Mur ABC, Lorentz and Debye
+ material (fused into the update, and on a cylindrical mesh extensions of
+ their own), lumped RLC, conducting sheet, TF/SF, local absorber,
+ steady-state and cylinder extensions, and cylindrical meshes with one and
+ two multi-grid levels. Run on its own (python3 Engine_Compare.py) or by run_testsuite.py;
+ without a GPU the device backend is skipped.
+
+ Pass criteria, per case
+
+   every engine
+     created as requested (not a silent fallback)
+
+   gpu-reference, against cpu-ref (the CPU engine with the flat sweep, its
+   generic kernels and the fast axis z: OPENEMS_CPU_TBLOCK=0,
+   OPENEMS_CPU_ISA=generic, OPENEMS_CPU_FAST_AXIS=z)
+     within 1e-5 of the peak value, probes and field dumps (the reference
+     backend computes the coefficients in float per node, as a device)
+
+   gpu-reference-blocked, gpu-blocked: temporal blocking forced
+   (OPENEMS_GPU_TBLOCK=2:5, tiles of 5 x 5 lines, the flat runs with 0):
+   bit-identical to the flat sweep; blocked across tile borders in at least
+   one case, absorbers among them, and in one at least along both axes it
+   tiles (not with a multi-grid or an extension without box hooks on the
+   device)
+     absorber_x: a local absorber normal to x next to a tile border, which
+       the GPU engine does not block (its tiles split x)
+
+   gpu (skipped without a GPU device)
+     max. deviation < 1e-4 of the peak value, per probe file and per field dump
+     on the cell model: within 1e-5 of gpu-reference, probes and field dumps;
+       bit-identical (BITIDENT_BACKENDS), but for the frequency domain dumps
+       summed on the device
+     dumps_snapshot, multigrid_snapshot, dumps_snapshot_host_dft: the dumps
+       read field snapshots (SNAPSHOT_BACKENDS); dumps_snapshot_host_dft
+       sums the frequency domain dumps from them on the host
+       (OPENEMS_GPU_DUMPS=snapshot)
+     dumps, sar: the FD dumps (the E field of the SAR) accumulated on the
+       device (DEVICE_DFT_BACKENDS)
+     the fused step (FUSED_BACKENDS: the main updates in one pass into second
+       field buffers, the currents next to what the extensions write between
+       them after those): in every case without a multi-grid (the bit-identity
+       of the blocked runs above then compares it with the separate updates),
+       and tried against the two updates for a tiny time each at the start
+       (OPENEMS_GPU_TRIAL), so it switches to them; steady_state needs the
+       separate updates at its checks
+
+   cpu
+     max. deviation < 1e-4 of the peak value, like a device backend
+     blocking forced (OPENEMS_CPU_TBLOCK=2:5,3:7: tiles of 5 lines and 2
+       timesteps per block, of 7 lines and 3) and switched between those and
+       the flat sweep on every call at the start (OPENEMS_CPU_TRIAL):
+       bit-identical to the flat sweep
+     blocked in at least one case (the multi-grid cases run the flat sweep),
+       in one at least across tile borders along both axes it tiles
+
+   multithreaded (cylindrical and multi-grid cases)
+     bit-identical to basic
+
+ With the environment variable OPENEMS_ENGINE set (run_testsuite.py
+ --engine=<e>), only that engine is compared with basic: cpu (flat and
+ blocked), gpu or gpu-reference (both GPU backends), multithreaded (then in
+ every case); with basic there is nothing to compare.
+
+ Tested with
+  - python 3.13
+  - openEMS v0.37+
+
+ (c) 2026 Sean Mollet <sean@malmoset.com>
+
+"""
+
+import os, re, sys, glob, tempfile, ctypes, ctypes.util
+import numpy as np
+import h5py
+
+from CSXCAD  import ContinuousStructure
+from CSXCAD.CSProperties import CSPropLorentzMaterial, CSPropDebyeMaterial
+from CSXCAD.CSProperties import ABCtype
+from openEMS.physical_constants import C0
+from openEMS import openEMS
+from openEMS.compare import compare_sim_results, deviation
+from openEMS.ports import LumpedPort
+
+unit = 1e-3   # drawing unit: mm
+
+
+def channel_1d(FDTD, CSX, sinus=False):
+    """ TEM channel (PEC walls normal to x, PMC walls normal to y, PML at the z-ends) """
+    if sinus:
+        FDTD.SetSinusExcite(3e9)
+    else:
+        FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PEC', 'PEC', 'PMC', 'PMC', 'PML_8', 'PML_8'])
+    mesh = CSX.GetGrid()
+    mesh.AddLine('x', [0, 0.5, 1])
+    mesh.AddLine('y', [0, 0.5, 1])
+    mesh.AddLine('z', np.arange(0, 100.5, 0.5))
+    CSX.AddExcitation('plane', exc_type=0, exc_val=[1, 0, 0]).AddBox([0, 0, 20], [1, 1, 20])
+    CSX.AddProbe('et', p_type=2).AddPoint([0.5, 0.5, 70])
+    # the H probe reads the dual node: y=0.75 gives Hy on the line y=0.5, which carries the
+    # wave; on the walls (y=0, 1) openEMS zeroes it, also at a PMC wall
+    CSX.AddProbe('ht', p_type=3).AddPoint([0.5, 0.75, 70])
+
+
+def case_dispersive_pml():
+    FDTD = openEMS(NrTS=5000, EndCriteria=1e-5)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    CSX.GetGrid().SetDeltaUnit(unit)
+    channel_1d(FDTD, CSX)
+    drude = CSPropLorentzMaterial(CSX.GetParameterSet(), order=1)
+    drude.SetName('drude')
+    drude.SetDispersiveMaterialProperty(0, eps_plasma=5e9, eps_relax=1e-9)
+    CSX.AddProperty(drude)
+    drude.AddBox([0, 0, 40], [1, 1, 50], priority=10)
+    return FDTD, CSX
+
+
+def case_3d_mixed():
+    FDTD = openEMS(NrTS=800, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['MUR'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-10, 10.5, 1))
+
+    # lumped port and series RLC element connected by two wires
+    LumpedPort(CSX, 1, 50, [-4, 0, 0], [-4, 0, 2], 'z', excite=1)
+    rlc = CSX.AddLumpedElement('rlc', ny='z', caps=False, R=10, L=1e-9, C=1e-12, LEtype=1)
+    rlc.AddBox([4, 0, 0], [4, 0, 2], priority=10)
+    wire = CSX.AddMetal('wire')
+    wire.AddCurve([[-4, 4], [0, 0], [0, 0]])
+    wire.AddCurve([[-4, 4], [0, 0], [2, 2]])
+
+    # conducting sheet patch
+    sheet = CSX.AddConductingSheet('sheet', conductivity=5.8e7, thickness=1e-6)
+    sheet.AddBox([-3, -3, 5], [3, 3, 5], priority=10)
+
+    # TF/SF plane wave
+    pw = CSX.AddExcitation('plane_wave', exc_type=10, exc_val=[0, 0, 1])
+    pw.SetPropagationDir([1, 0, 0])
+    pw.SetFrequency(5e9)
+    pw.AddBox([-6, -6, -6], [6, 6, 6])
+
+    CSX.AddProbe('et', p_type=2).AddPoint([0, 5, 0])
+    CSX.AddProbe('ht', p_type=3).AddPoint([0, 5, 0])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-10, -10, 0], [10, 10, 0])
+    CSX.AddDump('Hf', dump_type=11, file_type=1, frequency=[5e9]).AddBox([-10, 0, -10], [10, 0, 10])
+    return FDTD, CSX
+
+
+def case_dumps():
+    """ E and H dumps in all interpolation modes, time and frequency domain, on a non-uniform mesh """
+    FDTD = openEMS(NrTS=300, EndCriteria=0)
+    FDTD.SetGaussExcite(5e9, 4e9)
+    FDTD.SetBoundaryCond(['PML_8', 'PML_8', 'PEC', 'PMC', 'MUR', 'PML_8'])
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('x', np.concatenate([np.linspace(-30, -5, 12), np.linspace(-4, 4, 17), np.linspace(5, 30, 9)]))
+    mesh.AddLine('y', np.linspace(-25, 25, 31)**3/625.0 + np.linspace(-25, 25, 31)*0.5)
+    mesh.AddLine('z', np.linspace(-20, 20, 27))
+    CSX.AddMaterial('diel', epsilon=4, kappa=0.01).AddBox([-10, -8, -5], [6, 9, 7])
+    CSX.AddMetal('pec').AddBox([8, -5, -3], [9, 5, 3])
+    CSX.AddExcitation('d', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -2], [0, 0, 2])
+    CSX.AddProbe('et', p_type=2).AddPoint([5, 5, 5])
+    for mode in (0, 1, 2):
+        for t in (0, 1):
+            CSX.AddDump(f'td_{t}_{mode}', dump_type=t, dump_mode=mode, file_type=1).AddBox([-30, -25, -20], [30, 25, 20])
+            CSX.AddDump(f'fd_{t}_{mode}', dump_type=10+t, dump_mode=mode, file_type=1, frequency=[3e9, 6e9]).AddBox([-12, -25, -20], [12, 25, 20])
+    return FDTD, CSX
+
+
+def case_dumps_snapshot():
+    """ NF2FF box (TD dumps of E and H) and FD dumps on a grid large enough for field snapshots (>= 512k nodes) """
+    FDTD = openEMS(NrTS=400, EndCriteria=0)
+    FDTD.SetGaussExcite(5e9, 4e9)
+    FDTD.SetBoundaryCond(['PML_8']*6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('x', np.linspace(-50, 50, 101))   # with a line at 0 for the excitation
+    mesh.AddLine('y', np.linspace(-40, 40, 81))
+    mesh.AddLine('z', np.linspace(-36, 36, 73))
+    CSX.AddMaterial('diel', epsilon=4, kappa=0.01).AddBox([-10, -8, -5], [6, 9, 7])
+    CSX.AddExcitation('d', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -2], [0, 0, 2])
+    CSX.AddProbe('et', p_type=2).AddPoint([5, 5, 5])
+    FDTD.CreateNF2FFBox()
+    CSX.AddDump('td_cell', dump_type=0, dump_mode=2, file_type=1).AddBox([-20, -20, -10], [20, 20, 10])
+    for t in (0, 1):
+        CSX.AddDump(f'fd_{t}', dump_type=10+t, dump_mode=1, file_type=1, frequency=[3e9, 6e9]).AddBox([-30, -30, -5], [30, 30, 5])
+    return FDTD, CSX
+
+
+def case_sar():
+    """ local SAR of a lossy block: the E field summed like a frequency domain E dump (on the device) """
+    FDTD = openEMS(NrTS=400, EndCriteria=0)
+    FDTD.SetGaussExcite(2e9, 1.5e9)
+    FDTD.SetBoundaryCond(['PML_8'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-20, 20.5, 1))
+    CSX.AddMaterial('tissue', epsilon=40, kappa=0.8, density=1000).AddBox([-8, -8, -8], [8, 8, 8])
+    CSX.AddExcitation('dipole', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -12], [0, 0, -10])
+    CSX.AddProbe('et', p_type=2).AddPoint([3, 2, 0])
+    CSX.AddDump('SAR', dump_type=20, file_type=1, frequency=[1.5e9, 2.5e9]).AddBox([-20, -20, -20], [20, 20, 20])
+    return FDTD, CSX
+
+
+def case_excitation():
+    """ PEC cavity: only the excitation extension, with overlapping sources """
+    FDTD = openEMS(NrTS=600, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-10, 10.5, 1))
+    CSX.AddExcitation('e_soft', exc_type=0, exc_val=[1, 0, 0]).AddBox([0, -2, 2], [4, 2, 2])
+    CSX.AddExcitation('e_soft2', exc_type=0, exc_val=[0.5, 0, 0], delay=0.1e-9).AddBox([2, 0, 2], [6, 0, 2])  # shares edges
+    CSX.AddExcitation('h_soft', exc_type=2, exc_val=[0, 0, 1]).AddBox([2, 2, -4], [4, 4, -2])
+    CSX.AddProbe('et', p_type=2).AddPoint([5, 5, 5])
+    CSX.AddProbe('ht', p_type=3).AddPoint([-5, 5, -5])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-10, -10, 0], [10, 10, 0])
+    return FDTD, CSX
+
+
+def case_pml():
+    """ free space with PML on all sides: excitation and UPML extensions """
+    FDTD = openEMS(NrTS=700, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PML_8'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-15, 15.5, 1))
+    CSX.AddExcitation('dipole', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -1], [0, 0, 1])
+    CSX.AddProbe('et', p_type=2).AddPoint([4, 3, 2])
+    CSX.AddProbe('ht', p_type=3).AddPoint([-3, 5, 0])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-15, -15, 0], [15, 15, 0])
+    return FDTD, CSX
+
+
+def case_mur():
+    """ free space with Mur ABC on all sides and a source on a boundary plane: excitation and Mur extensions """
+    FDTD = openEMS(NrTS=700, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['MUR'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-10, 10.5, 1))
+    CSX.AddExcitation('dipole', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -1], [0, 0, 1])
+    # a source on the x-max plane delays that Mur ABC until the excitation is done
+    CSX.AddExcitation('wall', exc_type=0, exc_val=[0, 1, 0]).AddBox([10, -2, 0], [10, 2, 0])
+    CSX.AddProbe('et', p_type=2).AddPoint([4, 3, 2])
+    CSX.AddProbe('ht', p_type=3).AddPoint([-3, 5, 0])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-10, -10, 0], [10, 10, 0])
+    return FDTD, CSX
+
+
+def case_materials():
+    """ Drude, Lorentz and two Debye materials (two poles, one lossy pole), a magnetic Drude material and a conducting sheet in a PML channel """
+    FDTD = openEMS(NrTS=3000, EndCriteria=0)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    CSX.GetGrid().SetDeltaUnit(unit)
+    channel_1d(FDTD, CSX)
+    def lorentz(name, z0, z1, **kw):
+        m = CSPropLorentzMaterial(CSX.GetParameterSet(), order=1)
+        m.SetName(name)
+        m.SetDispersiveMaterialProperty(0, **kw)
+        CSX.AddProperty(m)
+        m.AddBox([0, 0, z0], [1, 1, z1], priority=10)
+    lorentz('drude', 25, 30, eps_plasma=5e9, eps_relax=1e-9)
+    lorentz('lorentz', 32, 37, eps_plasma=4e9, eps_pole_freq=3e9, eps_relax=1e-9)
+    lorentz('double_drude', 39, 44, eps_plasma=5e9, eps_relax=1e-8, mue_plasma=5e9, mue_relax=1e-8)
+    debye = CSPropDebyeMaterial(CSX.GetParameterSet(), order=2, epsilon=4)
+    debye.SetName('debye')
+    debye.SetDispersiveMaterialProperty(0, eps_delta=1, eps_relax=4e-11)
+    debye.SetDispersiveMaterialProperty(1, eps_delta=0.5, eps_relax=1e-10)
+    CSX.AddProperty(debye)
+    debye.AddBox([0, 0, 46], [1, 1, 51], priority=10)
+    # a lossy single-pole Debye next to the two-pole one: the device keeps two poles for all of
+    # their cells, those of this one padded
+    debye1 = CSPropDebyeMaterial(CSX.GetParameterSet(), order=1, epsilon=3, kappa=0.05)
+    debye1.SetName('debye1')
+    debye1.SetDispersiveMaterialProperty(0, eps_delta=2, eps_relax=6e-11)
+    CSX.AddProperty(debye1)
+    debye1.AddBox([0, 0, 58], [1, 1, 63], priority=10)
+    CSX.AddConductingSheet('sheet', conductivity=1e5, thickness=10e-6).AddBox([0, 0, 55], [1, 1, 55], priority=10)
+    return FDTD, CSX
+
+
+def case_lumped(bc='MUR', size=10):
+    """ lumped port with series and parallel RLC elements in a Mur box: excitation, lumped RLC and Mur extensions """
+    FDTD = openEMS(NrTS=1500, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond([bc] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-size, size + 0.5, 1))
+    LumpedPort(CSX, 1, 50, [-4, 0, 0], [-4, 0, 2], 'z', excite=1)
+    ser = CSX.AddLumpedElement('ser_rlc', ny='z', caps=False, R=10, L=1e-9, C=1e-12, LEtype=1)
+    ser.AddBox([0, 0, 0], [0, 0, 2], priority=10)
+    par = CSX.AddLumpedElement('par_rlc', ny='z', caps=False, R=200, L=2e-9, C=0.5e-12, LEtype=0)
+    par.AddBox([4, 0, 0], [4, 0, 2], priority=10)
+    wire = CSX.AddMetal('wire')
+    wire.AddCurve([[-4, 4], [0, 0], [0, 0]])
+    wire.AddCurve([[-4, 4], [0, 0], [2, 2]])
+    CSX.AddProbe('et', p_type=2).AddPoint([0, 5, 0])
+    return FDTD, CSX
+
+
+def case_lumped_pml():
+    """ the lumped RLC elements with PML: the voltages they change in the fused device step """
+    return case_lumped('PML_8', 20)
+
+
+def case_tfsf():
+    """ oblique plane wave on a PEC sphere in a PML box: excitation, TF/SF and UPML extensions """
+    FDTD = openEMS(NrTS=700, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PML_8'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax in 'xyz':
+        mesh.AddLine(ax, np.arange(-15, 15.5, 1))
+    k_dir = np.array([1, 2, 3]) / np.sqrt(14)
+    pw = CSX.AddExcitation('plane_wave', exc_type=10, exc_val=[2, -1, 0])
+    pw.SetPropagationDir(k_dir)
+    pw.SetFrequency(5e9)
+    pw.AddBox([-6, -6, -6], [6, 6, 6])
+    CSX.AddMetal('sphere').AddSphere(priority=10, center=[0, 0, 0], radius=3)
+    CSX.AddProbe('et_in', p_type=2).AddPoint([4, -3, 2])
+    CSX.AddProbe('et_out', p_type=2).AddPoint([-10, 1, 3])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-15, -15, 0], [15, 15, 0])
+    return FDTD, CSX
+
+
+def case_absorbers():
+    """ PEC-terminated channel with local absorbing sheets (Mur and Mur with super-absorption) """
+    FDTD = openEMS(NrTS=3000, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PEC', 'PEC', 'PMC', 'PMC', 'PEC', 'PEC'])
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    # 21 lines along x: the GPU engine's tiles (blocked runs, 5 lines) cut the sheets
+    mesh.AddLine('x', np.arange(0, 10.5, 0.5))
+    mesh.AddLine('y', [0, 0.5, 1])
+    mesh.AddLine('z', np.arange(0, 100.5, 0.5))
+    CSX.AddExcitation('plane', exc_type=0, exc_val=[1, 0, 0]).AddBox([0, 0, 40], [10, 1, 40])
+    CSX.AddAbsorbingBC('abs_low', NormalSignPositive=False, AbsorbingBoundaryType=ABCtype.MUR_1ST,
+                       PhaseVelocity=C0).AddBox([0, 0, 5], [10, 1, 5], priority=6)
+    CSX.AddAbsorbingBC('abs_high', NormalSignPositive=True, AbsorbingBoundaryType=ABCtype.MUR_1ST_SA,
+                       PhaseVelocity=C0).AddBox([0, 0, 95], [10, 1, 95], priority=6)
+    CSX.AddProbe('et', p_type=2).AddPoint([0.5, 0.5, 70])
+    CSX.AddProbe('ht', p_type=3).AddPoint([0.5, 0.75, 20])   # Hy on the line y=0.5, see channel_1d()
+    return FDTD, CSX
+
+
+def case_absorber_x():
+    """ channel along x with a local absorber normal to x, its sheet (line 124) and the line next to it
+        (125) on either side of a tile border of the blocked GPU runs: the GPU engine must not block """
+    FDTD = openEMS(NrTS=2000, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PEC', 'PEC', 'PMC', 'PMC', 'PEC', 'PEC'])
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('x', np.arange(0, 100.5, 0.5))
+    mesh.AddLine('y', [0, 0.5, 1])
+    mesh.AddLine('z', [0, 0.5, 1])
+    CSX.AddExcitation('plane', exc_type=0, exc_val=[0, 0, 1]).AddBox([40, 0, 0], [40, 1, 1])
+    CSX.AddAbsorbingBC('abs', NormalSignPositive=True, AbsorbingBoundaryType=ABCtype.MUR_1ST_SA,
+                       PhaseVelocity=C0).AddBox([62, 0, 0], [62, 1, 1], priority=6)
+    CSX.AddProbe('et', p_type=2).AddPoint([55, 0.5, 0.5])   # between the source and the sheet: what it reflects
+    CSX.AddProbe('ht', p_type=3).AddPoint([20, 0.75, 0.5])
+    return FDTD, CSX
+
+
+def cylinder_mesh(FDTD, alpha, r0, r1, z_pad=0):
+    """ cylindrical mesh;
+        z_pad extends z beyond 0..30 on both sides, e.g. to make room for a PML """
+    CSX = ContinuousStructure(CoordSystem=1)
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('r', np.arange(r0, r1 + 1, 2))
+    mesh.AddLine('a', alpha)
+    mesh.AddLine('z', np.arange(-z_pad, 30 + z_pad + 0.5, 2))
+    return CSX
+
+
+def case_cylinder_closed():
+    """ closed cylindrical mesh including r=0: excitation and cylinder extensions """
+    FDTD = openEMS(CoordSystem=1, NrTS=1500, EndCriteria=0)
+    FDTD.SetGaussExcite(3e9, 2e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = cylinder_mesh(FDTD, (np.arange(25) - 12) * 2*np.pi/24, 0, 40)
+    CSX.AddExcitation('line', exc_type=0, exc_val=[0, 0, 1]).AddBox([14, 0, 0], [14, 0, 30])
+    CSX.AddExcitation('radial', exc_type=0, exc_val=[1, 0, 0]).AddBox([6, np.pi/2, 10], [10, np.pi/2, 10])
+    CSX.AddProbe('et_axis', p_type=2).AddPoint([0, 0, 16])
+    CSX.AddProbe('et', p_type=2).AddPoint([20, np.pi/4, 14])
+    CSX.AddProbe('ht', p_type=3).AddPoint([10, -np.pi/3, 8])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([0, -np.pi, 14], [40, np.pi, 14])
+    # large enough to be evaluated by several threads, which read the fields of the engine concurrently.
+    # Node interpolated: the nodes on the alpha seam are evaluated from the other side of it
+    CSX.AddDump('Et_vol', dump_type=0, dump_mode=1, file_type=1).AddBox([0, -np.pi, 0], [40, np.pi, 30])
+    CSX.AddDump('Ht_cell', dump_type=1, dump_mode=2, file_type=1).AddBox([0, -np.pi, 0], [40, np.pi, 30])
+    # B has to be mue0*H on the seam too, see the check of this case below
+    CSX.AddDump('Ht_node', dump_type=1, dump_mode=1, file_type=1).AddBox([0, -np.pi, 0], [40, np.pi, 30])
+    CSX.AddDump('Bt_node', dump_type=5, dump_mode=1, file_type=1).AddBox([0, -np.pi, 0], [40, np.pi, 30])
+    return FDTD, CSX
+
+
+def case_cylinder_wedge():
+    """ open alpha wedge with r>0 and PML in z: excitation, UPML and (inactive) cylinder extensions.
+        No field dump, and stopped by the end criteria: its energy estimate has to see
+        the fields on the device, a run that stops at another timestep fails the comparison """
+    FDTD = openEMS(CoordSystem=1, NrTS=20000, EndCriteria=1e-3)
+    FDTD.SetGaussExcite(3e9, 2e9)
+    FDTD.SetBoundaryCond(['PEC', 'PEC', 'PEC', 'PEC', 'PML_8', 'PML_8'])
+    CSX = cylinder_mesh(FDTD, np.linspace(-np.pi/4, np.pi/4, 13), 10, 40, z_pad=16)
+    CSX.AddExcitation('coax', exc_type=0, exc_val=[1, 0, 0]).AddBox([10, -np.pi/4, 12], [40, np.pi/4, 12])
+    CSX.AddProbe('et', p_type=2).AddPoint([20, 0, 20])
+    CSX.AddProbe('ht', p_type=3).AddPoint([30, np.pi/8, 6])
+    return FDTD, CSX
+
+
+def case_cylinder_dispersive():
+    """ Drude (electric and magnetic), Lorentz and two-pole Debye materials on a closed cylindrical mesh, where
+        the cell model does not fuse them (the cylinder extension): the dispersive extensions of their own, two
+        orders of one of them """
+    FDTD = openEMS(CoordSystem=1, NrTS=1500, EndCriteria=0)
+    FDTD.SetGaussExcite(3e9, 2e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = cylinder_mesh(FDTD, (np.arange(25) - 12) * 2*np.pi/24, 0, 40)
+    CSX.AddExcitation('line', exc_type=0, exc_val=[0, 0, 1]).AddBox([14, 0, 0], [14, 0, 30])
+    CSX.AddExcitation('radial', exc_type=0, exc_val=[1, 0, 0]).AddBox([6, np.pi/2, 10], [10, np.pi/2, 10])
+    lorentz = CSPropLorentzMaterial(CSX.GetParameterSet(), order=2)
+    lorentz.SetName('lorentz')
+    lorentz.SetDispersiveMaterialProperty(0, eps_plasma=5e9, eps_relax=1e-9, mue_plasma=5e9, mue_relax=1e-8)
+    lorentz.SetDispersiveMaterialProperty(1, eps_plasma=4e9, eps_pole_freq=3e9, eps_relax=1e-9)
+    CSX.AddProperty(lorentz)
+    lorentz.AddBox([20, -np.pi/8, 14], [30, np.pi/8, 22], priority=10)
+    debye = CSPropDebyeMaterial(CSX.GetParameterSet(), order=2, epsilon=4)
+    debye.SetName('debye')
+    debye.SetDispersiveMaterialProperty(0, eps_delta=1, eps_relax=4e-11)
+    debye.SetDispersiveMaterialProperty(1, eps_delta=0.5, eps_relax=1e-10)
+    CSX.AddProperty(debye)
+    debye.AddBox([12, -np.pi/4, 20], [18, np.pi/4, 28], priority=10)
+    CSX.AddProbe('et', p_type=2).AddPoint([24, 0, 18])
+    CSX.AddProbe('et_debye', p_type=2).AddPoint([16, 0, 24])
+    CSX.AddProbe('ht', p_type=3).AddPoint([30, np.pi/8, 12])
+    return FDTD, CSX
+
+
+def multigrid(radii, alpha, r1=40, z_bc='PEC'):
+    """ cylindrical multi-grid with sources and probes inside and outside the sub-grids """
+    FDTD = openEMS(CoordSystem=1, NrTS=1200, EndCriteria=0, MultiGrid=radii)
+    FDTD.SetGaussExcite(3e9, 2e9)
+    FDTD.SetBoundaryCond(['PEC', 'PEC', 'PEC', 'PEC', z_bc, z_bc])
+    CSX = cylinder_mesh(FDTD, alpha, 0, r1, z_pad=16 if z_bc.startswith('PML') else 0)
+    CSX.AddExcitation('inner', exc_type=0, exc_val=[0, 0, 1]).AddBox([4, 0, 0], [4, 0, 30])
+    CSX.AddExcitation('outer', exc_type=0, exc_val=[1, 0, 0]).AddBox([26, alpha[3], 12], [32, alpha[3], 12])
+    CSX.AddProbe('et_axis', p_type=2).AddPoint([0, 0, 16])
+    CSX.AddProbe('et_inner', p_type=2).AddPoint([6, alpha[len(alpha)//3], 14])
+    CSX.AddProbe('ht_inner', p_type=3).AddPoint([8, alpha[len(alpha)//4], 8])
+    CSX.AddProbe('et_outer', p_type=2).AddPoint([30, alpha[2*len(alpha)//3], 14])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([0, alpha[0], 14], [r1, alpha[-1], 14])
+    return FDTD, CSX
+
+
+def case_multigrid():
+    """ closed cylindrical mesh with one multi-grid level """
+    return multigrid([14], (np.arange(49) - 24) * 2*np.pi/48)
+
+
+def case_multigrid2():
+    """ closed cylindrical mesh with two nested multi-grid levels """
+    return multigrid([10, 20], (np.arange(49) - 24) * 2*np.pi/48)
+
+
+def case_multigrid_wedge():
+    """ open alpha wedge with one multi-grid level and PML in z """
+    return multigrid([14], np.linspace(-np.pi/2, np.pi/2, 25), z_bc='PML_8')
+
+
+def case_multigrid_snapshot():
+    """ one multi-grid level on a grid large enough for field snapshots (>= 512k nodes):
+        the dumps read the base grid after the sub-grid fields were interpolated into it """
+    FDTD = openEMS(CoordSystem=1, NrTS=300, EndCriteria=0, MultiGrid=[20])
+    FDTD.SetGaussExcite(3e9, 2e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = ContinuousStructure(CoordSystem=1)
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    mesh.AddLine('r', np.arange(0, 60.5, 1))
+    mesh.AddLine('a', (np.arange(129) - 64) * 2*np.pi/128)
+    mesh.AddLine('z', np.arange(0, 40.25, 0.5))
+    CSX.AddExcitation('inner', exc_type=0, exc_val=[0, 0, 1]).AddBox([6, 0, 10], [6, 0, 30])
+    CSX.AddExcitation('outer', exc_type=0, exc_val=[1, 0, 0]).AddBox([30, np.pi/2, 20], [36, np.pi/2, 20])
+    CSX.AddProbe('et', p_type=2).AddPoint([10, np.pi/4, 18])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([0, -np.pi, 20], [60, np.pi, 20])
+    CSX.AddDump('Ht', dump_type=1, dump_mode=2, file_type=1).AddBox([0, 0, 0], [60, 0, 40])
+    return FDTD, CSX
+
+
+def case_steady_state():
+    FDTD = openEMS(NrTS=100000, EndCriteria=1e-6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    CSX.GetGrid().SetDeltaUnit(unit)
+    channel_1d(FDTD, CSX, sinus=True)
+    return FDTD, CSX
+
+
+def graded(n):
+    """ n mesh lines with all spacings different """
+    return np.cumsum(1.002**np.arange(n)) * 0.5
+
+
+def case_graded_mesh():
+    """ dipole in a PML box on a mesh graded in all directions: the mesh factors differ on every line """
+    lines = [graded(70), graded(70), graded(70)]
+    FDTD = openEMS(NrTS=150, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PML_8'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax, l in zip('xyz', lines):
+        mesh.AddLine(ax, l - l[len(l)//2])
+    CSX.AddExcitation('dipole', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 0, -1], [0, 0, 1])
+    CSX.AddProbe('et', p_type=2).AddPoint([4, 3, 2])
+    CSX.AddProbe('ht', p_type=3).AddPoint([-3, 5, 0])
+    return FDTD, CSX
+
+
+def case_pml_graded():
+    """ PML around a graded permittivity: the UPML coefficients change from cell to cell """
+    FDTD, CSX = case_pml()
+    mat = CSX.AddMaterial('graded_eps', epsilon=2)
+    mat.SetMaterialWeight(epsilon='1+0.02*sin(x)+0.03*cos(y)+0.04*sin(z)')
+    mat.AddBox([-1000]*3, [1000]*3)
+    return FDTD, CSX
+
+
+def run_captured(case, Sim_Path, engine):
+    """ Run a case with the given engine, return the openEMS console output """
+    FDTD, CSX = case()
+    log_file = Sim_Path + '.log'
+    sys.stdout.flush()
+    saved = os.dup(1)
+    with open(log_file, 'w') as log:
+        os.dup2(log.fileno(), 1)
+        try:
+            # the backends are compared value by value, so every run has to stop at the
+            # same timestep: the end criteria is otherwise evaluated on a wall-clock
+            # schedule and the faster backend runs a few timesteps further
+            FDTD.Run(Sim_Path, cleanup=True, engine=engine, exact_endcriteria=True, verbose=2)   # verbose 2: the paths the GPU engine takes
+        finally:
+            try:   # flush the C stdio buffer of the openEMS library
+                ctypes.CDLL(ctypes.util.find_library('c')).fflush(None)
+            except (OSError, AttributeError, TypeError):
+                pass
+            os.dup2(saved, 1)
+            os.close(saved)
+    with open(log_file) as log:
+        return log.read()
+
+
+def compare_outputs(path_a, path_b, rtol=0):
+    """ compare all probe files and field dumps (openEMS.compare), return the (name, deviation)
+        above rtol, the numbers of probe files and of HDF5 dumps, and the max. deviation """
+    files = [f for f in os.listdir(path_a) if os.path.isfile(os.path.join(path_a, f))]
+    probes = [f for f in files if '.' not in f]   # probe and port files have no extension
+    dumps  = [f for f in files if f.endswith('.h5')]
+    assert probes, f'FAIL: no probe files in {path_a}'
+    for f in probes:
+        assert np.any(np.loadtxt(os.path.join(path_a, f), comments='%')[:, 1:]), \
+            f'FAIL: the probe {f} of {path_a} is zero, the comparison would test nothing'
+    for f in dumps:
+        with h5py.File(os.path.join(path_a, f), 'r') as a:
+            fields = []
+            a.visititems(lambda name, obj: fields.append(obj[()]) if isinstance(obj, h5py.Dataset) and name.startswith('FieldData') else None)
+            assert max([np.max(np.abs(x)) for x in fields] or [0]) > 0, \
+                f'FAIL: the field dump {f} of {path_a} is zero, the comparison would test nothing'
+    diff = compare_sim_results(path_a, path_b)
+    worst = max(d for _, d in diff)
+    return [(n, d) for n, d in diff if d > rtol], len(probes), len(dumps), worst
+
+
+def case_coax_resonator():
+    """ re-entrant coaxial cavity: a quarter-wave line shorted at one end and loaded
+        by a lumped capacitor at the other, in a closed PEC can. Nothing damps it, so
+        it rings for the whole run and a small difference between the engines grows
+        out of the noise instead of staying in it. """
+    post_r, can_r, can_t, post_len, gap = 3.0, 7.0, 1.0, 30.0, 1.0
+    lid = post_len + gap
+    FDTD = openEMS(NrTS=100000, EndCriteria=0)
+    FDTD.SetGaussExcite(1.8e9, 1.2e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+
+    metal = CSX.AddMetal('can')
+    metal.AddCylindricalShell([0, 0, 0], [0, 0, lid], can_r + can_t/2, can_t)
+    metal.AddCylinder([0, 0, -can_t], [0, 0, 0], can_r + can_t)
+    metal.AddCylinder([0, 0, lid], [0, 0, lid + can_t], can_r + can_t)
+    metal.AddCylinder([0, 0, 0], [0, 0, post_len], post_r)
+
+    capa = CSX.AddLumpedElement('tuning_C', ny='z', caps=True, C=2e-12)
+    capa.AddBox([-post_r, -post_r, post_len], [post_r, post_r, lid], priority=5)
+    LumpedPort(CSX, 1, 1000, [0, 0, post_len], [0, 0, lid], 'z', excite=1, priority=10)
+
+    for ny in ('x', 'y'):
+        mesh.AddLine(ny, [-can_r - can_t, -can_r, -post_r, 0, post_r, can_r, can_r + can_t])
+        mesh.SmoothMeshLines(ny, 0.5, 1.4)
+    mesh.AddLine('z', [-can_t, 0, post_len, lid, lid + can_t])
+    mesh.AddLine('z', np.linspace(post_len, lid, 3))
+    mesh.SmoothMeshLines('z', 1.0, 1.4)
+
+    CSX.AddProbe('et', p_type=0).AddBox([0, 0, post_len], [0, 0, lid])
+    return FDTD, CSX
+
+
+# (name, case)
+cases = [('excitation',             case_excitation),
+         ('pml',                    case_pml),
+         ('mur',                    case_mur),
+         ('materials',              case_materials),
+         ('lumped',                 case_lumped),
+         ('lumped_pml',             case_lumped_pml),
+         ('tfsf',                   case_tfsf),
+         ('absorbers',              case_absorbers),
+         ('absorber_x',             case_absorber_x),
+         ('cylinder_closed',        case_cylinder_closed),
+         ('cylinder_wedge',         case_cylinder_wedge),
+         ('cylinder_dispersive',    case_cylinder_dispersive),
+         ('multigrid',              case_multigrid),
+         ('multigrid2',             case_multigrid2),
+         ('multigrid_wedge',        case_multigrid_wedge),
+         ('multigrid_snapshot',     case_multigrid_snapshot),
+         ('dispersive_pml',         case_dispersive_pml),
+         ('3d_mixed',               case_3d_mixed),
+         ('steady_state',           case_steady_state),
+         ('dumps',                  case_dumps),
+         ('dumps_snapshot',         case_dumps_snapshot),
+         ('coax_resonator',         case_coax_resonator),
+         ('graded_mesh',            case_graded_mesh),
+         ('pml_graded',             case_pml_graded),
+         ('dumps_snapshot_host_dft', case_dumps_snapshot),
+         ('sar',                    case_sar)]
+
+# environment of a case: the frequency domain dumps of dumps_snapshot without device sums,
+# summed on the host from the snapshots
+CASE_ENV = {'dumps_snapshot_host_dft': {'OPENEMS_GPU_DUMPS': 'snapshot'}}
+
+DEVICE_RTOL = 1e-4
+# the reference backend against the CPU engine: the coefficients in float per node (CM_FACTOR)
+REF_RTOL = 1e-5
+# a device backend on the cell model against the reference backend: its float arithmetic may round differently
+CELL_MODEL_RTOL = 1e-5
+# device backends bit-identical to the reference backend (HIP and SYCL: no FMA contraction, -ffp-contract=off)
+BITIDENT_BACKENDS = ('HIP', 'SYCL')
+# device backends that take field snapshots for the dumps
+SNAPSHOT_BACKENDS = ('HIP', 'Metal', 'SYCL')
+# device backends that accumulate the frequency domain dumps
+DEVICE_DFT_BACKENDS = ('HIP', 'SYCL')
+# the backends with the fused step (GPU_Backend::PrepareFused())
+FUSED_BACKENDS = ('HIP', 'SYCL')
+# the engines compared with basic: all of them, or those of OPENEMS_ENGINE (run_testsuite.py --engine)
+ENGINE_SETS = {'cpu': ('cpu', 'cpu-blocked'),
+               'gpu': ('cpu-ref', 'gpu-reference', 'gpu-reference-blocked', 'gpu', 'gpu-blocked'),
+               'gpu-reference': ('cpu-ref', 'gpu-reference', 'gpu-reference-blocked', 'gpu', 'gpu-blocked'),
+               'multithreaded': ('multithreaded',), 'sse': ('multithreaded',),
+               'sse-compressed': ('multithreaded',), 'fastest': ('multithreaded',),
+               'basic': ()}
+only = os.environ.get('OPENEMS_ENGINE')
+if only:
+    assert only in ENGINE_SETS, f'FAIL: OPENEMS_ENGINE={only} is no engine this test knows'
+    if not ENGINE_SETS[only]:
+        print(f'OPENEMS_ENGINE={only}: nothing to compare with the basic engine')
+        print('PASS')
+        sys.exit(0)
+    print(f'OPENEMS_ENGINE={only}: comparing {", ".join(ENGINE_SETS[only])} with the basic engine')
+
+blocked_cases = []
+gpu_blocked_cases = []
+gpu_tiled_cases = []   # blocked across tile borders: more than one tile
+gpu_tiled2_cases = []   # blocked across tile borders along both axes the GPU engine tiles
+cpu_tiled_cases = []   # blocked across tile borders along both axes the CPU engine tiles
+gpu_fused_cases = []   # the gpu run with the fused step
+for name, case in cases:
+    print(f'Testing case: {name}')
+    if only:
+        engines = ('basic',) + ENGINE_SETS[only]
+    else:
+        engines = ('basic', 'cpu-ref', 'gpu-reference', 'gpu-reference-blocked', 'gpu', 'gpu-blocked', 'cpu', 'cpu-blocked')
+        if name.startswith(('cylinder', 'multigrid')):
+            engines += ('multithreaded',)   # the basic engine on a cylindrical mesh against the default one
+    paths = {engine: os.path.join(tempfile.gettempdir(), f'Engine_Compare_{name}_{engine}') for engine in engines}
+    os.environ.update(CASE_ENV.get(name, {}))
+    try:
+        logs = {}
+        for engine in engines:
+            # the CPU engine flat, and with blocking forced even where the model fits the cache: two
+            # tiles and the flat sweep tried for a tiny time each, so the engine switches between them
+            # on every call at the start, then keeps one
+            os.environ['OPENEMS_CPU_TBLOCK'] = '2:5,3:7' if engine=='cpu-blocked' else '0'
+            # the GPU engine flat, and blocked in tiles of 5 lines and 2 timesteps
+            os.environ['OPENEMS_GPU_TBLOCK'] = '2:5' if engine.endswith('-blocked') else '0'
+            os.environ['OPENEMS_CPU_TRIAL'] = '1e-9'
+            # the flat GPU run: the fused step and the two updates tried for a tiny time each, so it switches between
+            # them; the blocked one keeps its tile
+            os.environ['OPENEMS_GPU_TRIAL'] = '0' if engine.endswith('-blocked') else '1e-9'
+            # the CPU engine as the GPU kernels compute: generic kernels (no FMA), the runs along z
+            for var, val in (('OPENEMS_CPU_ISA', 'generic'), ('OPENEMS_CPU_FAST_AXIS', 'z')):
+                if engine=='cpu-ref':
+                    os.environ[var] = val
+                else:
+                    os.environ.pop(var, None)
+            logs[engine] = run_captured(case, paths[engine], {'cpu-blocked': 'cpu', 'cpu-ref': 'cpu', 'gpu-blocked': 'gpu',
+                                                              'gpu-reference-blocked': 'gpu-reference'}.get(engine, engine))
+    finally:
+        del os.environ['OPENEMS_CPU_TBLOCK']
+        del os.environ['OPENEMS_GPU_TBLOCK']
+        del os.environ['OPENEMS_CPU_TRIAL']
+        del os.environ['OPENEMS_GPU_TRIAL']
+        os.environ.pop('OPENEMS_CPU_ISA', None)
+        os.environ.pop('OPENEMS_CPU_FAST_AXIS', None)
+        for var in CASE_ENV.get(name, {}):
+            del os.environ[var]
+
+    assert 'Create FDTD engine (GPU' not in logs['basic'], \
+        f'FAIL [{name}]: engine=basic created the GPU engine'
+
+    if 'gpu-reference' in engines:
+        assert 'Create FDTD engine (GPU, backend: reference' in logs['gpu-reference'], \
+            f'FAIL [{name}]: engine=gpu-reference did not create the GPU engine with the reference backend'
+        if name=='cylinder_dispersive':
+            assert len(re.findall(r'CellModel: the .* stays an extension: the cylinder extension', logs['gpu-reference']))==2, \
+                f'FAIL [{name}]: the cell model fused a dispersive material on the cylindrical mesh'
+        diff, n_probes, n_dumps, worst = compare_outputs(paths['cpu-ref'], paths['gpu-reference'])
+        print(f'  reference backend: compared {n_probes} probe files and {n_dumps} field dumps with the CPU engine, '
+              f'max. deviation {worst:.1e} of the peak value')
+        dev = [f'{n} ({d:.1e})' for n, d in diff if d > REF_RTOL]
+        assert not dev, f'FAIL [{name}]: reference backend deviates from the CPU engine in: {", ".join(dev)}'
+        if name=='absorber_x':
+            assert 'Engine_GPU: no temporal blocking: a local absorber normal to x' in logs['gpu-reference-blocked'], \
+                f'FAIL [{name}]: the GPU engine blocked with a local absorber normal to x'
+        if 'Engine_GPU: temporal blocking' in logs['gpu-reference-blocked']:
+            gpu_blocked_cases.append(name)
+            tiles = re.search(r'Engine_GPU: temporal blocking along \w and \w, tiles to try \(timesteps:lines\) 1\) \d+:\d+x\d+ \((\d+)x(\d+) tiles\)',
+                              logs['gpu-reference-blocked'])
+            assert tiles, f'FAIL [{name}]: the blocked GPU engine did not report its tiles'
+            if int(tiles.group(1))*int(tiles.group(2)) > 1:
+                gpu_tiled_cases.append(name)
+            if int(tiles.group(1)) > 1 and int(tiles.group(2)) > 1:
+                gpu_tiled2_cases.append(name)
+            diff, _, _, _ = compare_outputs(paths['gpu-reference'], paths['gpu-reference-blocked'])
+            assert not diff, f'FAIL [{name}]: the blocked reference backend differs from its flat sweep in: {", ".join(n for n, _ in diff)}'
+            print('  reference backend blocked: bit-identical to its flat sweep')
+
+    if 'cpu' in engines:
+        assert 'Create FDTD engine (CPU' in logs['cpu'], f'FAIL [{name}]: engine=cpu did not create the CPU engine'
+        diff, _, _, worst = compare_outputs(paths['basic'], paths['cpu'], rtol=DEVICE_RTOL)
+        print(f'  CPU engine: max. deviation {worst:.1e} of the peak value')
+        assert not diff, f'FAIL [{name}]: the CPU engine deviates from the basic engine: ' + \
+            ', '.join(f'{n} ({d:.1e})' for n, d in diff)
+        if 'Engine_CPU: temporal blocking' in logs['cpu-blocked']:
+            blocked_cases.append(name)
+            tiles = re.search(r'Engine_CPU: temporal blocking, .* tiles of \d+ lines along \w and \w, (\d+)x(\d+) tiles',
+                              logs['cpu-blocked'])
+            assert tiles, f'FAIL [{name}]: the blocked CPU engine did not report its tiles'
+            if int(tiles.group(1)) > 1 and int(tiles.group(2)) > 1:
+                cpu_tiled_cases.append(name)
+            diff, _, _, _ = compare_outputs(paths['cpu'], paths['cpu-blocked'])
+            assert not diff, f'FAIL [{name}]: the blocked CPU engine differs from its flat sweep in: {", ".join(n for n, _ in diff)}'
+            print('  CPU engine blocked: bit-identical to its flat sweep')
+
+    if 'multithreaded' in engines:
+        diff, _, _, _ = compare_outputs(paths['basic'], paths['multithreaded'])
+        assert not diff, f'FAIL [{name}]: the multithreaded engine differs from the basic engine in: {", ".join(n for n, _ in diff)}'
+
+    if name=='cylinder_closed':
+        # the H and the B field are interpolated alike, also on the alpha seam of the mesh
+        with h5py.File(os.path.join(paths['basic'], 'Ht_node.h5'), 'r') as H, h5py.File(os.path.join(paths['basic'], 'Bt_node.h5'), 'r') as B:
+            ts = sorted(H['FieldData/TD'].keys())[-1]
+            dev = deviation(H['FieldData/TD'][ts][()], B['FieldData/TD'][ts][()]/(4e-7*np.pi))
+        assert dev<1e-6, f'FAIL [{name}]: the B field dump is not mue0 times the H field dump ({dev:.1e} of the peak)'
+
+    if 'gpu' in engines:
+        backend = re.search(r'Create FDTD engine \(GPU, backend: (\w+)', logs['gpu'])
+        backend = backend.group(1) if backend else None
+        if 'Engine_GPU: fused step' in logs['gpu']:
+            gpu_fused_cases.append(name)
+            assert re.search(r'Engine_GPU: tried the fused step \d+ MC/s, the two updates \d+ MC/s', logs['gpu']), \
+                f'FAIL [{name}]: the flat GPU run did not try the fused step and the two updates'
+        elif backend in FUSED_BACKENDS and 'multigrid' not in name:
+            assert False, f'FAIL [{name}]: the {backend} backend did not run the fused step'
+        if backend and backend!='reference':
+            if name in ('dumps_snapshot', 'multigrid_snapshot', 'dumps_snapshot_host_dft') and backend in SNAPSHOT_BACKENDS:
+                assert 'Engine_GPU: field dumps from snapshots' in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not take field snapshots for the dumps'
+            if name=='dumps_snapshot_host_dft':
+                assert 'frequency domain dumps accumulated on the device' not in logs['gpu'], \
+                    f'FAIL [{name}]: OPENEMS_GPU_DUMPS=snapshot did not keep the sums off the device'
+            if name in ('dumps', 'sar') and backend in DEVICE_DFT_BACKENDS:
+                assert 'Engine_GPU: frequency domain dumps accumulated on the device' in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not accumulate the frequency domain dumps'
+            diff, _, _, worst = compare_outputs(paths['basic'], paths['gpu'], rtol=DEVICE_RTOL)
+            print(f'  {backend} backend: max. deviation {worst:.1e} of the peak value')
+            assert not diff, f'FAIL [{name}]: {backend} backend deviates from the basic engine: ' + \
+                ', '.join(f'{n} ({d:.1e})' for n, d in diff)
+            if 'gpu-blocked' in engines and 'Engine_GPU: temporal blocking' in logs['gpu-blocked']:
+                diff, _, _, _ = compare_outputs(paths['gpu'], paths['gpu-blocked'])
+                assert not diff, f'FAIL [{name}]: the blocked {backend} backend differs from its flat sweep in: {", ".join(n for n, _ in diff)}'
+                print(f'  {backend} backend blocked: bit-identical to its flat sweep')
+            # the kernels of the reference backend on the same data
+            if 'gpu-reference' in engines:
+                diff, _, _, worst = compare_outputs(paths['gpu-reference'], paths['gpu'])
+                print(f'  {backend} backend on the cell model: max. deviation {worst:.1e} from the reference backend')
+                # the same code on the same data: bit-identical, but for the frequency domain dumps summed on the
+                # device (in another order than the host)
+                device_dft = 'frequency domain dumps accumulated on the device' in logs['gpu']
+                exact = backend in BITIDENT_BACKENDS
+                dev = [f'{n} ({d:.1e})' for n, d in diff
+                       if d > CELL_MODEL_RTOL or (exact and not (device_dft and 'FieldData/FD' in n))]
+                assert not dev, f'FAIL [{name}]: the {backend} backend deviates from the reference backend: ' + ', '.join(dev)
+        else:
+            # no silent fallback to the (slow) reference backend
+            assert 'Running FDTD engine' not in logs['gpu'], \
+                f'FAIL [{name}]: engine=gpu ran without a GPU device'
+            print('  no GPU device, device backend not tested')
+    print('PASS [{}]'.format(name))
+
+if not only or 'cpu' in ENGINE_SETS[only]:
+    assert blocked_cases, 'FAIL: the CPU engine blocked in no case'
+    print(f'CPU engine blocked in {len(blocked_cases)} cases: {", ".join(blocked_cases)}')
+    print(f'  across tile borders along both axes in {len(cpu_tiled_cases)}: {", ".join(cpu_tiled_cases)}')
+    assert cpu_tiled_cases, 'FAIL: the CPU engine blocked in no case across tile borders along both axes'
+if not only or 'gpu-reference' in ENGINE_SETS[only]:
+    assert gpu_blocked_cases, 'FAIL: the GPU engine blocked in no case'
+    print(f'GPU engine blocked in {len(gpu_blocked_cases)} cases: {", ".join(gpu_blocked_cases)}')
+    print(f'  across tile borders in {len(gpu_tiled_cases)}: {", ".join(gpu_tiled_cases)}')
+    print(f'  across tile borders along both axes in {len(gpu_tiled2_cases)}: {", ".join(gpu_tiled2_cases)}')
+    assert gpu_tiled2_cases, 'FAIL: the GPU engine blocked in no case across tile borders along both axes'
+    assert 'absorbers' in gpu_tiled_cases, 'FAIL: the GPU engine did not block the absorbers case across tile borders'
+if gpu_fused_cases:
+    print(f'GPU engine fused in {len(gpu_fused_cases)} cases: {", ".join(gpu_fused_cases)}')
+print('PASS')

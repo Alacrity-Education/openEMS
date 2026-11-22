@@ -29,6 +29,18 @@ IF(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
   SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ffp-contract=off")
 ENDIF()
 
+# The Intel compiler (icpx, icx) defaults to fast math, which assumes there are no
+# NaNs: the setup uses NaN for a value not given (e.g. of a lumped element), and the
+# reference GPU backend has to round like the other compilers. Precise math for a
+# build with it; the SYCL plugin sets its own flags (FDTD/sycl).
+IF(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  IF(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options(/fp:precise)
+  ELSE()
+    add_compile_options(-fno-fast-math)
+  ENDIF()
+ENDIF()
+
 # default
 set(LIB_VERSION_MAJOR 0)
 set(LIB_VERSION_MINOR 37)
@@ -252,7 +264,29 @@ IF(ENABLE_HIP AND OPENEMS_HIP_AS_CUDA)
   IF(ENABLE_FLUSH_TO_ZERO)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ftz=true")
   ENDIF()
-  message(STATUS "HIP GPU backend enabled as CUDA sources, architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+  # The HIP headers have to be complete and fit the CUDA version: a distribution's HIP
+  # package can lack hip/nvidia_detail, a minimal CUDA install cuda_profiler_api.h, and
+  # HIP headers before 7.2 do not compile with CUDA 13. Found here, not in the build.
+  include(CheckSourceCompiles)
+  IF(NOT HIP_HEADERS_COMPILE_AS_CUDA)
+    # a failure is checked again on the next configure, e.g. after installing other headers
+    unset(HIP_HEADERS_COMPILE_AS_CUDA CACHE)
+  ENDIF()
+  set(CMAKE_REQUIRED_INCLUDES ${HIP_INCLUDE_DIR})
+  set(CMAKE_REQUIRED_DEFINITIONS -D__HIP_PLATFORM_NVIDIA__=1)
+  check_source_compiles(CUDA "#include <hip/hip_runtime.h>
+int main() { return 0; }" HIP_HEADERS_COMPILE_AS_CUDA)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  IF(HIP_HEADERS_COMPILE_AS_CUDA)
+    message(STATUS "HIP GPU backend enabled as CUDA sources, architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+  ELSE()
+    message(WARNING "The HIP headers in ${HIP_INCLUDE_DIR} do not compile with ${CMAKE_CUDA_COMPILER} "
+      "(CUDA ${CMAKE_CUDA_COMPILER_VERSION}), building without the HIP GPU backend. They need "
+      "hip/nvidia_detail (in the hip-dev package of AMD), cuda_profiler_api.h of CUDA, and for "
+      "CUDA 13 the HIP headers of ROCm 7.2 or newer; CMakeFiles/CMakeConfigureLog.yaml has the error.")
+    set(ENABLE_HIP OFF)
+  ENDIF()
 ELSEIF(ENABLE_HIP)
   set(_hip_nvidia OFF)
   IF((CMAKE_HIP_PLATFORM STREQUAL "nvidia") OR ("$ENV{HIP_PLATFORM}" STREQUAL "nvidia"))
@@ -287,7 +321,7 @@ ELSEIF(ENABLE_HIP)
   enable_language(HIP)
   set(CMAKE_HIP_STANDARD 17)
   # No fused multiply-add and the same denormal handling, so the kernels round like the
-  # CPU engines (python/Tests/GPU_Engine.py compares them value by value). The flags are
+  # reference backend (python/Tests/Engine_Compare.py compares them value by value). The flags are
   # those of the compiler behind hipcc: hipcc on the NVIDIA platform, clang on AMD, and
   # the clang spelling would only reach the host compiler under hipcc.
   IF(CMAKE_HIP_PLATFORM STREQUAL "nvidia")
@@ -323,6 +357,66 @@ ENDIF()
 OPTION(OPENEMS_GPU_PLUGINS "Build the HIP GPU backend as a plugin loaded at runtime" ON)
 IF(ENABLE_HIP AND NOT OPENEMS_GPU_PLUGINS)
   ADD_DEFINITIONS( -DOPENEMS_WITH_HIP )
+ENDIF()
+
+# SYCL GPU backend for the GPU engine (--engine=gpu), for Intel GPUs through Level Zero.
+# It needs the Intel oneAPI DPC++/C++ compiler (icpx, icx on Windows) 2026 or newer and
+# is always a plugin: libopenEMS then needs no SYCL runtime. With that compiler as the C++
+# compiler of the whole build the plugin is a target of it; with another one (GCC, MSVC)
+# it builds the plugin as a project of its own (FDTD/sycl) against the libopenEMS just
+# built, after the sub-build of thliebig/openEMS#243: OPENEMS_ICPX is that compiler, a
+# path that does not exist turns the backend off. Whatever is missing switches it off,
+# with a warning if it was asked for.
+set(SYCL_MISSING "")
+set(_sycl_subbuild OFF)
+set(_sycl_version "")
+IF(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  set(_sycl_version ${CMAKE_CXX_COMPILER_VERSION})
+ELSE()
+  # searched once: a value given by the user, even OPENEMS_ICPX-NOTFOUND, is kept
+  IF(NOT DEFINED OPENEMS_ICPX)
+    IF(WIN32)
+      set(_icpx_names icx)
+    ELSE()
+      set(_icpx_names icpx)
+    ENDIF()
+    find_program(OPENEMS_ICPX NAMES ${_icpx_names} HINTS ${ONEAPI_ROOT}/compiler/latest/bin
+                 $ENV{ONEAPI_ROOT}/compiler/latest/bin /opt/intel/oneapi/compiler/latest/bin)
+  ENDIF()
+  IF(OPENEMS_ICPX AND EXISTS "${OPENEMS_ICPX}")
+    set(_sycl_subbuild ON)
+    execute_process(COMMAND ${OPENEMS_ICPX} --version OUTPUT_VARIABLE _icpx_out ERROR_QUIET)
+    string(REGEX MATCH "Compiler ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" _icpx_match "${_icpx_out}")
+    set(_sycl_version ${CMAKE_MATCH_1})
+  ELSE()
+    set(SYCL_MISSING "the Intel oneAPI DPC++/C++ compiler (OPENEMS_ICPX)")
+  ENDIF()
+ENDIF()
+# the version line CI tests; an older one is not tried
+IF(NOT SYCL_MISSING AND (NOT _sycl_version OR _sycl_version VERSION_LESS 2026))
+  set(SYCL_MISSING "the Intel oneAPI DPC++/C++ compiler 2026 or newer (found '${_sycl_version}')")
+ENDIF()
+IF(SYCL_MISSING)
+  OPTION(ENABLE_SYCL "Build the SYCL GPU backend (Intel GPUs)" OFF)
+ELSE()
+  OPTION(ENABLE_SYCL "Build the SYCL GPU backend (Intel GPUs)" ON)
+ENDIF()
+IF(ENABLE_SYCL AND SYCL_MISSING)
+  message(WARNING "The SYCL GPU backend needs ${SYCL_MISSING}, building without it")
+  set(ENABLE_SYCL OFF)
+ENDIF()
+IF(ENABLE_SYCL AND NOT OPENEMS_GPU_PLUGINS)
+  message(WARNING "The SYCL GPU backend is only built as a plugin (OPENEMS_GPU_PLUGINS), building without it")
+  set(ENABLE_SYCL OFF)
+ENDIF()
+# Without ahead-of-time devices every Intel GPU compiles the SPIR-V image when the GPU
+# engine starts, kept in SYCL's cache on disk after the first time.
+set(OPENEMS_SYCL_AOT_DEVICES "" CACHE STRING
+  "Intel GPUs the SYCL backend is compiled for ahead of time (ocloc -device syntax, e.g. bmg-g21); empty: SPIR-V only, compiled on the device at run time")
+IF(ENABLE_SYCL AND _sycl_subbuild)
+  message(STATUS "SYCL GPU backend enabled, built by ${OPENEMS_ICPX} (${_sycl_version}) in the sub-build sycl-plugin")
+ELSEIF(ENABLE_SYCL)
+  message(STATUS "SYCL GPU backend enabled")
 ENDIF()
 
 # libopenEMS refuses a plugin of another build (see FDTD/gpu_plugin.h). In a git
@@ -377,7 +471,39 @@ IF(ENABLE_HIP AND OPENEMS_HIP_AS_CUDA)
   set_source_files_properties(${HIP_SOURCES} PROPERTIES LANGUAGE CUDA COMPILE_OPTIONS "-x;cu")
 ENDIF()
 
+# the kernels of the CPU engine once more for AVX2 and FMA, chosen at run time
+# (Engine_CPU::InitKernels()); on x86-64 with GCC, Clang, MSVC and clang-cl
+set(CPU_AVX2_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/FDTD/engine_cpu_kernels_avx2.cpp)
+IF(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+  IF(MSVC)   # MSVC and clang-cl
+    set(OPENEMS_CPU_AVX2 ON)
+    set_source_files_properties(${CPU_AVX2_SOURCE} PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  ELSEIF(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(OPENEMS_CPU_AVX2 ON)
+    set_source_files_properties(${CPU_AVX2_SOURCE} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  ENDIF()
+  IF(OPENEMS_CPU_AVX2)
+    set(SOURCES ${SOURCES} ${CPU_AVX2_SOURCE})
+  ENDIF()
+ENDIF()
+
+# Without fused multiply-add, whatever the target offers: the reference backend of the GPU
+# engine computes as a device (HIP below), and the CPU engine's generic kernels and engine
+# extensions (which the reference runs as kernels/ext_ops.h) as both;
+# python/Tests/Engine_Compare.py compares HIP with the reference bit for bit and the reference
+# with the CPU engine (Clang contracts by default, e.g. on ARM). The AVX2 kernels keep their FMA.
+IF(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM" AND NOT MSVC)
+  file(GLOB ENGINE_EXT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/FDTD/extensions/engine_ext_*.cpp)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/FDTD/gpu_backend_reference.cpp
+                              ${CMAKE_CURRENT_SOURCE_DIR}/FDTD/engine_cpu_kernels.cpp
+                              ${ENGINE_EXT_SOURCES}
+                              PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+ENDIF()
+
 add_library( openEMS SHARED ${SOURCES})
+IF(OPENEMS_CPU_AVX2)
+  target_compile_definitions(openEMS PRIVATE OPENEMS_CPU_AVX2)
+ENDIF()
 
 # the target the HIP sources are built into: libopenEMS or the plugin
 IF(ENABLE_HIP)
@@ -431,6 +557,54 @@ IF(ENABLE_HIP AND OPENEMS_HIP_AS_CUDA)
   target_include_directories( ${HIP_TARGET} PRIVATE ${HIP_INCLUDE_DIR} )
   target_compile_definitions( ${HIP_TARGET} PRIVATE __HIP_PLATFORM_NVIDIA__=1 )
 ENDIF()
+set(SYCL_PLUGIN_FILE ${CMAKE_CURRENT_BINARY_DIR}/plugins/openEMS_gpu_sycl${CMAKE_SHARED_MODULE_SUFFIX})
+IF(ENABLE_SYCL AND NOT _sycl_subbuild)
+  ADD_SUBDIRECTORY( FDTD/sycl )
+ELSEIF(ENABLE_SYCL)
+  # FDTD/sycl as a project of its own, compiled by the Intel compiler with the include
+  # directories and definitions of libopenEMS; its plugin lands in plugins/ as the HIP one
+  include(ExternalProject)
+  get_directory_property(_sycl_includes INCLUDE_DIRECTORIES)
+  get_directory_property(_sycl_definitions COMPILE_DEFINITIONS)
+  # GIT_VERSION: its quotes do not survive the command line, and the plugin has no use for it
+  set(_sycl_defs "")
+  foreach(_def ${_sycl_definitions})
+    IF(NOT _def MATCHES "^GIT_VERSION=")
+      list(APPEND _sycl_defs ${_def})
+    ENDIF()
+  endforeach()
+  string(REPLACE ";" "|" _sycl_includes "${_sycl_includes}")
+  string(REPLACE ";" "|" _sycl_defs "${_sycl_defs}")
+  set(_sycl_args
+    -DCMAKE_CXX_COMPILER=${OPENEMS_ICPX}
+    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    -DOPENEMS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -DOPENEMS_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+    -DOPENEMS_LIBRARY=$<TARGET_LINKER_FILE:openEMS>
+    -DOPENEMS_CSXCAD_LIBRARY=${CSXCAD_LIBRARIES}
+    -DOPENEMS_INCLUDE_DIRS=${_sycl_includes}
+    -DOPENEMS_COMPILE_DEFINITIONS=${_sycl_defs}
+    -DOPENEMS_SYCL_AOT_DEVICES=${OPENEMS_SYCL_AOT_DEVICES}
+    -DENABLE_FLUSH_TO_ZERO=${ENABLE_FLUSH_TO_ZERO})
+  IF(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # the GCC of libopenEMS, whose libstdc++ the plugin is compiled against (icpx would
+    # take the newest GCC it finds)
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-libgcc-file-name
+      OUTPUT_VARIABLE _libgcc OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(_gcc_install_dir "${_libgcc}" DIRECTORY)
+    list(APPEND _sycl_args -DOPENEMS_GCC_INSTALL_DIR=${_gcc_install_dir})
+  ENDIF()
+  # BUILD_ALWAYS: the sub-build sees changes of the SYCL sources, the outer one does not
+  ExternalProject_Add( openEMS_gpu_sycl
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/FDTD/sycl
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/sycl-plugin
+    DEPENDS openEMS
+    LIST_SEPARATOR |
+    CMAKE_ARGS ${_sycl_args}
+    BUILD_ALWAYS ON
+    BUILD_BYPRODUCTS ${SYCL_PLUGIN_FILE}
+    INSTALL_COMMAND "" )
+ENDIF()
 #ADD_EXECUTABLE( openEMS main.cpp ${SOURCES})
 IF(ENABLE_HIP AND NOT OPENEMS_HIP_AS_CUDA AND CMAKE_HIP_PLATFORM STREQUAL "amd")
   TARGET_LINK_LIBRARIES( ${HIP_TARGET} ${HIP_RUNTIME_LIBRARY} )
@@ -481,6 +655,14 @@ IF(ENABLE_HIP AND OPENEMS_GPU_PLUGINS)
     INSTALL(TARGETS ${HIP_TARGET} LIBRARY DESTINATION lib${LIB_SUFFIX}/openEMS/plugins)
   ENDIF()
 ENDIF()
+IF(ENABLE_SYCL AND _sycl_subbuild)
+  # the file of the sub-build; the in-tree target installs itself (FDTD/sycl)
+  IF(WIN32)
+    INSTALL(PROGRAMS ${SYCL_PLUGIN_FILE} DESTINATION bin/openEMS/plugins)
+  ELSE()
+    INSTALL(PROGRAMS ${SYCL_PLUGIN_FILE} DESTINATION lib${LIB_SUFFIX}/openEMS/plugins)
+  ENDIF()
+ENDIF()
 
 if (UNIX)
     INSTALL( FILES openEMS.sh 
@@ -491,4 +673,13 @@ INSTALL(FILES ${PUB_HEADERS} DESTINATION include/openEMS)
 INSTALL( DIRECTORY matlab DESTINATION share/openEMS )
 INSTALL( DIRECTORY python/Tutorials DESTINATION share/openEMS/python )
 INSTALL( DIRECTORY resources DESTINATION share/openEMS )
+
+# C++ unit tests. Off by default: they are of no use to somebody installing
+# openEMS, and building them needs nothing the library does not need anyway.
+# Enable with -DOPENEMS_BUILD_TESTS=ON, then run them with `ctest`.
+option(OPENEMS_BUILD_TESTS "Build the C++ unit tests in tests/" OFF)
+if (OPENEMS_BUILD_TESTS)
+  enable_testing()
+  ADD_SUBDIRECTORY( tests )
+endif()
 # TODO tarball, debug, release

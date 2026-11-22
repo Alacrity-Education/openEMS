@@ -23,11 +23,20 @@
 #include "excitation.h"
 #include "Common/operator_base.h"
 
+#include "tools/arraylib/array_ijk.h"
 #include "tools/arraylib/array_nijk.h"
+#include "operator_coeffs.h"
+#include "ec_table.h"
+#include "engine_type.h"
+
+#include <algorithm>
+#include <functional>
+#include <stdexcept>
 
 class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
+class GPU_Backend;
 class TiXmlElement;
 
 //! Basic FDTD-operator
@@ -49,9 +58,16 @@ public:
 
 	enum MatAverageMethods {QuarterCell=0, CentralCell=1};
 
-	//! Create a new operator
-	static Operator* New();
+	//! Create a new operator, running its build and engine on numThreads threads (0: all available)
+	static Operator* New(unsigned int numThreads = 0);
 	virtual ~Operator();
+
+	//! Choose the engine the operator creates (CreateEngine()), Engine::BASIC, SSE, GPU or CPU (no default: building the operator without it throws), and with it the layout of the coefficients (Coeffs_SSE_Compressed for the SSE engine, Coeffs_Basic for the basic one, else Coeffs_EC); before the operator is built, throws after
+	virtual void SetEngineType(Engine_Types::EngineType type);
+	Engine_Types::EngineType GetEngineType() const {return m_EngineType;}
+	//! The backend of a GPU engine (see GPU_Backend::New), which the operator takes over and hands on to its engine
+	//! A multi-grid sub-grid passes the backend of its parent grid as \a parent instead (see GPU_Backend::NewSubGridBackend()).
+	void SetGPUBackend(GPU_Backend* backend, GPU_Backend* parent=NULL);
 
 	virtual Engine* CreateEngine();
 	virtual Engine* GetEngine() const {return m_Engine;}
@@ -59,71 +75,38 @@ public:
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	//! The debug dumps CalcECOperator() was asked for: an engine may dump its view of the operator too
+	DebugFlags GetDebugFlags() const {return m_DebugFlags;}
 
-	// the next four functions need to be reimplemented in a derived class
-	inline virtual FDTD_FLOAT GetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+	//! The update coefficients, see Operator_Coeffs
+	const Operator_Coeffs* GetCoeffs() const {return m_Coeffs;}
+	//! The update coefficients in the layout \a T an engine reads directly; throws if the operator stores another layout
+	template <class T> const T& GetCoeffsAs() const
 	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& vv = *vv_ptr;
-		return vv(n, x, y, z);
+		const T* coeffs = dynamic_cast<const T*>(m_Coeffs);
+		if (coeffs==NULL)
+			throw std::runtime_error("Operator::GetCoeffsAs: the operator stores its coefficients in another layout");
+		return *coeffs;
 	}
 
-	inline virtual FDTD_FLOAT GetVI(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& vi = *vi_ptr;
-		return vi(n, x, y, z);
-	}
-
-	inline virtual FDTD_FLOAT GetII(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& ii = *ii_ptr;
-		return ii(n, x, y, z);
-	}
-	inline virtual FDTD_FLOAT GetIV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& iv = *iv_ptr;
-		return iv(n, x, y, z);
-	}
+	inline FDTD_FLOAT GetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return m_Coeffs->GetVV(n, x, y, z);}
+	inline FDTD_FLOAT GetVI(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return m_Coeffs->GetVI(n, x, y, z);}
+	inline FDTD_FLOAT GetII(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return m_Coeffs->GetII(n, x, y, z);}
+	inline FDTD_FLOAT GetIV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const {return m_Coeffs->GetIV(n, x, y, z);}
 
 	// convenient access functions
-	inline virtual FDTD_FLOAT GetVV( unsigned int n, unsigned int pos[3] ) const
-	{
-		return GetVV(n, pos[0], pos[1], pos[2]);
-	}
+	inline FDTD_FLOAT GetVV(unsigned int n, unsigned int pos[3]) const {return GetVV(n, pos[0], pos[1], pos[2]);}
+	inline FDTD_FLOAT GetVI(unsigned int n, unsigned int pos[3]) const {return GetVI(n, pos[0], pos[1], pos[2]);}
+	inline FDTD_FLOAT GetII(unsigned int n, unsigned int pos[3]) const {return GetII(n, pos[0], pos[1], pos[2]);}
+	inline FDTD_FLOAT GetIV(unsigned int n, unsigned int pos[3]) const {return GetIV(n, pos[0], pos[1], pos[2]);}
 
-	inline virtual FDTD_FLOAT GetVI( unsigned int n, unsigned int pos[3] ) const
-	{
-		return GetVI(n, pos[0], pos[1], pos[2]);
-	}
-	inline virtual FDTD_FLOAT GetII( unsigned int n, unsigned int pos[3] ) const
-	{
-		return GetII(n, pos[0], pos[1], pos[2]);
-	}
-	inline virtual FDTD_FLOAT GetIV( unsigned int n, unsigned int pos[3] ) const
-	{
-		return GetIV(n, pos[0], pos[1], pos[2]);
-	}
+	//! The voltage (\a f 0: vv, vi) or current (1: ii, iv) coefficients of direction \a n at \a pos, in one go
+	inline void GetCoeffPair(int f, unsigned int n, const unsigned int pos[3], FDTD_FLOAT& self, FDTD_FLOAT& curl) const {m_Coeffs->GetPair(f, n, pos[0], pos[1], pos[2], self, curl);}
 
-	// the next four functions need to be reimplemented in a derived class
-	inline virtual void SetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& vv = *vv_ptr;
-		vv(n, x, y, z) = value;
-	}
-	inline virtual void SetVI(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& vi = *vi_ptr;
-		vi(n, x, y, z) = value;
-	}
-	inline virtual void SetII(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& ii = *ii_ptr;
-		ii(n, x, y, z) = value;
-	}
-	inline virtual void SetIV(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>& iv = *iv_ptr;
-		iv(n, x, y, z) = value;
-	}
+	inline void SetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value) {m_Coeffs->SetVV(n, x, y, z, value);}
+	inline void SetVI(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value) {m_Coeffs->SetVI(n, x, y, z, value);}
+	inline void SetII(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value) {m_Coeffs->SetII(n, x, y, z, value);}
+	inline void SetIV(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value) {m_Coeffs->SetIV(n, x, y, z, value);}
 
 	virtual void ApplyElectricBC(bool* dirs); //applied by default to all boundaries
 	virtual void ApplyMagneticBC(bool* dirs);
@@ -180,7 +163,7 @@ public:
 	//! Get the node area for a given direction \a n and a given mesh position \a pos
 	virtual double GetNodeArea(int ny, const int pos[3], bool dualMesh = false) const;
 
-	//! Get the length of an FDTD edge (unit is meter).
+	//! Get the length of an FDTD edge (unit is meter). A subclass overriding it overrides TableGeometry() too, see there
 	virtual double GetEdgeLength(int ny, const unsigned int pos[3], bool dualMesh = false) const;
 
 	//! The smallest mesh step (in drawing units)
@@ -193,6 +176,7 @@ public:
 	/*!
 		This will return the area around an edge with a given direction, measured at the middle of the edge.
 		In a cartesian mesh this is equal to the NodeArea, may be different in other coordinate systems.
+		A subclass overriding it (or GetNodeArea()) overrides TableGeometry() too, see there.
 	*/
 	virtual double GetEdgeArea(int ny, const unsigned int pos[3], bool dualMesh = false) const {return GetNodeArea(ny,pos,dualMesh);}
 
@@ -222,7 +206,10 @@ public:
 
 	virtual void CleanupMaterialStorage();
 
+	//! The material \a type (0: epsilon, 1: kappa, 2: mue, 3: sigma) of the edge \a ny at \a pos for the dumps: those a dump asked for (SetMaterialStoreFlags()), with the material table all four; else 0
 	virtual double GetDiscMaterial(int type, int ny, const unsigned int pos[3]) const;
+	//! Whether GetDiscMaterial() has the material \a type (with the material table: all four)
+	bool HasDiscMaterial(int type) const;
 
 	//! Get the cell center coordinate usable for material averaging (Warning, may not be the yee cell center)
 	virtual bool GetCellCenterMaterialAvgCoord(const int pos[3], double coord[3]) const;
@@ -234,17 +221,62 @@ public:
 
 	virtual double CalcNumericPhaseVelocity(unsigned int start[3], unsigned int stop[3], double propDir[3], float freq) const;
 
-	virtual std::vector<CSPrimitives*> GetPrimitivesBoundBox(
-		int posX,
-		int posY,
-		int posZ,
-		CSProperties::PropertyType type=CSProperties::ANY
-	) const;
+	virtual std::vector<CSPrimitives*> GetPrimitivesBoundBox(int posX, int posY, int posZ, CSProperties::PropertyType type=CSProperties::ANY) const;
+
+	//! Number of threads that build the operator, 0 (the default) for AvailableThreads(). More than AvailableThreads() are limited to it.
+	void SetNumThreads(unsigned int numThreads) {m_numThreads = numThreads;}
+	//! The number of threads as set by SetNumThreads(), 0 for AvailableThreads().
+	unsigned int GetNumThreads() const {return m_numThreads;}
+
+	//! Split the lines in x-direction into ranges for up to \a numThreads threads; \a numThreads returns the number of ranges. Used for the operator build and by Engine_ThreadPool.
+	virtual void CalcStartStopLines(unsigned int &numThreads, std::vector<unsigned int> &start, std::vector<unsigned int> &stop) const;
+
+	//! The number of threads the operator build uses, from m_numThreads and AvailableThreads().
+	unsigned int GetBuildThreads() const;
+	//! Run \a fn(thread, begin, end) on the build threads, [0, \a count) split into consecutive ranges in thread order
+	/*!
+	  At most GetBuildThreads() ranges, fewer if \a count is smaller; \a thread numbers them
+	  from 0, so results kept per thread and joined in thread order are in the order of the
+	  serial loop. An exception of a thread is rethrown after all have ended.
+	  */
+	void ParallelFor(size_t count, const std::function<void(unsigned int thread, size_t begin, size_t end)>& fn) const;
+	//! The index of the node \a pos in the EC arrays (the layout of MainOp), without changing the position of MainOp
+	size_t GetECIndex(const unsigned int pos[3]) const {return pos[2] + (size_t)numLines[2]*(pos[1] + (size_t)numLines[1]*pos[0]);}
+	//! \a pos shifted by \a step along \a a into \a q, clamped to the mesh (-1 -> 0, numLines -> numLines-1, as AdrOp::SetReflection2Cell() for steps of 1); inline in operator.cpp, for its use only
+	void GetShiftedPos(const unsigned int pos[3], int a, int step, unsigned int q[3]) const;
+
+	//! The circuit values of an edge: capacitance, conductance (main mesh), inductance, resistance (dual mesh)
+	enum ECValue {EC_CAP=0, EC_CON=1, EC_IND=2, EC_RES=3};
+	//! The circuit value \a k (ECValue) of the edge \a n at the node \a pos, from CalcECOperator() until the coefficients are freed (FreeCoeffs())
+	FDTD_FLOAT GetEC(int k, int n, const unsigned int pos[3]) const;
+	//! GetEC() of C and G (\a f 0) or of L and R (\a f 1) of the edge \a n at the node \a pos, in one go
+	void GetECPair(int f, int n, const unsigned int pos[3], FDTD_FLOAT& a, FDTD_FLOAT& b) const;
 
 protected:
+	//! Set the circuit values of the edge \a n at the node \a pos: bit k (ECValue) of \a mask says which of \a values; the others and the other edges stay
+	/*!
+	  Who changes the circuit values of a node must call Calc_ECOperatorPos() for it afterwards,
+	  or FreezeCoeffs() before to keep its coefficients as they are.
+
+	  The material dumps (GetDiscMaterial()) see the effective material of a value set here (a
+	  lumped resistor as the conductivity it stands for), or with \a keepMaterial the material
+	  of the node from before.
+
+	  From one thread at a time only: it adds to the one table of the operator and may make the
+	  circuit values dense (ECTableToDense()).
+	  */
+	void SetEC(int n, const unsigned int pos[3], unsigned int mask, const double values[4], bool keepMaterial=false);
+	DebugFlags m_DebugFlags = None;
 	//! use New() for creating a new Operator
 	Operator();
 
+	unsigned int m_numThreads; //!< see SetNumThreads()
+
+	Engine_Types::EngineType m_EngineType;  //!< see SetEngineType()
+	GPU_Backend* m_GPU_Backend;  //!< until CreateEngine()
+	GPU_Backend* m_GPU_Parent;
+	//! hands the backend on to the engine
+	GPU_Backend* TakeGPUBackend() {GPU_Backend* b = m_GPU_Backend; m_GPU_Backend = NULL; return b;}
 	virtual void Init();
 	void Delete();
 	virtual void Reset();
@@ -277,11 +309,7 @@ protected:
 	double CalcTimestep_Var3();
 
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos
-	virtual bool Calc_ECPos(
-		int ny,
-		const unsigned int* pos,
-		double* EC, std::vector<CSPrimitives *> vPrims
-	) const;
+	virtual bool Calc_ECPos(int ny, const unsigned int* pos, double* EC, const std::vector<CSPrimitives*>& vPrims) const;
 
 	//! Get the FDTD raw disc delta, needed by Calc_EffMatPos() \sa Calc_EffMatPos
 	/*!
@@ -292,37 +320,20 @@ protected:
 	virtual double GetRawDiscDelta(int ny, const int pos) const;
 
 	//! Get the material at a given coordinate, direction and type from CSX (internal use only)
-	virtual double GetMaterial(
-		int ny,
-		const double coords[3],
-		int MatType,
-		std::vector<CSPrimitives*> vPrims,
-		bool markAsUsed=true
-	) const;
+	virtual double GetMaterial(int ny, const double coords[3], int MatType, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed=true) const;
+	//! GetMaterial() of the types \a type1 and \a type2 at the same point, with one lookup of the property. The averaging calls this one: a subclass overrides both
+	virtual void GetMaterials(int ny, const double coords[3], int type1, int type2, double& val1, double& val2, const std::vector<CSPrimitives*>& vPrims, bool markAsUsed=true) const;
+	//! The material value \a MatType of the property \a prop (the background without a material) at \a coords
+	double GetMaterialValue(CSProperties* prop, int ny, const double coords[3], int MatType) const;
 
 	MatAverageMethods m_MatAverageMethod;
 
 	//! Calculate the effective/averaged material properties at the given position and direction ny.
-	virtual bool Calc_EffMatPos(
-		int ny,
-		const unsigned int* pos,
-		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
-	) const;
+	virtual bool Calc_EffMatPos(int ny, const unsigned int* pos, double* EffMat, const std::vector<CSPrimitives*>& vPrims) const;
 
-	virtual bool AverageMatCellCenter(
-		int ny,
-		const unsigned int* pos,
-		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
-	) const;
+	virtual bool AverageMatCellCenter(int ny, const unsigned int* pos, double* EffMat, const std::vector<CSPrimitives*>& vPrims) const;
 
-	virtual bool AverageMatQuarterCell(
-		int ny,
-		const unsigned int* pos,
-		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
-	) const;
+	virtual bool AverageMatQuarterCell(int ny, const unsigned int* pos, double* EffMat, const std::vector<CSPrimitives*>& vPrims) const;
 
 	//! Calc operator at certain \a pos
 	virtual void Calc_ECOperatorPos(int n, unsigned int* pos);
@@ -343,15 +354,63 @@ protected:
 	ArrayLib::ArrayNIJK<float>* m_sigma_ptr;
 
 	//EC elements, internal only!
-	virtual void Init_EC();
+	//! Allocate the circuit values: the material table and its index per node, or with \a dense the four arrays per direction
+	virtual void Init_EC(bool dense=false);
 	virtual bool Calc_EC();
-	virtual void Calc_EC_Range(unsigned int xStart, unsigned int xStop);
-	FDTD_FLOAT* EC_C[3];
+	//! The circuit values of the x lines \a xStart to \a xStop: the materials into \a table (a table of the build thread), else into the dense arrays
+	virtual void Calc_EC_Range(unsigned int xStart, unsigned int xStop, EC_Table* table=NULL);
+	//! Allocate the material arrays of the dumps that asked for them (SetMaterialStoreFlags()), with the dense circuit values
+	void AllocMaterialArrays();
+	//! Write the effective material \a EffMat of the edge \a ny at \a pos to the material storage of the dumps, if it is kept
+	void StoreMaterial(int ny, const unsigned int* pos, const double* EffMat) const;
+	//! The most entries of the material table before the circuit values go dense, for a mesh of \a nodes nodes
+	size_t GetECTableLimit(size_t nodes) const;
+	size_t m_ECTableLimit;   //!< GetECTableLimit() of this mesh, from Init_EC()
+	//! Replace the material table by the dense circuit values, computed from it
+	void ECTableToDense();
+	//! Give memory freed on the build threads back to the system (glibc)
+	static void ReleaseFreedMemory();
+
+	//! The circuit values, read with GetEC() and written with SetEC(). After InitOperator() the coefficients of the CPU
+	//! and GPU engines are computed from them when read (Coeffs_EC). Either the material table and its index (the
+	//! material of a node times the geometry of an edge), or, if the materials hardly repeat, dense per direction.
+	EC_Table* m_ECTable;   //!< the distinct effective materials (or NULL)
+	ArrayLib::ArrayIJK<uint32_t> m_ECIndex;   //!< per node its entry in m_ECTable (data(): by GetECIndex(), as the dense arrays)
+	//! The material table stays after the coefficients (FreeEC()) for the material the dumps read (GetDiscMaterial()), until CleanupMaterialStorage()
+	bool m_ECKeep;
+	//! The x lines below this one have no circuit values (GetEC() 0), only a material for the dumps: the region of a multi-grid's sub-grid
+	unsigned int m_ECZeroLines;
+	//! The material \a type (0: epsilon, 1: kappa, 2: mue, 3: sigma) of the edge \a n at \a pos from the table, as the material arrays hold it; for a circuit value an extension set, the effective material of it
+	double GetTableMaterial(int type, int n, const unsigned int pos[3]) const;
+	//! Free the material table and its index, also if kept for the dumps
+	void FreeECTable();
+	//! The index of an entry without circuit values of its own, with the material of \a e (for EC_Table::Entry::base)
+	uint32_t MaterialEntry(const EC_Table::Entry& e);
+	FDTD_FLOAT* EC_C[3];   //!< dense: per direction and node (or NULL)
 	FDTD_FLOAT* EC_G[3];
 	FDTD_FLOAT* EC_L[3];
 	FDTD_FLOAT* EC_R[3];
 
 	AdrOp* MainOp;
+
+	//! GetDiscLine() and GetEdgeLength() per direction and line, main [0] and dual [1] mesh: computed once per build (InitGeometry()), they are looked up per edge
+	std::vector<double> m_LineTable[2][3];
+	std::vector<double> m_EdgeLengthTable[2][3];
+	//! Fill the tables of the mesh, once it is final
+	void InitGeometry();
+	//! Whether GetEdgeLength() and GetEdgeArea() are those of this class, the per-line edge lengths and their products: GetEC() then reads the tables itself
+	/*!
+	  A subclass with a geometry of its own (GetEdgeLength(), GetEdgeArea(), GetNodeArea() or GetNodeWidth()
+	  overridden) returns false and overrides GetECGeometry() with it, as Operator_Cylinder does. Otherwise its
+	  circuit values keep the Cartesian geometry of the tables, while the dumps, which call the virtual
+	  functions, use its own.
+	  */
+	virtual bool TableGeometry() const {return true;}
+	//! GetEdgeArea() and GetEdgeLength() of the edge \a n at \a pos, on the dual mesh with \a dual, which GetEC() multiplies the material with: a subclass with a geometry of its own computes both in one go
+	virtual void GetECGeometry(int n, bool dual, const unsigned int pos[3], double& area, double& delta) const;
+	bool m_TableGeometry;   //!< TableGeometry(), from InitGeometry()
+	//! GetECGeometry(), or with m_TableGeometry its tables read inline: GetEC() and GetECPair() both, in the same order of operations; inline in operator.cpp, for its use only
+	void ECGeometry(int n, bool dual, const unsigned int pos[3], double& area, double& delta) const;
 
 	std::vector<Operator_Extension*> m_Op_exts;
 
@@ -361,13 +420,15 @@ protected:
 	Excitation* m_Exc; // excitation time signal class
 //	Operator_Ext_Excitation* m_Op_Ext_Exc; // excitation extension
 
-	// engine/post-proc needs access
-public:
-	//EC operator
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>* vv_ptr; //calc new voltage from old voltage
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>* vi_ptr; //calc new voltage from old current
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>* ii_ptr; //calc new current from old current
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>* iv_ptr; //calc new current from old voltage
+	Operator_Coeffs* m_Coeffs; //!< owned, created by InitOperator() for m_EngineType; NULL before
+	Coeffs_EC* m_ECCoeffs;     //!< m_Coeffs if it computes the coefficients from the circuit values (GetEC()), else NULL
+
+	//! Free the circuit values (the dense arrays, the material table unless kept for the dumps: m_ECKeep)
+	void FreeEC();
+	//! Free the coefficients and the circuit values they are computed from (once the engine holds them); GetVV() and friends are invalid after this
+	void FreeCoeffs();
+	//! Keep the coefficients of the node \a pos as they are, before an extension changes its circuit values without Calc_ECOperatorPos()
+	void FreezeCoeffs(const unsigned int pos[3]) {if (m_ECCoeffs) m_ECCoeffs->Freeze(pos[0], pos[1], pos[2]);}
 };
 
 inline Operator::DebugFlags operator|( Operator::DebugFlags a, Operator::DebugFlags b ) { return static_cast<Operator::DebugFlags>(static_cast<int>(a) | static_cast<int>(b)); }

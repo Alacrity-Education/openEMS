@@ -29,7 +29,7 @@
 
 //! Background work of the field dumps, one thread in the order of the tasks.
 //! - the HDF5 writes of the TD dumps: during the run it is the only user of HDF5 (the
-//!   other dumps write in InitProcess()/PostProcess(), after FinishAsync()), so the writes
+//!   other dumps write in InitProcess()/PostProcess()/DumpFDNow(), after FinishAsync()), so the writes
 //!   and the simulation overlap,
 //! - with field snapshots of the engine (see Engine_Interface_Base::TakeFieldSnapshot()),
 //!   the dumped fields from the snapshot (TD dumps) and the FD sums (FD dumps), while the
@@ -46,8 +46,10 @@ public:
 	//! Snapshot of the fields of timestep \a ts, shared by all dumps of that timestep; false if the engine has none
 	bool Snapshot(Engine_Interface_Base* eng_if, unsigned int ts, const float* &volt, const float* &curr)
 	{
-		std::unique_lock<std::mutex> lock(m_Mutex);
 		const void* id = eng_if->GetEngineID();
+		if (id==NULL)
+			return false;   // no snapshots; nor the empty one below (id NULL, ts 0), which a dump would read as the live fields
+		std::unique_lock<std::mutex> lock(m_Mutex);
 		if ((m_Snap.id==id) && (m_Snap.ts==ts))
 		{
 			volt = m_Snap.volt;

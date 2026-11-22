@@ -54,7 +54,7 @@ cdef class openEMS:
     >>> FDTD.Run(sim_path='/tmp/test')
 
     :param NrTS:           max. number of timesteps to simulate (e.g. default=1e9)
-    :param EndCriteria:    end criteria, e.g. 1e-5, simulations stops if energy has decayed by this value (<1e-4 is recommended, default=1e-5)
+    :param EndCriteria:    end criteria, e.g. 1e-5, simulations stops if energy has decayed by this value (<1e-4 is recommended, default=1e-6), 0: none, run all timesteps
     :param MaxTime:        max. real time in seconds to simulate
     :param OverSampling:   nyquist oversampling of the time domain dumps and probes (default 4).
                             Frequency-domain dumps/probes accumulate at the plain Nyquist rate
@@ -131,7 +131,7 @@ cdef class openEMS:
     def SetEndCriteria(self, val):
         """ SetEndCriteria(val)
 
-        Set the end criteria value. E.g. 1e-6 for -60dB
+        Set the end criteria value. E.g. 1e-6 for -60dB, 0 for none (run all timesteps)
         """
         self.thisptr.SetEndCriteria(val)
 
@@ -668,10 +668,14 @@ cdef class openEMS:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
         * numThreads (int) -- set the number of threads (default 0 --> max)
-        * engine (str) -- e.g. 'gpu' for the GPU engine
+        * engine (str) -- e.g. 'gpu' for the GPU engine; without it the
+          environment variable ``OPENEMS_ENGINE``, if set (``run_testsuite.py
+          --engine`` runs a whole test suite this way), else the fastest engine
         * gpu_device (int) -- GPU device of the GPU engine, a number of the
           device list printed at verbose >= 1 (default: the best device)
         * disable_dumps (bool) -- disable all field dumps for faster simulation
+        * no_memory_check (bool) -- set up also if the free memory cannot hold
+          what the engine needs at least for the mesh (the setup stops then)
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.
         * debug_PEC (bool) - dump metal distribution to a vtk file for debugging
@@ -693,6 +697,8 @@ cdef class openEMS:
             os.mkdir(sim_path)
         os.chdir(sim_path)
 
+        if 'engine' not in kw and os.environ.get('OPENEMS_ENGINE'):
+            kw['engine'] = os.environ['OPENEMS_ENGINE']
         self._SetLibraryArguments(kw)
 
         if Path(os.getcwd()).resolve() != Path(sim_path).resolve():
@@ -711,6 +717,28 @@ cdef class openEMS:
 
     def SetAbort(self, val):
         self.thisptr.SetAbort(val)
+
+    def RequestFDDump(self):
+        """ RequestFDDump()
+
+        Write the frequency domain field dumps with the results so far, at the
+        next timestep a running simulation reaches, e.g. from another thread
+        while :func:`Run` runs. They are written again, to the same files, at
+        the end. Creating the file ``DUMP_FD`` in `sim_path` does the same, and
+        openEMS removes it once the dumps are written. Read them, e.g. for an
+        NF2FF, in another process: HDF5 is not thread-safe, and openEMS may
+        still write its time domain dumps.
+
+        See also :func:`FDDumpPending`.
+        """
+        self.thisptr.RequestFDDump()
+
+    def FDDumpPending(self):
+        """ FDDumpPending()
+
+        Whether a dump asked for by :func:`RequestFDDump` is not written yet.
+        """
+        return self.thisptr.FDDumpPending()
 
     def Write2XML(self, file):
         """ Write2XML(file)

@@ -23,6 +23,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import h5py
 import numpy as np
 
 from CSXCAD import ContinuousStructure
@@ -313,6 +314,19 @@ class Test_Run(unittest.TestCase):
         self.fdtd.Run(os.path.join(self.tmp.name, 'link'), setup_only=True, verbose=0)
         self.assertInDir(os.path.join(self.tmp.name, 'real'))
 
+    def test_memory_check(self):
+        # too little free memory for the fields of the mesh stops the setup before the build, unless told not to check
+        os.environ['OPENEMS_AVAILABLE_MEMORY'] = '1000'   # bytes; the 605 nodes need at least 24 each
+        try:
+            self.assertNotEqual(self.fdtd.Run(os.path.join(self.tmp.name, 'a'), setup_only=True, verbose=0), 0)
+            fdtd = openEMS(NrTS=10)
+            fdtd.SetGaussExcite(1e9, 1e9)
+            fdtd.SetBoundaryCond(['PEC'] * 6)
+            fdtd.SetCSX(_make_csx_with_grid())
+            self.assertEqual(fdtd.Run(os.path.join(self.tmp.name, 'b'), setup_only=True, verbose=0, no_memory_check=True), 0)
+        finally:
+            os.environ.pop('OPENEMS_AVAILABLE_MEMORY', None)
+
     def test_flush_to_zero_restored(self):
         # the engines flush denormals to zero during the run only, not in the calling process
         tiny = np.float32(1e-39)   # a float32 denormal
@@ -340,7 +354,8 @@ for d in 'xyz':
 csx.AddExcitation('ex', 0, [0, 0, 1]).AddBox([10, 10, 10], [10, 10, 12])
 csx.AddDump('Et', dump_type=0, file_type=1).AddBox([0, 0, 0], [39, 39, 39])
 before = len(os.listdir('/proc/self/task'))
-fdtd.Run(sys.argv[1], verbose=0, numThreads=2)
+# a CPU engine: a GPU runtime keeps threads of its own (run_testsuite.py --engine=gpu)
+fdtd.Run(sys.argv[1], verbose=0, numThreads=2, engine='multithreaded')
 assert os.path.isfile(os.path.join(sys.argv[1], 'Et.h5'))
 # a joined thread can still be listed for a moment while the kernel tears it down
 for n in range(50):
@@ -362,6 +377,47 @@ class Test_NumThreads(unittest.TestCase):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  universal_newlines=True, check=True, cwd=tmp)
         self.assertLessEqual(int(out.stdout.split()[-1]), 2)
+
+
+_FD_DUMP_SCRIPT = """
+import os, sys
+import numpy as np
+from CSXCAD import ContinuousStructure
+from openEMS.openEMS import openEMS
+fdtd = openEMS(NrTS=100, EndCriteria=0)
+fdtd.SetGaussExcite(1e9, 1e9)
+fdtd.SetBoundaryCond(['PEC'] * 6)
+csx = ContinuousStructure()
+fdtd.SetCSX(csx)
+grid = csx.GetGrid()
+grid.SetDeltaUnit(1e-3)
+for d in 'xyz':
+    grid.SetLines(d, np.linspace(-50, 50, 11))
+csx.AddExcitation('ex', 0, [0, 0, 1]).AddBox([0, 0, -10], [0, 0, 10])
+csx.AddDump('Ef', dump_type=10, frequency=[1e9], file_type=1).AddBox([-50, -50, 0], [50, 50, 0])
+os.mkdir(sys.argv[1])
+if sys.argv[2] == 'request':
+    open(os.path.join(sys.argv[1], 'DUMP_FD'), 'w').close()
+fdtd.Run(sys.argv[1], verbose=0)
+"""
+
+
+class Test_FDDumpRequest(unittest.TestCase):
+    def test_dump_file(self):
+        # DUMP_FD in sim_path: the FD dumps are written at the first timesteps and again, in place,
+        # at the end, as without the request; the file is removed
+        with tempfile.TemporaryDirectory() as tmp:
+            f0 = []
+            for mode in ('request', 'none'):
+                sim = os.path.join(tmp, mode)
+                out = subprocess.run([sys.executable, '-c', _FD_DUMP_SCRIPT, sim, mode],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, check=True, cwd=tmp)
+                self.assertEqual('writing the frequency domain dumps' in out.stdout, mode == 'request')
+                self.assertFalse(os.path.exists(os.path.join(sim, 'DUMP_FD')))
+                with h5py.File(os.path.join(sim, 'Ef.h5'), 'r') as h:
+                    f0.append(np.array(h['/FieldData/FD/f0']))
+        np.testing.assert_allclose(f0[0], f0[1], rtol=0, atol=1e-6*np.abs(f0[1]).max())
 
 
 _GPU_ENGINE_SCRIPT = """

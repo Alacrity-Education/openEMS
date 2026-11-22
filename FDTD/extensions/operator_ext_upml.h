@@ -34,14 +34,12 @@ class FunctionParser;
 class Operator_Ext_UPML : public Operator_Extension
 {
 	friend class Engine_Ext_UPML;
-	friend class HIP_Ext_UPML;
-	friend class Metal_Ext_UPML;
+	friend class CellModel;   // fuses the cells into the engine update
 public:
 	virtual ~Operator_Ext_UPML();
 
 	//! Returns always true, Create_UPML method will take care of creating a valid pml for the cylindrical fdtd
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const { UNUSED(closedAlpha); UNUSED(R0_included); return true;}
-	virtual bool IsGPUSave() const {return true;}
 
 	//! Returns always true if base grid, Create_UPML will create proper child pml extensions.
 	virtual bool IsCylindricalMultiGridSave(bool child) const {if (child) return false; return true;}
@@ -93,9 +91,9 @@ protected:
 	unsigned int m_numLines[3];
 
 	std::string m_GradFunc;
-	FunctionParser* m_GradingFunction;
 
-	void CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3]);
+	//! the grading of the cell at \a pos, with \a grading parsed from m_GradFunc (fparser evaluates on one thread at a time per parser)
+	void CalcGradingKappa(FunctionParser& grading, int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3]);
 
 	void DeleteOp();
 

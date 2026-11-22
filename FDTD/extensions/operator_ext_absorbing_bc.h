@@ -42,8 +42,7 @@
 class Operator_Ext_Absorbing_BC : public Operator_Extension
 {
 	friend class Engine_Ext_Absorbing_BC;
-	friend class HIP_Ext_Absorbing_BC;
-	friend class Metal_Ext_Absorbing_BC;
+	friend class GPU_Ext_Absorbing_BC;
 public:
 
 	// This should be a replica of the CSXCAD property, but can also be something
@@ -58,9 +57,11 @@ public:
 	Operator_Ext_Absorbing_BC(Operator* op);
 	~Operator_Ext_Absorbing_BC();
 
+	//! the axis normal to the sheet
+	int GetNormalAxis() const {return m_ny;}
+
 	virtual Operator_Extension* Clone(Operator* op);
 
-	virtual bool IsGPUSave() const {return true;}
 
 	virtual bool BuildExtension();
 

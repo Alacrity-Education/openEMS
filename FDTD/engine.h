@@ -18,27 +18,23 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <chrono>
 #include <fstream>
 #include "operator.h"
+#include "engine_type.h"
+#include "engine_plan.h"
 
 #include "tools/arraylib/array_nijk.h"
 
-namespace NS_Engine_Multithread
-{
-class thread; // evil hack to access numTS from multithreading context
-}
-
 class Engine_Extension;
+class Engine_ThreadPool;
+class Engine_SubGridCoupling;
 
-class Engine
+class Engine : public Engine_Types
 {
 public:
-	enum EngineType
-	{
-		BASIC, SSE, GPU, UNKNOWN
-	};
-
-	static Engine* New(const Operator* op);
+	//! A basic engine on \a numThreads threads, 0 for finding the best number while running (see NextInterval())
+	static Engine* New(const Operator* op, unsigned int numThreads = 0);
 	virtual ~Engine();
 
 	virtual void Init();
@@ -49,7 +45,18 @@ public:
 
 	virtual unsigned int GetNumberOfTimesteps() {return numTS;}
 
-	virtual void NextInterval(float curr_speed) {UNUSED(curr_speed);};
+	//! The engine starts trying its variants (tiles, the flat sweep) at the start of the run; at --verbose "Engine: trials started"
+	void MarkTrialsStart();
+	//! The engine finished trying its variants; at --verbose "Engine: trials done" (benchmark/bench.py times the run from there)
+	void MarkTrialsEnd();
+	//! The timestep of MarkTrialsEnd() and the seconds since, false if the engine ran no trials
+	bool GetTrialsEnd(unsigned int& ts, double& seconds) const;
+
+	//! The speed of the last interval, for the thread count of the CPU engines
+	virtual void NextInterval(float curr_speed);
+
+	//! Number of threads of a CPU engine, 0 (default) for finding the best number while running; set before the first IterateTS()
+	void SetNumThreads(unsigned int numThreads) {m_numThreads = numThreads;}
 
 	//this access functions muss be overloaded by any new engine using a different storage model
 	inline virtual FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
@@ -100,29 +107,28 @@ public:
 		curr(n, pos[0], pos[1], pos[2]) = value;
 	}
 
-	//! Execute Pre-Voltage extension updates
-	virtual void DoPreVoltageUpdates();
-	//! Main FDTD engine voltage updates
-	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
-	//! Execute Post-Voltage extension updates
-	virtual void DoPostVoltageUpdates();
-	//! Apply extension voltage changes
-	virtual void Apply2Voltages();
-
-	//! Execute Pre-Current extension updates
-	virtual void DoPreCurrentUpdates();
-	//! Main FDTD engine current updates
-	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
-	//! Execute Post-Current extension updates
-	virtual void DoPostCurrentUpdates();
-	//! Apply extension current changes
-	virtual void Apply2Current();
-
 	inline size_t GetExtensionCount() {return m_Eng_exts.size();}
 	inline Engine_Extension* GetExtension(size_t nr) {return m_Eng_exts.at(nr);}
-	virtual void SortExtensionByPriority();
 
 	EngineType GetType() const {return m_type;}
+
+	//! The sums of the squared voltages and currents of the first numNodes[n] nodes in each direction, if the engine computes them itself (on the device, in its memory order); false: Engine_Interface_FDTD::CalcFastEnergy() does
+	virtual bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy) const {(void)numNodes; (void)E_energy; (void)H_energy; return false;}
+
+	//! The voltages and currents of the engines that keep them in these arrays (basic, CPU), else NULL
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* GetVoltageArray() const {return volt_ptr;}
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* GetCurrentArray() const {return curr_ptr;}
+
+	//! The sub-grid of a cylindrical multi-grid level: its engine (of the same type) and the coupling of the two, both taken over; before the first IterateTS(), throws after
+	void SetSubGrid(Engine* sub, Engine_SubGridCoupling* coupling);
+	//! The engine of the sub-grid, NULL without one; this engine steps it right after itself in every half step (the threads of Engine_ThreadPool, or Engine_GPU)
+	Engine* GetSubGridEngine() const {return m_SubGrid;}
+	//! Couple this grid and its sub-grid, once both did their voltage half step
+	void SyncSubGridVoltages();
+	//! Couple this grid and its sub-grid, once both did their current half step
+	void SyncSubGridCurrents();
+	//! Fill this grid from its sub-grid, at the end of IterateTS() (the sub-grid filled from its own first)
+	void InterpolateFromSubGrid();
 
 protected:
 	EngineType m_type;
@@ -136,11 +142,70 @@ protected:
 	ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr_ptr;
 	unsigned int numTS;
 
+	bool m_TrialsEnded = false;
+	unsigned int m_TrialsEndTS = 0;
+	std::chrono::steady_clock::time_point m_TrialsEndTime;
+
+	//! The memory layout of the fields (ArrayNIJK), allocated by Init()
+	virtual std::string GetFieldLayout() const {return "NIJK";}
+
+	// The steps of a half step: the extension hooks around the main update, called by
+	// Engine_ThreadPool (a friend), not from outside the engine
+	//! Execute Pre-Voltage extension updates
+	virtual void DoPreVoltageUpdates();
+	//! The voltage update of the x lines [startX, startX+numX): the kernel of the basic engine (SSE: its own), behind the box update
+	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
+	//! The voltage update of \a box (Engine_Plan), one CanUpdateBox() accepts; the default through UpdateVoltages(startX, numX)
+	virtual void UpdateVoltages(const Engine_Box& box);
+	//! Execute Post-Voltage extension updates
+	virtual void DoPostVoltageUpdates();
+	//! Apply extension voltage changes
+	virtual void Apply2Voltages();
+
+	//! Execute Pre-Current extension updates
+	virtual void DoPreCurrentUpdates();
+	//! The current update of the x lines [startX, startX+numX), see UpdateVoltages(unsigned int, unsigned int)
+	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
+	//! The current update of \a box, see UpdateVoltages(const Engine_Box&)
+	virtual void UpdateCurrents(const Engine_Box& box);
+
+	//! Whether UpdateVoltages(const Engine_Box&) (\a currents false) or UpdateCurrents(const Engine_Box&) takes \a box
+	/*!
+	  The default: boxes spanning all lines in y and z (all but the last for the
+	  currents), the x ranges of the kernels of the basic and the SSE engine.
+	  Engine_ThreadPool checks its plans once, when it builds them.
+	  */
+	virtual bool CanUpdateBox(const Engine_Box& box, bool currents) const;
+
+	//! The axis the flat plan splits over the threads: one of the slowest in memory
+	virtual int GetSplitAxis() const {return 0;}
+
+	//! The blocked plans (temporal blocking) for \a numThreads threads this engine offers for this model, see Engine_BlockedChoice; the default: none
+	virtual bool BuildBlockedPlans(unsigned int numThreads, Engine_BlockedChoice& choice) {(void)numThreads; (void)choice; return false;}
+	//! The threads for --numThreads=0: 0 lets Engine_ThreadPool add threads while the speed increases (the basic and the SSE engine)
+	virtual unsigned int DefaultThreads() const {return 0;}
+	//! Execute Post-Current extension updates
+	virtual void DoPostCurrentUpdates();
+	//! Apply extension current changes
+	virtual void Apply2Current();
+
+	virtual void SortExtensionByPriority();
+
 	virtual void InitExtensions();
 	virtual void ClearExtensions();
 	std::vector<Engine_Extension*> m_Eng_exts;
 
-	friend class NS_Engine_Multithread::thread; // evil hack to access numTS from multithreading context
+	friend class Engine_ThreadPool;
+	friend class Engine_ThreadPool_Worker;
+	friend class SubGrid_Coupling_Basic;
+
+	Engine* m_SubGrid;                        //!< see SetSubGrid()
+	Engine_SubGridCoupling* m_SubGridCoupling;
+	//! Delete the coupling and the sub-grid engine
+	void ClearSubGrid();
+
+	unsigned int m_numThreads;        //!< see SetNumThreads()
+	Engine_ThreadPool* m_ThreadPool;  //!< the worker threads of a CPU engine, created by the first IterateTS()
 };
 
 #endif // ENGINE_H

@@ -27,8 +27,7 @@ class Excitation;
 class Operator_Ext_TFSF : public Operator_Extension
 {
 	friend class Engine_Ext_TFSF;
-	friend class HIP_Ext_TFSF;
-	friend class Metal_Ext_TFSF;
+	friend class GPU_Ext_TFSF;
 public:
 	Operator_Ext_TFSF(Operator* op);
 	~Operator_Ext_TFSF();
@@ -40,7 +39,6 @@ public:
 	virtual Engine_Extension* CreateEngineExtention();
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return false;}
-	virtual bool IsGPUSave() const {return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return false;}
 
 	virtual std::string GetExtensionName() const
